@@ -2073,7 +2073,56 @@ def run_global_refresh():
             import traceback
             traceback.print_exc()
 
-    # Phase 3: Build valuations using SEC data + cached data (NO API calls)
+    # Phase 3: Retry failed tickers individually (handles rate-limited tickers)
+    failed_tickers = [t for t in all_tickers if t not in current_prices_dict or
+                      (isinstance(current_prices_dict.get(t), float) and np.isnan(current_prices_dict.get(t)))]
+
+    if failed_tickers:
+        screener_progress['phase'] = 'retrying'
+        screener_progress['ticker'] = f'Retrying {len(failed_tickers)} failed tickers...'
+        print(f"[Refresh] Retrying {len(failed_tickers)} tickers that failed batch download...")
+
+        retry_count = 0
+        for i, ticker in enumerate(failed_tickers):
+            if not screener_running:
+                break
+            if i % 50 == 0:
+                screener_progress['current'] = i
+                screener_progress['ticker'] = f'Retrying failed tickers... {i}/{len(failed_tickers)} ({retry_count} recovered)'
+
+            try:
+                stock = yf.Ticker(ticker)
+                # Try fast_info first (faster)
+                price = None
+                try:
+                    price = stock.fast_info.get('lastPrice') or stock.fast_info.get('regularMarketPrice')
+                except Exception:
+                    pass
+
+                # Fall back to history if fast_info fails
+                if not price:
+                    hist = stock.history(period='3mo')
+                    if hist is not None and not hist.empty and 'Close' in hist.columns:
+                        price = hist['Close'].iloc[-1]
+                        # Also get price changes
+                        if len(hist) >= 22:
+                            price_1m_ago = hist['Close'].iloc[-22]
+                            price_change_1m_dict[ticker] = ((price - price_1m_ago) / price_1m_ago) * 100
+                        if len(hist) > 1:
+                            price_3m_ago = hist['Close'].iloc[0]
+                            price_change_3m_dict[ticker] = ((price - price_3m_ago) / price_3m_ago) * 100
+
+                if price and price > 0:
+                    current_prices_dict[ticker] = float(price)
+                    retry_count += 1
+
+                time.sleep(0.2)  # Rate limit individual fetches
+            except Exception as e:
+                pass  # Skip this ticker
+
+        print(f"[Refresh] Recovered {retry_count}/{len(failed_tickers)} tickers from individual fetches")
+
+    # Phase 4: Build valuations using SEC data + cached data (NO API calls)
     screener_progress['phase'] = 'valuations'
     ticker_valuations = {}
     now_iso = datetime.now().isoformat()

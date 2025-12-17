@@ -142,6 +142,24 @@ def api_eps_recommendations():
     return jsonify(recommendations)
 
 
+@data_bp.route('/refresh-summary')
+def api_refresh_summary():
+    """Get summary of the last refresh operation."""
+    summary_file = os.path.join(DATA_DIR, 'refresh_summary.json')
+    if os.path.exists(summary_file):
+        try:
+            with open(summary_file, 'r') as f:
+                return jsonify(json.load(f))
+        except Exception:
+            pass
+    return jsonify({
+        'last_refresh': None,
+        'total_tickers': 0,
+        'no_price_data': 0,
+        'full_data': 0
+    })
+
+
 @data_bp.route('/screener/update-dividends', methods=['POST'])
 def api_screener_update_dividends():
     """Quick update of just dividend data for cached stocks."""
