@@ -1396,6 +1396,50 @@ def run_screener(index_name='all'):
 
             log.info(f"Screener: Recovered {retry_count}/{len(failed_tickers)} tickers from individual fetches")
 
+        # Phase 3.6: Fetch dividends for tickers missing dividend data
+        tickers_needing_dividends = [
+            t for t in tickers
+            if t in current_prices_dict and not existing_valuations.get(t, {}).get('annual_dividend')
+        ]
+
+        if tickers_needing_dividends:
+            screener_progress['phase'] = 'dividends'
+            screener_progress['ticker'] = f'Fetching dividends for {len(tickers_needing_dividends)} tickers...'
+            log.info(f"Screener: Fetching dividends for {len(tickers_needing_dividends)} tickers...")
+
+            dividend_count = 0
+            for i, ticker in enumerate(tickers_needing_dividends):
+                if not screener_running:
+                    break
+                if i % 50 == 0:
+                    screener_progress['current'] = i
+                    screener_progress['ticker'] = f'Fetching dividends... {i}/{len(tickers_needing_dividends)} ({dividend_count} with dividends)'
+
+                try:
+                    stock = yf.Ticker(ticker)
+                    dividends = stock.dividends
+
+                    if dividends is not None and len(dividends) > 0:
+                        from datetime import timedelta
+                        one_year_ago = datetime.now() - timedelta(days=365)
+                        recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
+                        annual_dividend = sum(float(d) for d in recent_dividends)
+
+                        if annual_dividend > 0:
+                            # Store in existing_valuations for use in valuation building
+                            if ticker not in existing_valuations:
+                                existing_valuations[ticker] = {}
+                            existing_valuations[ticker]['annual_dividend'] = round(annual_dividend, 2)
+                            existing_valuations[ticker]['last_dividend'] = round(float(dividends.iloc[-1]), 4)
+                            existing_valuations[ticker]['last_dividend_date'] = dividends.index[-1].strftime('%Y-%m-%d')
+                            dividend_count += 1
+
+                    time.sleep(0.15)  # Slightly faster for dividend-only calls
+                except Exception:
+                    pass
+
+            log.info(f"Screener: Found dividends for {dividend_count}/{len(tickers_needing_dividends)} tickers")
+
         # Build valuations using pre-computed data
         now_iso = datetime.now().isoformat()
 
@@ -2167,6 +2211,49 @@ def run_global_refresh():
                 pass  # Skip this ticker
 
         print(f"[Refresh] Recovered {retry_count}/{len(failed_tickers)} tickers from individual fetches")
+
+    # Phase 3.5: Fetch dividends for tickers missing dividend data
+    tickers_needing_dividends = [
+        t for t in all_tickers
+        if t in current_prices_dict and not existing_valuations.get(t, {}).get('annual_dividend')
+    ]
+
+    if tickers_needing_dividends:
+        screener_progress['phase'] = 'dividends'
+        screener_progress['ticker'] = f'Fetching dividends for {len(tickers_needing_dividends)} tickers...'
+        print(f"[Refresh] Fetching dividends for {len(tickers_needing_dividends)} tickers...")
+
+        dividend_count = 0
+        for i, ticker in enumerate(tickers_needing_dividends):
+            if not screener_running:
+                break
+            if i % 100 == 0:
+                screener_progress['current'] = i
+                screener_progress['ticker'] = f'Fetching dividends... {i}/{len(tickers_needing_dividends)} ({dividend_count} with dividends)'
+
+            try:
+                stock = yf.Ticker(ticker)
+                dividends = stock.dividends
+
+                if dividends is not None and len(dividends) > 0:
+                    from datetime import timedelta
+                    one_year_ago = datetime.now() - timedelta(days=365)
+                    recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
+                    annual_dividend = sum(float(d) for d in recent_dividends)
+
+                    if annual_dividend > 0:
+                        if ticker not in existing_valuations:
+                            existing_valuations[ticker] = {}
+                        existing_valuations[ticker]['annual_dividend'] = round(annual_dividend, 2)
+                        existing_valuations[ticker]['last_dividend'] = round(float(dividends.iloc[-1]), 4)
+                        existing_valuations[ticker]['last_dividend_date'] = dividends.index[-1].strftime('%Y-%m-%d')
+                        dividend_count += 1
+
+                time.sleep(0.15)
+            except Exception:
+                pass
+
+        print(f"[Refresh] Found dividends for {dividend_count}/{len(tickers_needing_dividends)} tickers")
 
     # Phase 4: Build valuations using SEC data + cached data (NO API calls)
     screener_progress['phase'] = 'valuations'
