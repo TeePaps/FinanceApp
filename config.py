@@ -19,6 +19,21 @@ STOCKS_FILE = os.path.join(USER_DATA_DIR, 'stocks.csv')
 TRANSACTIONS_FILE = os.path.join(USER_DATA_DIR, 'transactions.csv')
 
 # ============================================================================
+# Auto-create required directories and files
+# ============================================================================
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+# Create empty CSV files with headers if they don't exist
+if not os.path.exists(STOCKS_FILE):
+    with open(STOCKS_FILE, 'w') as f:
+        f.write('ticker,name,type\n')
+
+if not os.path.exists(TRANSACTIONS_FILE):
+    with open(TRANSACTIONS_FILE, 'w') as f:
+        f.write('id,ticker,action,shares,price,gain_pct,date,status\n')
+
+# ============================================================================
 # Cache Settings
 # ============================================================================
 PRICE_CACHE_DURATION = 300  # 5 minutes - how long to cache stock prices
