@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stock Portfolio Tracker</title>
+    <!-- Modular CSS Structure -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/variables.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}">
+</head>
+<body>
+    <div class="container">
+        <div class="header-row">
+            <h1>Stock Portfolio Tracker</h1>
+            <div class="header-right">
+                <span id="global-last-updated" class="global-last-updated"></span>
+                <div class="header-buttons">
+                    <button class="refresh-data-btn" onclick="refreshCurrentData()" title="Refresh data for current view">
+                        Refresh Data
+                    </button>
+                    <button class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <nav class="tabs">
+            <button class="tab-btn active" onclick="showTab('summary')">Summary</button>
+            <button class="tab-btn" onclick="showTab('profit')">Profit Timeline</button>
+            <button class="tab-btn" onclick="showTab('holdings')">Holdings</button>
+            <button class="tab-btn" onclick="showTab('add')">Add Transaction</button>
+            <button class="tab-btn" onclick="showTab('research')">Company Lookup</button>
+            <button class="tab-btn" onclick="showTab('screener')">Market Analysis</button>
+            <button class="tab-btn" onclick="showTab('recommendations')">Recommendations</button>
+            <button class="tab-btn" onclick="showTab('datasets')">Data Sets</button>
+        </nav>
+
+        <div id="summary-tab" class="tab-content active">
+            <section id="summary-section">
+                <div id="summary-totals" class="summary-grid"></div>
+                <h3>Market Value <button class="refresh-btn" onclick="loadPrices()" title="Refresh prices">↻</button></h3>
+                <div id="market-totals" class="summary-grid"></div>
+                <div id="market-prices"></div>
+                <h3>Portfolio Performance</h3>
+                <div id="performance-periods" class="performance-grid"></div>
+                <h3>Performance by Stock</h3>
+                <div id="summary-by-ticker"></div>
+            </section>
+        </div>
+
+        <div id="profit-tab" class="tab-content">
+            <section id="profit-section">
+                <div class="profit-filters">
+                    <div class="filter-row">
+                        <label>
+                            From:
+                            <input type="date" id="profit-start-date">
+                        </label>
+                        <label>
+                            To:
+                            <input type="date" id="profit-end-date">
+                        </label>
+                        <button onclick="loadProfitTimeline()">Apply</button>
+                        <div class="quick-filters">
+                            <button class="quick-filter" onclick="setProfitRange('ytd')">YTD</button>
+                            <button class="quick-filter" onclick="setProfitRange('2024')">2024</button>
+                            <button class="quick-filter" onclick="setProfitRange('2023')">2023</button>
+                            <button class="quick-filter" onclick="setProfitRange('all')">All Time</button>
+                        </div>
+                    </div>
+                </div>
+                <div id="profit-totals" class="summary-grid"></div>
+                <div id="profit-by-month"></div>
+                <div id="profit-by-ticker"></div>
+                <div id="profit-sales-list"></div>
+            </section>
+        </div>
+
+        <div id="holdings-tab" class="tab-content">
+        <section id="sell-recommendations-section" style="display: none;">
+            <h2>Consider Selling</h2>
+            <p class="section-intro">Stocks you hold that may be overvalued or have significant gains.</p>
+            <div id="sell-recommendations-container"></div>
+        </section>
+
+        <section id="stocks-section">
+            <h2>Stock Holdings</h2>
+            <div id="stocks-container"></div>
+        </section>
+
+        <section id="index-section">
+            <h2>Index Funds</h2>
+            <div id="index-container"></div>
+        </section>
+
+        <section id="pending-section">
+            <h2>Pending / Watchlist</h2>
+            <div id="pending-stocks-container"></div>
+            <div id="pending-index-container"></div>
+        </section>
+        </div>
+
+        <div id="add-tab" class="tab-content">
+        <section id="add-transaction-section">
+            <h2>Add Transaction</h2>
+            <form id="add-transaction-form">
+                <div class="form-row">
+                    <label>
+                        Ticker:
+                        <input type="text" name="ticker" required placeholder="e.g., AAPL">
+                    </label>
+                    <label>
+                        Action:
+                        <select name="action" required>
+                            <option value="buy">Buy</option>
+                            <option value="sell">Sell</option>
+                        </select>
+                    </label>
+                    <label>
+                        Shares:
+                        <input type="number" name="shares" required min="1">
+                    </label>
+                    <label>
+                        Price:
+                        <input type="number" name="price" step="0.01" required min="0">
+                    </label>
+                </div>
+                <div class="form-row">
+                    <label>
+                        Date:
+                        <input type="date" name="date">
+                    </label>
+                    <label>
+                        Gain %:
+                        <input type="number" name="gain_pct" step="0.1" placeholder="For sells">
+                    </label>
+                    <label>
+                        Status:
+                        <select name="status">
+                            <option value="watch">Watch</option>
+                            <option value="placed">Placed</option>
+                            <option value="done">Done</option>
+                        </select>
+                    </label>
+                    <button type="submit">Add Transaction</button>
+                </div>
+            </form>
+        </section>
+
+        <section id="add-stock-section">
+            <h2>Add New Stock</h2>
+            <form id="add-stock-form">
+                <div class="form-row">
+                    <label>
+                        Ticker:
+                        <input type="text" name="ticker" required placeholder="e.g., AAPL">
+                    </label>
+                    <label>
+                        Name:
+                        <input type="text" name="name" required placeholder="e.g., Apple Inc">
+                    </label>
+                    <label>
+                        Type:
+                        <select name="type">
+                            <option value="stock">Stock</option>
+                            <option value="index">Index Fund</option>
+                        </select>
+                    </label>
+                    <button type="submit">Add Stock</button>
+                </div>
+            </form>
+        </section>
+        </div>
+
+        <div id="research-tab" class="tab-content">
+            <section id="research-section">
+                <h2>Company Lookup</h2>
+                <div class="research-input">
+                    <label>
+                        Ticker:
+                        <input type="text" id="research-ticker" placeholder="e.g., AAPL">
+                    </label>
+                    <button onclick="runValuation()">Analyze</button>
+                </div>
+                <div id="research-results"></div>
+            </section>
+        </div>
+
+        <div id="screener-tab" class="tab-content">
+            <section id="screener-section">
+                <div class="screener-header">
+                    <h2 id="screener-title">Market Analysis</h2>
+                    <div class="index-selector">
+                        <label for="index-select">Index:</label>
+                        <select id="index-select" onchange="changeIndex(this.value)">
+                            <option value="all">All Indexes</option>
+                            <option value="sp500" selected>S&P 500</option>
+                            <option value="nasdaq100">Nasdaq 100</option>
+                            <option value="dow30">Dow 30</option>
+                            <option value="sp600">S&P 600</option>
+                            <option value="russell2000">Russell 2000</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="screener-controls">
+                    <div class="screener-status" id="screener-status">
+                        <span id="screener-last-updated">Never updated</span>
+                        <span id="screener-count"></span>
+                    </div>
+                    <div class="screener-buttons">
+                        <button id="screener-quick-btn" onclick="quickUpdatePrices()">Quick Update Prices</button>
+                        <button id="screener-start-btn" onclick="startScreener()">Full Update (EPS+Prices)</button>
+                        <button id="screener-stop-btn" onclick="stopScreener()" style="display: none;">Stop</button>
+                    </div>
+                </div>
+                <div id="screener-progress" style="display: none;">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <div class="progress-text" id="progress-text">0 / 0</div>
+                </div>
+                <div id="screener-summary"></div>
+                <div id="screener-results"></div>
+            </section>
+        </div>
+
+        <div id="recommendations-tab" class="tab-content">
+            <div class="recommendations-layout">
+                <section id="recommendations-section">
+                    <h2>Investment Recommendations</h2>
+                    <p class="recommendations-intro">Top 10 stocks based on undervaluation, dividend yield, and recent selloff pressure.</p>
+                    <div id="recommendations-loading" class="loading-indicator">Loading recommendations...</div>
+                    <div id="recommendations-list"></div>
+                </section>
+                <aside class="scoring-methodology">
+                    <h3>Scoring Methodology</h3>
+                    <div class="scoring-section">
+                        <h4>Undervaluation <span class="weight">(1.0x weight)</span></h4>
+                        <p>Compares current price to estimated fair value based on EPS.</p>
+                        <ul>
+                            <li>-50% undervalued = +50 pts</li>
+                            <li>Fair value = 0 pts</li>
+                            <li>+50% overvalued = -50 pts</li>
+                        </ul>
+                    </div>
+                    <div class="scoring-section">
+                        <h4>Dividend Yield <span class="weight">(1.5x weight)</span></h4>
+                        <p>Rewards consistent dividend payers.</p>
+                        <ul>
+                            <li>No dividend = -30 pts penalty</li>
+                            <li>1% yield = +5 pts</li>
+                            <li>6%+ yield = +30 pts (max)</li>
+                        </ul>
+                    </div>
+                    <div class="scoring-section">
+                        <h4>Selloff Pressure <span class="weight">(0.8x weight)</span></h4>
+                        <p>Identifies stocks that have dropped significantly.</p>
+                        <ul>
+                            <li>% off 52-week high = pts</li>
+                            <li>Severe selloff bonus: +15 pts</li>
+                            <li>Moderate selloff: +10 pts</li>
+                            <li>Recent selloff: +5 pts</li>
+                        </ul>
+                    </div>
+                    <div class="scoring-formula">
+                        <strong>Total Score =</strong><br>
+                        (Undervalue × 1.0) + (Dividend × 1.5) + (Selloff × 0.8)
+                    </div>
+                </aside>
+            </div>
+        </div>
+
+        <div id="datasets-tab" class="tab-content">
+            <section id="datasets-section">
+                <h2>Data Sets</h2>
+
+                <div id="refresh-status" class="dataset-card refresh-card" style="display: none;">
+                    <h3>Data Refresh In Progress</h3>
+                    <div class="refresh-progress">
+                        <div class="progress-bar large">
+                            <div class="progress-fill" id="refresh-progress-bar"></div>
+                        </div>
+                        <div class="progress-details">
+                            <span id="refresh-phase">Initializing...</span>
+                            <span id="refresh-ticker"></span>
+                            <span id="refresh-count"></span>
+                        </div>
+                    </div>
+                    <button class="stop-btn" onclick="stopRefresh()">Stop Refresh</button>
+                </div>
+
+                <div class="datasets-grid">
+                    <div class="dataset-card">
+                        <h3>SEC EDGAR Data</h3>
+                        <div class="dataset-stats" id="sec-stats">
+                            <div class="stat-row">
+                                <span class="stat-label">SEC EPS Available:</span>
+                                <span class="stat-value" id="sec-company-count">-</span>
+                            </div>
+                            <div class="stat-row">
+                                <span class="stat-label">CIK Mappings:</span>
+                                <span class="stat-value" id="sec-cik-count">-</span>
+                            </div>
+                            <div class="stat-row">
+                                <span class="stat-label">CIK Last Updated:</span>
+                                <span class="stat-value" id="sec-cik-updated">-</span>
+                            </div>
+                            <div class="stat-row">
+                                <span class="stat-label">Coverage:</span>
+                                <span class="stat-value" id="sec-freshness">-</span>
+                            </div>
+                        </div>
+                        <div class="dataset-info">
+                            <p>EPS data from official SEC 10-K filings. Companies without SEC EPS use yfinance as fallback.</p>
+                        </div>
+                    </div>
+
+                    <div class="dataset-card" id="index-cards">
+                        <!-- Index cards will be populated by JavaScript -->
+                    </div>
+                </div>
+
+                <div id="datasets-details"></div>
+
+                <div class="dataset-card recommendations-card">
+                    <h3>EPS Update Recommendations</h3>
+                    <p class="recommendations-desc">Companies whose fiscal year has ended and may have new 10-K filings available.</p>
+                    <div id="eps-recommendations-summary" class="recommendations-summary">
+                        <span class="loading">Loading recommendations...</span>
+                    </div>
+                    <div id="eps-recommendations-list"></div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- Main App Logic -->
+    <script src="{{ url_for('static', filename='app.js') }}?v=31"></script>
+</body>
+</html>

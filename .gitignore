@@ -1,0 +1,45 @@
+# Personal holdings data (NEVER commit)
+user_data/
+
+# Market data (can be regenerated)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Node modules (playwright-mcp)
+node_modules/
+playwright-mcp/node_modules/
+
+# Backup files
+backup/
+
+# Environment variables
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.temp

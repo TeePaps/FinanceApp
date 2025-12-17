@@ -1,0 +1,192 @@
+/**
+ * Layout styles for the Finance App.
+ *
+ * Includes container, header, tabs, and grid layouts.
+ */
+
+/* Container */
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+/* Header */
+.header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}
+
+.header-buttons {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.global-last-updated {
+    font-size: 0.85em;
+    color: var(--text-muted);
+    padding: 6px 12px;
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+    border: 1px solid var(--border-color);
+    cursor: default;
+}
+
+/* Theme Toggle */
+.theme-toggle {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 1.2em;
+    transition: background 0.2s;
+}
+
+.theme-toggle:hover {
+    background: var(--bg-hover);
+}
+
+/* Tabs */
+.tabs {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 20px;
+    border-bottom: 2px solid var(--border-color);
+    padding-bottom: 10px;
+    flex-wrap: wrap;
+}
+
+.tab-btn {
+    padding: 10px 20px;
+    background: var(--bg-hover);
+    border: none;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    font-size: 1em;
+    color: var(--text-secondary);
+}
+
+.tab-btn:hover {
+    background: var(--bg-tertiary);
+}
+
+.tab-btn.active {
+    background: #007bff;
+    color: white;
+}
+
+.tab-content {
+    display: none;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+/* Grid Layouts */
+.grid-2 {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 20px;
+}
+
+.grid-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+}
+
+.grid-4 {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 20px;
+}
+
+.grid-auto {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 20px;
+}
+
+/* Flex Layouts */
+.flex-row {
+    display: flex;
+    flex-direction: row;
+    gap: 10px;
+}
+
+.flex-col {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.flex-center {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.flex-between {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* Two Column Layout */
+.two-column-layout {
+    display: grid;
+    grid-template-columns: 1fr 300px;
+    gap: 30px;
+}
+
+.main-content {
+    min-width: 0;
+}
+
+.sidebar {
+    position: sticky;
+    top: 20px;
+    height: fit-content;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+    .two-column-layout {
+        grid-template-columns: 1fr;
+    }
+
+    .sidebar {
+        position: static;
+    }
+}
+
+@media (max-width: 768px) {
+    .grid-2,
+    .grid-3,
+    .grid-4 {
+        grid-template-columns: 1fr;
+    }
+
+    .tabs {
+        flex-direction: column;
+    }
+
+    .header-row {
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    body {
+        padding: 10px;
+    }
+}
