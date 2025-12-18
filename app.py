@@ -1177,7 +1177,15 @@ def fetch_eps_for_ticker(ticker, existing_valuation=None, retry_count=0):
 
 
 def run_screener(index_name='all'):
-    """Optimized background task - batch prices + parallel EPS fetching"""
+    """
+    Optimized background task for stock screening.
+
+    Phase order (prioritizes fundamental data over prices):
+    1. SEC EPS data - fetch/cache EPS from SEC EDGAR
+    2. Dividends - fetch dividend data for tickers missing it
+    3. Prices - batch download current prices
+    4. Build valuations - combine all data
+    """
     global screener_running, screener_progress, screener_current_index
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1193,48 +1201,21 @@ def run_screener(index_name='all'):
 
     log.info(f"Screener: {len(tickers)} tickers to process, {len(existing_valuations)} cached valuations")
 
-    # Phase 1: Batch download all prices (fast - ~30 seconds for 2600 tickers)
+    # Initialize progress
     screener_progress = {
         'current': 0, 'total': len(tickers),
-        'ticker': 'Batch downloading prices...',
-        'status': 'running', 'phase': 'prices',
+        'ticker': 'Starting...',
+        'status': 'running', 'phase': 'eps',
         'index': index_name, 'index_name': index_display_name
     }
 
-    log.info("Screener Phase 1: Batch downloading prices...")
+    # =========================================================================
+    # PHASE 1: SEC EPS Data (prioritize fundamental data)
+    # =========================================================================
+    log.info("Screener Phase 1: Loading SEC EPS data...")
     phase1_start = time.time()
-    try:
-        price_data = yf.download(tickers, period='3mo', progress=False, threads=True)
-
-        # Reuse cached 52-week data from existing valuations (rarely changes)
-        # Only tickers without cached data will be missing this info
-        info_cache = {}
-        for t in tickers:
-            existing = existing_valuations.get(t, {})
-            if existing.get('fifty_two_week_high'):
-                info_cache[t] = {
-                    'fiftyTwoWeekHigh': existing.get('fifty_two_week_high', 0),
-                    'fiftyTwoWeekLow': existing.get('fifty_two_week_low', 0),
-                    'shortName': existing.get('company_name', t)
-                }
-        screener_progress['current'] = len(tickers)
-        log.info(f"Screener Phase 1 complete: {time.time() - phase1_start:.1f}s, reusing cached 52-week data for {len(info_cache)} tickers")
-    except Exception as e:
-        log_error(f"Screener Phase 1 failed after {time.time() - phase1_start:.1f}s", e)
-        price_data = None
-        info_cache = {}
-
-    if not screener_running:
-        screener_progress['status'] = 'cancelled'
-        screener_running = False
-        return
-
-    # Phase 2: Get EPS from SEC data (no Yahoo API calls - avoids rate limiting)
-    log.info("Screener Phase 2: Loading SEC EPS data...")
-    phase2_start = time.time()
     screener_progress['phase'] = 'eps'
     screener_progress['ticker'] = 'Loading SEC EPS data...'
-    screener_progress['total'] = len(tickers)
     screener_progress['current'] = 0
 
     eps_results = {}
@@ -1274,7 +1255,67 @@ def run_screener(index_name='all'):
             sec_misses += 1
 
     screener_progress['current'] = len(tickers)
-    log.info(f"Screener Phase 2 complete: {time.time() - phase2_start:.1f}s, SEC EPS: {sec_hits} found, {sec_misses} missing")
+    log.info(f"Screener Phase 1 complete: {time.time() - phase1_start:.1f}s, SEC EPS: {sec_hits} found, {sec_misses} missing")
+
+    if not screener_running:
+        screener_progress['status'] = 'cancelled'
+        screener_running = False
+        log.info("Screener cancelled after Phase 1")
+        return
+
+    # =========================================================================
+    # PHASE 2: Dividends (fetch for ALL tickers missing dividend data)
+    # =========================================================================
+    # Identify tickers needing dividend data - NOT dependent on price success
+    tickers_needing_dividends = [
+        t for t in tickers
+        if not existing_valuations.get(t, {}).get('annual_dividend')
+        and not eps_results.get(t, {}).get('annual_dividend')
+    ]
+
+    dividend_data = {}  # Store fetched dividend data
+    if tickers_needing_dividends:
+        log.info(f"Screener Phase 2: Fetching dividends for {len(tickers_needing_dividends)} tickers...")
+        phase2_start = time.time()
+        screener_progress['phase'] = 'dividends'
+        screener_progress['ticker'] = f'Fetching dividends (0/{len(tickers_needing_dividends)})...'
+        screener_progress['total'] = len(tickers_needing_dividends)
+        screener_progress['current'] = 0
+
+        dividend_count = 0
+        for i, ticker in enumerate(tickers_needing_dividends):
+            if not screener_running:
+                break
+            if i % 50 == 0:
+                screener_progress['current'] = i
+                screener_progress['ticker'] = f'Fetching dividends... {i}/{len(tickers_needing_dividends)} ({dividend_count} found)'
+
+            try:
+                stock = yf.Ticker(ticker)
+                dividends = stock.dividends
+
+                if dividends is not None and len(dividends) > 0:
+                    from datetime import timedelta
+                    one_year_ago = datetime.now() - timedelta(days=365)
+                    recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
+                    annual_dividend = sum(float(d) for d in recent_dividends)
+
+                    if annual_dividend > 0:
+                        dividend_data[ticker] = {
+                            'annual_dividend': round(annual_dividend, 2),
+                            'last_dividend': round(float(dividends.iloc[-1]), 4),
+                            'last_dividend_date': dividends.index[-1].strftime('%Y-%m-%d')
+                        }
+                        dividend_count += 1
+
+                time.sleep(0.15)
+            except Exception:
+                pass
+
+        screener_progress['current'] = len(tickers_needing_dividends)
+        log.info(f"Screener Phase 2 complete: {time.time() - phase2_start:.1f}s, found dividends for {dividend_count}/{len(tickers_needing_dividends)} tickers")
+    else:
+        log.info("Screener Phase 2: All tickers have dividend data, skipping fetch")
 
     if not screener_running:
         screener_progress['status'] = 'cancelled'
@@ -1282,11 +1323,49 @@ def run_screener(index_name='all'):
         log.info("Screener cancelled after Phase 2")
         return
 
-    # Phase 4: Combine price data with EPS data (VECTORIZED)
-    log.info("Screener Phase 3: Building valuations (vectorized)...")
+    # =========================================================================
+    # PHASE 3: Batch download prices (fast - ~30 seconds for 2600 tickers)
+    # =========================================================================
+    log.info("Screener Phase 3: Batch downloading prices...")
     phase3_start = time.time()
+    screener_progress['phase'] = 'prices'
+    screener_progress['ticker'] = 'Batch downloading prices...'
+    screener_progress['total'] = len(tickers)
+    screener_progress['current'] = 0
+
+    price_data = None
+    info_cache = {}
+    try:
+        price_data = yf.download(tickers, period='3mo', progress=False, threads=True)
+
+        # Reuse cached 52-week data from existing valuations (rarely changes)
+        for t in tickers:
+            existing = existing_valuations.get(t, {})
+            if existing.get('fifty_two_week_high'):
+                info_cache[t] = {
+                    'fiftyTwoWeekHigh': existing.get('fifty_two_week_high', 0),
+                    'fiftyTwoWeekLow': existing.get('fifty_two_week_low', 0),
+                    'shortName': existing.get('company_name', t)
+                }
+        screener_progress['current'] = len(tickers)
+        log.info(f"Screener Phase 3 complete: {time.time() - phase3_start:.1f}s, reusing cached 52-week data for {len(info_cache)} tickers")
+    except Exception as e:
+        log_error(f"Screener Phase 3 failed after {time.time() - phase3_start:.1f}s", e)
+        price_data = None
+        info_cache = {}
+
+    if not screener_running:
+        screener_progress['status'] = 'cancelled'
+        screener_running = False
+        return
+
+    # =========================================================================
+    # PHASE 4: Build valuations (VECTORIZED)
+    # =========================================================================
+    log.info("Screener Phase 4: Building valuations (vectorized)...")
+    phase4_start = time.time()
     screener_progress['phase'] = 'combining'
-    screener_progress['ticker'] = 'Building valuations (vectorized)...'
+    screener_progress['ticker'] = 'Building valuations...'
     screener_progress['total'] = len(tickers)
 
     valuations_batch = {}
@@ -1369,51 +1448,8 @@ def run_screener(index_name='all'):
 
             log.info(f"Screener: Recovered {retry_count}/{len(failed_tickers)} tickers from individual fetches")
 
-        # Phase 3.6: Fetch dividends for tickers missing dividend data
-        tickers_needing_dividends = [
-            t for t in tickers
-            if t in current_prices_dict and not existing_valuations.get(t, {}).get('annual_dividend')
-        ]
-
-        if tickers_needing_dividends:
-            screener_progress['phase'] = 'dividends'
-            screener_progress['ticker'] = f'Fetching dividends for {len(tickers_needing_dividends)} tickers...'
-            log.info(f"Screener: Fetching dividends for {len(tickers_needing_dividends)} tickers...")
-
-            dividend_count = 0
-            for i, ticker in enumerate(tickers_needing_dividends):
-                if not screener_running:
-                    break
-                if i % 50 == 0:
-                    screener_progress['current'] = i
-                    screener_progress['ticker'] = f'Fetching dividends... {i}/{len(tickers_needing_dividends)} ({dividend_count} with dividends)'
-
-                try:
-                    stock = yf.Ticker(ticker)
-                    dividends = stock.dividends
-
-                    if dividends is not None and len(dividends) > 0:
-                        from datetime import timedelta
-                        one_year_ago = datetime.now() - timedelta(days=365)
-                        recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
-                        annual_dividend = sum(float(d) for d in recent_dividends)
-
-                        if annual_dividend > 0:
-                            # Store in existing_valuations for use in valuation building
-                            if ticker not in existing_valuations:
-                                existing_valuations[ticker] = {}
-                            existing_valuations[ticker]['annual_dividend'] = round(annual_dividend, 2)
-                            existing_valuations[ticker]['last_dividend'] = round(float(dividends.iloc[-1]), 4)
-                            existing_valuations[ticker]['last_dividend_date'] = dividends.index[-1].strftime('%Y-%m-%d')
-                            dividend_count += 1
-
-                    time.sleep(0.15)  # Slightly faster for dividend-only calls
-                except Exception:
-                    pass
-
-            log.info(f"Screener: Found dividends for {dividend_count}/{len(tickers_needing_dividends)} tickers")
-
         # Build valuations using pre-computed data
+        # Note: Dividends were fetched in Phase 2 (before prices)
         now_iso = datetime.now().isoformat()
 
         for i, ticker in enumerate(tickers):
@@ -1446,7 +1482,15 @@ def run_screener(index_name='all'):
             # Get EPS data (from new fetch or existing)
             eps_info = eps_results.get(ticker) or existing_valuations.get(ticker, {})
             eps_avg = eps_info.get('eps_avg')
-            annual_dividend = eps_info.get('annual_dividend', 0) or 0
+
+            # Get dividend data - check Phase 2 fetch first, then eps_info, then existing
+            div_info = dividend_data.get(ticker, {})
+            annual_dividend = (
+                div_info.get('annual_dividend') or
+                eps_info.get('annual_dividend') or
+                existing_valuations.get(ticker, {}).get('annual_dividend') or
+                0
+            )
 
             # Use fetched company name if available
             if eps_info.get('company_name'):
@@ -1509,7 +1553,7 @@ def run_screener(index_name='all'):
     data['last_updated'] = datetime.now().isoformat()
 
     # Save to consolidated data_manager
-    log.info(f"Screener Phase 3 complete: {time.time() - phase3_start:.1f}s, built {len(valuations_batch)} valuations")
+    log.info(f"Screener Phase 4 complete: {time.time() - phase4_start:.1f}s, built {len(valuations_batch)} valuations")
     if valuations_batch:
         data_manager.bulk_update_valuations(valuations_batch)
         log.info(f"Screener: Saved {len(valuations_batch)} valuations to data_manager")
