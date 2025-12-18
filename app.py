@@ -2483,13 +2483,14 @@ def run_global_refresh():
 
 @app.route('/api/refresh', methods=['POST'])
 def api_global_refresh():
-    """Start a global refresh of all data"""
+    """Start a global refresh of all data - uses run_screener with 'all' index"""
     global screener_running
 
     if screener_running:
         return jsonify({'error': 'Update already running'}), 400
 
-    thread = threading.Thread(target=run_global_refresh)
+    # Use run_screener which has the correct phase order: EPS -> Dividends -> Prices
+    thread = threading.Thread(target=run_screener, args=('all',))
     thread.daemon = True
     thread.start()
 
