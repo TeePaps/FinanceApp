@@ -1,10 +1,17 @@
 """
 SQLite Database Module for the Finance App.
 
-Provides database connection, schema initialization, and CRUD operations
-for all data previously stored in flat files.
+Provides database connection, schema initialization, and CRUD operations.
 
-Tables:
+Two separate databases:
+- data_private/private.db: User's personal data (holdings, transactions)
+- data_public/public.db: Public market data (SEC, indexes, valuations)
+
+Private Database Tables:
+- stocks: User's stock registry
+- transactions: User's transaction history
+
+Public Database Tables:
 - indexes: Index definitions (sp500, nasdaq100, etc.)
 - tickers: Ticker metadata and status
 - ticker_indexes: Many-to-many relationship
@@ -13,8 +20,7 @@ Tables:
 - eps_history: EPS history per ticker
 - cik_mapping: Ticker to CIK mapping
 - ticker_failures: Failed ticker tracking
-- stocks: User's stock registry
-- transactions: User's transaction history
+- sec_filings: 10-K filing URLs
 - metadata: Cache/system metadata
 """
 
@@ -24,9 +30,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple, Any
 from contextlib import contextmanager
 
-# Database path
+# Database paths
 BASE_DIR = os.path.dirname(__file__)
-DATABASE_PATH = os.path.join(BASE_DIR, 'finance_app.db')
+PRIVATE_DB_PATH = os.path.join(BASE_DIR, 'data_private', 'private.db')
+PUBLIC_DB_PATH = os.path.join(BASE_DIR, 'data_public', 'public.db')
 
 # Valid indexes
 VALID_INDICES = ['sp500', 'nasdaq100', 'dow30', 'sp600', 'russell2000']
@@ -39,18 +46,18 @@ INDEX_NAMES = {
 }
 
 
-def get_connection() -> sqlite3.Connection:
+def _get_connection(db_path: str) -> sqlite3.Connection:
     """Get a database connection with row factory enabled."""
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 @contextmanager
-def get_db():
-    """Context manager for database connections."""
-    conn = get_connection()
+def get_public_db():
+    """Context manager for public database connections."""
+    conn = _get_connection(PUBLIC_DB_PATH)
     try:
         yield conn
         conn.commit()
@@ -61,9 +68,38 @@ def get_db():
         conn.close()
 
 
+@contextmanager
+def get_private_db():
+    """Context manager for private database connections."""
+    conn = _get_connection(PRIVATE_DB_PATH)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# Backward compatibility alias - defaults to public database
+@contextmanager
+def get_db():
+    """Context manager for database connections (defaults to public)."""
+    with get_public_db() as conn:
+        yield conn
+
+
 def init_database():
-    """Initialize the database schema."""
-    with get_db() as conn:
+    """Initialize both database schemas."""
+    _init_public_database()
+    _init_private_database()
+    print("[Database] Both schemas initialized successfully")
+
+
+def _init_public_database():
+    """Initialize the public database schema."""
+    with get_public_db() as conn:
         cursor = conn.cursor()
 
         # Indexes table
@@ -99,7 +135,7 @@ def init_database():
             )
         ''')
 
-        # Valuations table (no foreign key - may have valuations for tickers not tracked)
+        # Valuations table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS valuations (
                 ticker TEXT PRIMARY KEY,
@@ -170,6 +206,49 @@ def init_database():
             )
         ''')
 
+        # Metadata table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated TEXT
+            )
+        ''')
+
+        # SEC Filings table (10-K document URLs)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sec_filings (
+                ticker TEXT NOT NULL,
+                fiscal_year INTEGER NOT NULL,
+                form_type TEXT NOT NULL,
+                accession_number TEXT NOT NULL,
+                filing_date TEXT NOT NULL,
+                document_url TEXT NOT NULL,
+                updated TEXT NOT NULL,
+                PRIMARY KEY (ticker, fiscal_year, form_type)
+            )
+        ''')
+
+        # Create indexes
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticker_indexes_ticker ON ticker_indexes(ticker)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticker_indexes_index ON ticker_indexes(index_name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_eps_history_ticker ON eps_history(ticker)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuations_price_vs_value ON valuations(price_vs_value)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sec_filings_ticker ON sec_filings(ticker)')
+
+        # Insert default indexes
+        for name, (display_name, short_name) in INDEX_NAMES.items():
+            cursor.execute('''
+                INSERT OR IGNORE INTO indexes (name, display_name, short_name)
+                VALUES (?, ?, ?)
+            ''', (name, display_name, short_name))
+
+
+def _init_private_database():
+    """Initialize the private database schema."""
+    with get_private_db() as conn:
+        cursor = conn.cursor()
+
         # Stocks table (user holdings)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS stocks (
@@ -179,7 +258,7 @@ def init_database():
             )
         ''')
 
-        # Transactions table (user transactions)
+        # Transactions table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY,
@@ -193,30 +272,8 @@ def init_database():
             )
         ''')
 
-        # Metadata table (for cache timestamps, etc.)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated TEXT
-            )
-        ''')
-
-        # Create indexes for better query performance
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticker_indexes_ticker ON ticker_indexes(ticker)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticker_indexes_index ON ticker_indexes(index_name)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_eps_history_ticker ON eps_history(ticker)')
+        # Create indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_transactions_ticker ON transactions(ticker)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuations_price_vs_value ON valuations(price_vs_value)')
-
-        # Insert default indexes
-        for name, (display_name, short_name) in INDEX_NAMES.items():
-            cursor.execute('''
-                INSERT OR IGNORE INTO indexes (name, display_name, short_name)
-                VALUES (?, ?, ?)
-            ''', (name, display_name, short_name))
-
-        print("[Database] Schema initialized successfully")
 
 
 # =============================================================================
@@ -652,6 +709,72 @@ def get_sec_company_count() -> int:
 
 
 # =============================================================================
+# SEC Filings Operations (10-K document URLs)
+# =============================================================================
+
+def get_sec_filings(ticker: str) -> List[Dict]:
+    """Get SEC 10-K filing URLs for a ticker."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT fiscal_year, form_type, accession_number, filing_date, document_url, updated
+            FROM sec_filings WHERE ticker = ?
+            ORDER BY fiscal_year DESC
+        ''', (ticker.upper(),))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def save_sec_filings(ticker: str, filings: List[Dict]):
+    """Save SEC 10-K filing URLs for a ticker."""
+    ticker = ticker.upper()
+    now = datetime.now().isoformat()
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Clear existing filings for this ticker
+        cursor.execute('DELETE FROM sec_filings WHERE ticker = ?', (ticker,))
+
+        # Insert new filings
+        for filing in filings:
+            cursor.execute('''
+                INSERT INTO sec_filings (ticker, fiscal_year, form_type, accession_number,
+                                        filing_date, document_url, updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                ticker,
+                filing.get('fiscal_year'),
+                filing.get('form_type'),
+                filing.get('accession_number'),
+                filing.get('filing_date'),
+                filing.get('document_url'),
+                now
+            ))
+
+
+def get_sec_filings_last_updated(ticker: str) -> Optional[str]:
+    """Get the last update timestamp for a ticker's filings."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT MAX(updated) as latest FROM sec_filings WHERE ticker = ?
+        ''', (ticker.upper(),))
+        row = cursor.fetchone()
+        return row['latest'] if row else None
+
+
+def get_latest_filing_year(ticker: str) -> Optional[int]:
+    """Get the most recent fiscal year we have a filing for."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT MAX(fiscal_year) as latest_year FROM sec_filings WHERE ticker = ?
+        ''', (ticker.upper(),))
+        row = cursor.fetchone()
+        return row['latest_year'] if row else None
+
+
+# =============================================================================
 # CIK Mapping Operations
 # =============================================================================
 
@@ -748,12 +871,12 @@ def get_excluded_tickers(threshold: int = 3) -> List[str]:
 
 
 # =============================================================================
-# User Holdings Operations (Stocks & Transactions)
+# User Holdings Operations (Stocks & Transactions) - Uses PRIVATE database
 # =============================================================================
 
 def get_stocks() -> List[Dict]:
     """Get all user stocks."""
-    with get_db() as conn:
+    with get_private_db() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM stocks ORDER BY ticker')
         return [dict(row) for row in cursor.fetchall()]
@@ -761,7 +884,7 @@ def get_stocks() -> List[Dict]:
 
 def add_stock(ticker: str, name: str, stock_type: str = 'stock'):
     """Add a stock to the registry."""
-    with get_db() as conn:
+    with get_private_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO stocks (ticker, name, type)
@@ -774,14 +897,14 @@ def add_stock(ticker: str, name: str, stock_type: str = 'stock'):
 
 def remove_stock(ticker: str):
     """Remove a stock from the registry."""
-    with get_db() as conn:
+    with get_private_db() as conn:
         cursor = conn.cursor()
         cursor.execute('DELETE FROM stocks WHERE ticker = ?', (ticker.upper(),))
 
 
 def get_transactions() -> List[Dict]:
     """Get all user transactions."""
-    with get_db() as conn:
+    with get_private_db() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM transactions ORDER BY id')
         return [dict(row) for row in cursor.fetchall()]
@@ -789,7 +912,7 @@ def get_transactions() -> List[Dict]:
 
 def get_transactions_for_ticker(ticker: str) -> List[Dict]:
     """Get transactions for a specific ticker."""
-    with get_db() as conn:
+    with get_private_db() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM transactions WHERE ticker = ? ORDER BY id', (ticker.upper(),))
         return [dict(row) for row in cursor.fetchall()]
@@ -798,7 +921,7 @@ def get_transactions_for_ticker(ticker: str) -> List[Dict]:
 def add_transaction(ticker: str, action: str, shares: int, price: float,
                    gain_pct: float = None, date: str = None, status: str = None) -> int:
     """Add a transaction and return its ID."""
-    with get_db() as conn:
+    with get_private_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO transactions (ticker, action, shares, price, gain_pct, date, status)
@@ -809,7 +932,7 @@ def add_transaction(ticker: str, action: str, shares: int, price: float,
 
 def update_transaction(txn_id: int, updates: Dict):
     """Update a transaction."""
-    with get_db() as conn:
+    with get_private_db() as conn:
         cursor = conn.cursor()
         set_parts = []
         values = []
@@ -827,14 +950,14 @@ def update_transaction(txn_id: int, updates: Dict):
 
 def delete_transaction(txn_id: int):
     """Delete a transaction."""
-    with get_db() as conn:
+    with get_private_db() as conn:
         cursor = conn.cursor()
         cursor.execute('DELETE FROM transactions WHERE id = ?', (txn_id,))
 
 
 def get_next_transaction_id() -> int:
     """Get the next available transaction ID."""
-    with get_db() as conn:
+    with get_private_db() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT MAX(id) as max_id FROM transactions')
         row = cursor.fetchone()
@@ -916,6 +1039,6 @@ def get_data_stats() -> Dict:
         }
 
 
-# Initialize database on import
-if not os.path.exists(DATABASE_PATH):
+# Initialize databases on import if needed
+if not os.path.exists(PUBLIC_DB_PATH) or not os.path.exists(PRIVATE_DB_PATH):
     init_database()

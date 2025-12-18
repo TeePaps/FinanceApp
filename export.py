@@ -8,7 +8,7 @@ from config import STOCKS_FILE, TRANSACTIONS_FILE
 
 
 def read_user_csv(filepath):
-    """Read CSV file from user_data directory."""
+    """Read CSV file from data_private directory."""
     with open(filepath, 'r') as f:
         reader = csv.DictReader(f)
         return list(reader)

@@ -1,5 +1,217 @@
 let stocksList = [];
 
+// Ticker autocomplete cache
+let tickerCache = [];
+let autocompleteSelectedIndex = -1;
+
+// Collapsible section toggle
+function toggleCollapsible(sectionId) {
+    const section = document.getElementById(sectionId);
+    if (section) {
+        section.classList.toggle('collapsed');
+    }
+}
+
+// 10-K Filings Functions
+async function load10KFilings(ticker) {
+    const dropdown = document.getElementById('tenk-filings-dropdown');
+    if (!dropdown) return;
+
+    try {
+        const response = await fetch(`/api/sec-filings/${ticker}`);
+        const filings = await response.json();
+
+        if (filings && filings.length > 0) {
+            dropdown.innerHTML = '<option value="">View 10-K...</option>';
+            for (const filing of filings) {
+                const label = `FY${filing.fiscal_year}${filing.form_type === '10-K/A' ? ' (Amended)' : ''}`;
+                dropdown.innerHTML += `<option value="${filing.document_url}">${label}</option>`;
+            }
+            dropdown.disabled = false;
+        } else {
+            dropdown.innerHTML = '<option value="">No 10-K filings</option>';
+        }
+    } catch (error) {
+        console.error('Error loading 10-K filings:', error);
+        dropdown.innerHTML = '<option value="">Error loading</option>';
+    }
+}
+
+function openTenKFiling(url) {
+    if (url) {
+        window.open(url, '_blank');
+        // Reset dropdown after opening
+        const dropdown = document.getElementById('tenk-filings-dropdown');
+        if (dropdown) dropdown.selectedIndex = 0;
+    }
+}
+
+// Fuzzy search for ticker autocomplete
+function fuzzySearchTickers(query, maxResults = 10) {
+    if (!query || query.length < 1) return [];
+
+    const q = query.toLowerCase();
+    const results = [];
+
+    for (const item of tickerCache) {
+        const ticker = item.ticker.toLowerCase();
+        const name = (item.company_name || '').toLowerCase();
+
+        // Exact ticker match - highest priority
+        if (ticker === q) {
+            results.push({ ...item, score: 100, matchType: 'exact' });
+            continue;
+        }
+
+        // Ticker starts with query - high priority
+        if (ticker.startsWith(q)) {
+            results.push({ ...item, score: 90 - ticker.length, matchType: 'ticker-start' });
+            continue;
+        }
+
+        // Ticker contains query
+        if (ticker.includes(q)) {
+            results.push({ ...item, score: 70, matchType: 'ticker-contains' });
+            continue;
+        }
+
+        // Company name starts with query word
+        const nameWords = name.split(/\s+/);
+        const startsWithWord = nameWords.some(word => word.startsWith(q));
+        if (startsWithWord) {
+            results.push({ ...item, score: 60, matchType: 'name-word' });
+            continue;
+        }
+
+        // Company name contains query
+        if (name.includes(q)) {
+            results.push({ ...item, score: 40, matchType: 'name-contains' });
+            continue;
+        }
+    }
+
+    // Sort by score descending, then by ticker alphabetically
+    results.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.ticker.localeCompare(b.ticker);
+    });
+
+    return results.slice(0, maxResults);
+}
+
+// Initialize ticker autocomplete
+function initTickerAutocomplete() {
+    const input = document.getElementById('research-ticker');
+    const dropdown = document.getElementById('ticker-autocomplete');
+    if (!input || !dropdown) return;
+
+    // Fetch ticker list for autocomplete
+    fetch('/api/all-tickers')
+        .then(res => res.json())
+        .then(data => {
+            tickerCache = data.tickers || [];
+        })
+        .catch(err => console.error('Error loading tickers for autocomplete:', err));
+
+    // Input event - show suggestions
+    input.addEventListener('input', function() {
+        const query = this.value.trim();
+        autocompleteSelectedIndex = -1;
+
+        if (query.length < 1) {
+            dropdown.style.display = 'none';
+            dropdown.innerHTML = '';
+            return;
+        }
+
+        const results = fuzzySearchTickers(query);
+
+        if (results.length === 0) {
+            dropdown.style.display = 'none';
+            dropdown.innerHTML = '';
+            return;
+        }
+
+        dropdown.innerHTML = results.map((item, idx) => `
+            <div class="autocomplete-item" data-ticker="${item.ticker}" data-index="${idx}">
+                <span class="autocomplete-ticker">${highlightMatch(item.ticker, query)}</span>
+                <span class="autocomplete-name">${highlightMatch(item.company_name || '', query)}</span>
+            </div>
+        `).join('');
+
+        dropdown.style.display = 'block';
+
+        // Add click handlers
+        dropdown.querySelectorAll('.autocomplete-item').forEach(item => {
+            item.addEventListener('click', function() {
+                selectAutocompleteItem(this.dataset.ticker);
+            });
+        });
+    });
+
+    // Keyboard navigation
+    input.addEventListener('keydown', function(e) {
+        const items = dropdown.querySelectorAll('.autocomplete-item');
+        if (items.length === 0) return;
+
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            autocompleteSelectedIndex = Math.min(autocompleteSelectedIndex + 1, items.length - 1);
+            updateAutocompleteSelection(items);
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            autocompleteSelectedIndex = Math.max(autocompleteSelectedIndex - 1, -1);
+            updateAutocompleteSelection(items);
+        } else if (e.key === 'Enter' && autocompleteSelectedIndex >= 0) {
+            e.preventDefault();
+            const selectedItem = items[autocompleteSelectedIndex];
+            if (selectedItem) {
+                selectAutocompleteItem(selectedItem.dataset.ticker);
+            }
+        } else if (e.key === 'Escape') {
+            dropdown.style.display = 'none';
+            autocompleteSelectedIndex = -1;
+        }
+    });
+
+    // Close dropdown when clicking outside
+    document.addEventListener('click', function(e) {
+        if (!input.contains(e.target) && !dropdown.contains(e.target)) {
+            dropdown.style.display = 'none';
+            autocompleteSelectedIndex = -1;
+        }
+    });
+}
+
+function highlightMatch(text, query) {
+    if (!text || !query) return text;
+    const regex = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    return text.replace(regex, '<mark>$1</mark>');
+}
+
+function updateAutocompleteSelection(items) {
+    items.forEach((item, idx) => {
+        item.classList.toggle('selected', idx === autocompleteSelectedIndex);
+    });
+    // Scroll selected item into view
+    if (autocompleteSelectedIndex >= 0 && items[autocompleteSelectedIndex]) {
+        items[autocompleteSelectedIndex].scrollIntoView({ block: 'nearest' });
+    }
+}
+
+function selectAutocompleteItem(ticker) {
+    const input = document.getElementById('research-ticker');
+    const dropdown = document.getElementById('ticker-autocomplete');
+
+    input.value = ticker;
+    dropdown.style.display = 'none';
+    dropdown.innerHTML = '';
+    autocompleteSelectedIndex = -1;
+
+    // Automatically run the valuation
+    runValuation();
+}
+
 document.addEventListener('DOMContentLoaded', function() {
     loadStocks();
     loadHoldings();
@@ -8,6 +220,7 @@ document.addEventListener('DOMContentLoaded', function() {
     initTheme();
     restoreTabFromHash();
     loadGlobalLastUpdated();
+    initTickerAutocomplete();
 });
 
 // Handle browser back/forward buttons
@@ -1446,9 +1659,15 @@ function renderValuation(data, refreshInfo = '') {
     const hasEnoughYears = data.has_enough_years;
     const minYearsRecommended = data.min_years_recommended || 8;
 
-    // Data source badge
+    // Data source badge and 10-K dropdown
     const sourceLabel = data.eps_source === 'sec' ? 'SEC EDGAR' : 'yfinance';
     const sourceBadge = `<span class="data-source-badge ${data.eps_source}">${sourceLabel}</span>`;
+    const tenKDropdown = `<select id="tenk-filings-dropdown" class="tenk-dropdown" onchange="openTenKFiling(this.value)" disabled>
+        <option value="">View 10-K...</option>
+    </select>`;
+
+    // Fetch 10-K filings asynchronously after render
+    setTimeout(() => load10KFilings(data.ticker), 0);
 
     // Note for fewer than recommended years
     let dataWarning = '';
@@ -1456,13 +1675,23 @@ function renderValuation(data, refreshInfo = '') {
         dataWarning = `<div class="data-warning">Based on ${data.eps_years} years of data (${minYearsRecommended}+ years recommended for reliable valuation)</div>`;
     }
 
+    // Note for cached data (rate limited fallback)
+    let cacheNotice = '';
+    if (data.from_cache) {
+        cacheNotice = `<div class="cache-notice">⚠️ ${data.cache_note || 'Showing cached data due to rate limiting'}</div>`;
+    }
+
     let html = `
         ${refreshInfo}
         <div class="valuation-header">
             <h3>${data.ticker} - ${data.company_name}</h3>
-            ${sourceBadge}
+            <div class="valuation-header-controls">
+                ${sourceBadge}
+                ${tenKDropdown}
+            </div>
         </div>
 
+        ${cacheNotice}
         ${dataWarning}
 
         <div class="valuation-summary">
@@ -1514,10 +1743,13 @@ function renderValuation(data, refreshInfo = '') {
 
     for (const eps of data.eps_data) {
         const rowClass = eps.eps <= 0 ? 'negative-eps-row' : '';
-        const epsType = eps.eps_type === 'basic' ? 'Basic' : 'Diluted';
+        // Get EPS type - support both old format ('basic'/'diluted') and new descriptive labels
+        let epsType = eps.eps_type || eps.type || 'Diluted EPS';
+        if (epsType === 'basic') epsType = 'Basic EPS';
+        else if (epsType === 'diluted') epsType = 'Diluted EPS';
         // Format fiscal period as "Mon YYYY - Mon YYYY"
-        let fiscalPeriod = '';
-        if (eps.period_start && eps.period_end) {
+        let fiscalPeriod = eps.fiscal_period || '';
+        if (!fiscalPeriod && eps.period_start && eps.period_end) {
             const formatPeriodDate = (dateStr) => {
                 const d = new Date(dateStr);
                 const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -1591,48 +1823,85 @@ function renderValuation(data, refreshInfo = '') {
         </div>
     `;
 
-    // SEC Metrics Section (Latest Year - All EPS Types)
-    if (data.sec_metrics && data.sec_metrics.eps_metrics) {
-        const metrics = data.sec_metrics.eps_metrics;
-        const metricsList = Object.values(metrics);
+    // SEC Metrics Section - Multi-year EPS Matrix (types on Y, years on X)
+    if (data.sec_metrics && data.sec_metrics.eps_matrix) {
+        const epsMatrix = data.sec_metrics.eps_matrix;
+        const years = data.sec_metrics.eps_years || [];
+        const epsTypes = Object.keys(epsMatrix);
 
-        if (metricsList.length > 0) {
-            // Get period info from first metric
-            const firstMetric = metricsList[0];
-            let periodInfo = '';
-            if (firstMetric.period_start && firstMetric.period_end) {
-                const formatDate = (dateStr) => {
-                    const d = new Date(dateStr);
-                    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-                    return `${months[d.getMonth()]} ${d.getFullYear()}`;
-                };
-                periodInfo = ` (${formatDate(firstMetric.period_start)} - ${formatDate(firstMetric.period_end)})`;
-            }
-
+        if (epsTypes.length > 0 && years.length > 0) {
             html += `
         <div class="metrics-section">
-            <h3>SEC Reported Metrics - FY${firstMetric.year}${periodInfo}</h3>
+            <h3>SEC Reported EPS - Annual (10-K)</h3>
             <div class="metrics-grid">
                 <div class="metric-category">
-                    <h4>Earnings Per Share</h4>
-                    <table class="summary-table">
+                    <table class="summary-table sec-matrix-table">
                         <thead>
                             <tr>
-                                <th>Metric</th>
-                                <th>Value</th>
+                                <th>EPS Type</th>
+                                ${years.map(y => `<th>FY${y}</th>`).join('')}
                             </tr>
                         </thead>
                         <tbody>
             `;
 
-            for (const metric of metricsList) {
-                const valueClass = metric.value < 0 ? 'negative-value' : '';
-                html += `
+            for (const epsType of epsTypes) {
+                const yearValues = epsMatrix[epsType];
+                html += `<tr><td>${epsType}</td>`;
+                for (const year of years) {
+                    const val = yearValues[year];
+                    if (val !== undefined) {
+                        const valueClass = val < 0 ? 'negative-value' : '';
+                        html += `<td class="${valueClass}">${formatMoney(val)}</td>`;
+                    } else {
+                        html += `<td class="no-data">-</td>`;
+                    }
+                }
+                html += `</tr>`;
+            }
+
+            html += `
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+            `;
+        }
+
+        // Dividend Matrix Section
+        const divMatrix = data.sec_metrics.dividend_matrix || {};
+        const divYears = data.sec_metrics.dividend_years || [];
+        const divTypes = Object.keys(divMatrix);
+
+        if (divTypes.length > 0 && divYears.length > 0) {
+            html += `
+        <div class="metrics-section">
+            <h3>SEC Reported Dividends - Annual (10-K)</h3>
+            <div class="metrics-grid">
+                <div class="metric-category">
+                    <table class="summary-table sec-matrix-table">
+                        <thead>
                             <tr>
-                                <td>${metric.label}</td>
-                                <td class="${valueClass}">${formatMoney(metric.value)}</td>
+                                <th>Dividend Type</th>
+                                ${divYears.map(y => `<th>FY${y}</th>`).join('')}
                             </tr>
-                `;
+                        </thead>
+                        <tbody>
+            `;
+
+            for (const divType of divTypes) {
+                const yearValues = divMatrix[divType];
+                html += `<tr><td>${divType}</td>`;
+                for (const year of divYears) {
+                    const val = yearValues[year];
+                    if (val !== undefined) {
+                        html += `<td>${formatMoney(val)}</td>`;
+                    } else {
+                        html += `<td class="no-data">-</td>`;
+                    }
+                }
+                html += `</tr>`;
             }
 
             html += `
@@ -2432,43 +2701,28 @@ async function loadDatasets() {
             document.getElementById('sec-freshness').textContent = 'No data';
         }
 
-        // Render index cards
+        // Render index cards in compact grid
         const indexCardsDiv = document.getElementById('index-cards');
-        let indexHtml = '<h3>Market Indexes</h3>';
+        let indexHtml = '<h3>Market Indexes</h3><div class="index-cards-grid">';
 
         for (const idx of data.indices) {
-            const lastUpdated = idx.last_updated
-                ? new Date(idx.last_updated).toLocaleString()
-                : 'Never';
-
             const coverageClass = idx.coverage_pct >= 90 ? 'good' :
                                   idx.coverage_pct >= 50 ? 'partial' : 'low';
 
             indexHtml += `
-                <div class="index-stat-card">
-                    <div class="index-header">
+                <div class="index-card-compact">
+                    <div class="index-card-header">
                         <span class="index-name">${idx.short_name}</span>
                         <span class="coverage-badge ${coverageClass}">${idx.coverage_pct}%</span>
                     </div>
-                    <div class="stat-row">
-                        <span class="stat-label">Tickers:</span>
-                        <span class="stat-value">${idx.valuations_count} / ${idx.total_tickers}</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-label">SEC Source:</span>
-                        <span class="stat-value">${idx.sec_source_count}</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-label">Avg EPS Years:</span>
-                        <span class="stat-value">${idx.avg_eps_years}</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-label">Last Updated:</span>
-                        <span class="stat-value small">${lastUpdated}</span>
+                    <div class="index-card-stats">
+                        <span class="index-stat">${idx.valuations_count}/${idx.total_tickers}</span>
+                        <span class="index-stat-label">tickers</span>
                     </div>
                 </div>
             `;
         }
+        indexHtml += '</div>';
         indexCardsDiv.innerHTML = indexHtml;
 
         // Render refresh summary if available
@@ -2476,6 +2730,9 @@ async function loadDatasets() {
 
         // Render EPS recommendations
         renderEpsRecommendations(recommendations);
+
+        // Load all tickers table
+        loadAllTickersTable();
 
         // Handle refresh status
         if (data.refresh.running) {
@@ -2498,54 +2755,32 @@ async function loadDatasets() {
 
 function renderRefreshSummary(summary, excludedInfo) {
     const detailsDiv = document.getElementById('datasets-details');
+    const inlineRefresh = document.getElementById('data-refresh-inline');
+
+    // Render inline refresh button in SEC EDGAR card
+    if (inlineRefresh) {
+        const excludedCount = excludedInfo?.count || 0;
+        const pendingCount = excludedInfo?.pending_failures || 0;
+        let inlineHtml = `
+            <button class="btn btn-primary btn-sm" onclick="startGlobalRefresh()">Update Prices</button>
+        `;
+        if (excludedCount > 0 || pendingCount > 0) {
+            inlineHtml += `<div class="excluded-info-compact">`;
+            if (excludedCount > 0) {
+                inlineHtml += `<span class="excluded-count-sm">${excludedCount} excluded</span>`;
+            }
+            if (pendingCount > 0) {
+                inlineHtml += `<span class="pending-count-sm">${pendingCount} pending</span>`;
+            }
+            inlineHtml += `<button class="btn-link-sm" onclick="clearExcludedTickers()">Reset</button>`;
+            inlineHtml += `</div>`;
+        }
+        inlineRefresh.innerHTML = inlineHtml;
+    }
+
     if (!detailsDiv) return;
 
     let html = '';
-
-    // Data refresh controls card - always show this
-    const excludedCount = excludedInfo?.count || 0;
-    html += `
-        <div class="dataset-card data-refresh-card">
-            <h3>Data Refresh</h3>
-            <div class="refresh-controls">
-                <button class="update-price-btn" onclick="startGlobalRefresh()">
-                    Update Price Data
-                </button>
-    `;
-
-    if (excludedCount > 0 || (excludedInfo?.pending_failures > 0)) {
-        const pendingCount = excludedInfo?.pending_failures || 0;
-        html += `
-                <div class="excluded-info-inline">
-        `;
-        if (excludedCount > 0) {
-            html += `
-                    <span class="excluded-count">${excludedCount} excluded</span>
-                    <span class="excluded-note">(failed 3+ times)</span>
-            `;
-        }
-        if (pendingCount > 0) {
-            html += `
-                    <span class="pending-count">${pendingCount} pending</span>
-                    <span class="excluded-note">(1-2 failures)</span>
-            `;
-        }
-        if (excludedCount > 0 || pendingCount > 0) {
-            html += `
-                    <button class="clear-excluded-btn-small" onclick="clearExcludedTickers()">
-                        Reset Counts
-                    </button>
-            `;
-        }
-        html += `
-                </div>
-        `;
-    }
-
-    html += `
-            </div>
-        </div>
-    `;
 
     if (summary) {
         const lastRefresh = summary.last_refresh ? new Date(summary.last_refresh).toLocaleString() : 'Never';
@@ -2712,6 +2947,8 @@ async function stopRefresh() {
 function renderEpsRecommendations(recommendations) {
     const summaryDiv = document.getElementById('eps-recommendations-summary');
     const listDiv = document.getElementById('eps-recommendations-list');
+    const statusBadge = document.getElementById('eps-status-badge');
+    const epsSection = document.getElementById('eps-section');
 
     if (!summaryDiv || !listDiv) return;
 
@@ -2725,15 +2962,32 @@ function renderEpsRecommendations(recommendations) {
     let summaryClass = 'recommendations-ok';
     let summaryIcon = '✓';
     let summaryText = 'All SEC data is up to date';
+    let badgeClass = 'status-ok';
+    let badgeText = 'Up to date';
 
     if (totalMissing > 0) {
         summaryClass = 'recommendations-high';
         summaryIcon = '⚠';
         summaryText = `${totalMissing} ticker${totalMissing > 1 ? 's' : ''} not yet fetched`;
+        badgeClass = 'status-warning';
+        badgeText = `${totalMissing} missing`;
     } else if (needsUpdate > 0) {
         summaryClass = needsUpdate > 10 ? 'recommendations-high' : 'recommendations-medium';
         summaryIcon = needsUpdate > 10 ? '⚠' : '○';
         summaryText = `${needsUpdate} ticker${needsUpdate > 1 ? 's' : ''} may have new 10-K filings available`;
+        badgeClass = needsUpdate > 10 ? 'status-warning' : 'status-info';
+        badgeText = `${needsUpdate} updates`;
+    }
+
+    // Update the header badge
+    if (statusBadge) {
+        statusBadge.className = `status-badge ${badgeClass}`;
+        statusBadge.textContent = badgeText;
+    }
+
+    // Auto-collapse if all OK
+    if (epsSection && summaryClass === 'recommendations-ok') {
+        epsSection.classList.add('collapsed');
     }
 
     summaryDiv.innerHTML = `
@@ -2894,4 +3148,307 @@ async function updateTickerEps(ticker) {
             btn.textContent = 'Update';
         }, 2000);
     }
+}
+
+// All Tickers Table
+let allTickersData = [];
+let allTickersSortColumn = 'ticker';
+let allTickersSortAsc = true;
+let allTickersCurrentPage = 1;
+let allTickersPageSize = 50;
+let allTickersFilteredData = [];
+
+async function loadAllTickersTable() {
+    try {
+        const response = await fetch('/api/all-tickers');
+        const data = await response.json();
+        allTickersData = data.tickers || [];
+
+        // Set up event listeners
+        setupAllTickersControls();
+
+        // Render the table
+        renderAllTickersTable();
+    } catch (error) {
+        console.error('Error loading all tickers:', error);
+        const tbody = document.getElementById('all-tickers-body');
+        if (tbody) {
+            tbody.innerHTML = '<tr><td colspan="9" class="error">Error loading tickers</td></tr>';
+        }
+    }
+}
+
+function setupAllTickersControls() {
+    // Search input
+    const searchInput = document.getElementById('ticker-search');
+    if (searchInput) {
+        searchInput.removeEventListener('input', handleTickerSearch);
+        searchInput.addEventListener('input', handleTickerSearch);
+    }
+
+    // Index filter
+    const indexFilter = document.getElementById('ticker-filter-index');
+    if (indexFilter) {
+        indexFilter.removeEventListener('change', handleTickerFilterChange);
+        indexFilter.addEventListener('change', handleTickerFilterChange);
+    }
+
+    // Source filter
+    const sourceFilter = document.getElementById('ticker-filter-source');
+    if (sourceFilter) {
+        sourceFilter.removeEventListener('change', handleTickerFilterChange);
+        sourceFilter.addEventListener('change', handleTickerFilterChange);
+    }
+
+    // Updated filter
+    const updatedFilter = document.getElementById('ticker-filter-updated');
+    if (updatedFilter) {
+        updatedFilter.removeEventListener('change', handleTickerFilterChange);
+        updatedFilter.addEventListener('change', handleTickerFilterChange);
+    }
+
+    // Page size selector
+    const pageSizeSelect = document.getElementById('ticker-page-size');
+    if (pageSizeSelect) {
+        pageSizeSelect.removeEventListener('change', handleTickerPageSizeChange);
+        pageSizeSelect.addEventListener('change', handleTickerPageSizeChange);
+    }
+
+    // Sortable headers
+    const headers = document.querySelectorAll('#all-tickers-table th.sortable');
+    headers.forEach(th => {
+        th.removeEventListener('click', handleTickerSort);
+        th.addEventListener('click', handleTickerSort);
+    });
+}
+
+function handleTickerFilterChange() {
+    allTickersCurrentPage = 1; // Reset to first page on filter change
+    renderAllTickersTable();
+}
+
+function handleTickerPageSizeChange(e) {
+    allTickersPageSize = parseInt(e.target.value) || 50;
+    allTickersCurrentPage = 1; // Reset to first page
+    renderAllTickersTable();
+}
+
+function tickerPrevPage() {
+    if (allTickersCurrentPage > 1) {
+        allTickersCurrentPage--;
+        renderAllTickersTable();
+    }
+}
+
+function tickerNextPage() {
+    const totalPages = Math.ceil(allTickersFilteredData.length / allTickersPageSize);
+    if (allTickersCurrentPage < totalPages) {
+        allTickersCurrentPage++;
+        renderAllTickersTable();
+    }
+}
+
+function handleTickerSearch() {
+    allTickersCurrentPage = 1; // Reset to first page on search
+    renderAllTickersTable();
+}
+
+function handleTickerSort(e) {
+    const th = e.target.closest('th[data-sort]');
+    if (!th) return;
+    const column = th.dataset.sort;
+    if (column === allTickersSortColumn) {
+        allTickersSortAsc = !allTickersSortAsc;
+    } else {
+        allTickersSortColumn = column;
+        allTickersSortAsc = true;
+    }
+
+    // Reset to page 1 when sort changes
+    allTickersCurrentPage = 1;
+
+    // Update header indicators
+    document.querySelectorAll('#all-tickers-table th.sortable').forEach(header => {
+        header.classList.remove('sorted-asc', 'sorted-desc');
+    });
+    th.classList.add(allTickersSortAsc ? 'sorted-asc' : 'sorted-desc');
+
+    renderAllTickersTable();
+}
+
+function renderAllTickersTable() {
+    const tbody = document.getElementById('all-tickers-body');
+    const countSpan = document.getElementById('ticker-count');
+    const pageInfo = document.getElementById('ticker-page-info');
+    const prevBtn = document.getElementById('ticker-prev-btn');
+    const nextBtn = document.getElementById('ticker-next-btn');
+    if (!tbody) return;
+
+    // Get filter values
+    const searchValue = (document.getElementById('ticker-search')?.value || '').toLowerCase();
+    const indexFilter = document.getElementById('ticker-filter-index')?.value || '';
+    const sourceFilter = document.getElementById('ticker-filter-source')?.value || '';
+    const updatedFilter = document.getElementById('ticker-filter-updated')?.value || '';
+
+    // Calculate time thresholds for updated filter (showing OLD/stale data)
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+    const monthAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
+    const threeMonthsAgo = new Date(now - 90 * 24 * 60 * 60 * 1000);
+
+    // Filter data
+    allTickersFilteredData = allTickersData.filter(t => {
+        // Search filter
+        if (searchValue) {
+            const matchesTicker = t.ticker.toLowerCase().includes(searchValue);
+            const matchesName = (t.company_name || '').toLowerCase().includes(searchValue);
+            if (!matchesTicker && !matchesName) return false;
+        }
+
+        // Index filter
+        if (indexFilter && !(t.indexes || []).includes(indexFilter)) return false;
+
+        // Source filter
+        if (sourceFilter && t.eps_source !== sourceFilter) return false;
+
+        // Updated filter - shows STALE data (older than threshold)
+        if (updatedFilter) {
+            const updated = t.valuation_updated ? new Date(t.valuation_updated) : null;
+            switch (updatedFilter) {
+                case 'not-today':
+                    // Show items NOT updated today (older than today or never)
+                    if (updated && updated >= todayStart) return false;
+                    break;
+                case 'older-week':
+                    // Show items older than 1 week or never updated
+                    if (updated && updated >= weekAgo) return false;
+                    break;
+                case 'older-month':
+                    // Show items older than 1 month or never updated
+                    if (updated && updated >= monthAgo) return false;
+                    break;
+                case 'older-3months':
+                    // Show items older than 3 months or never updated
+                    if (updated && updated >= threeMonthsAgo) return false;
+                    break;
+                case 'never':
+                    // Show only items that were never updated
+                    if (updated) return false;
+                    break;
+            }
+        }
+
+        return true;
+    });
+
+    // Sort data
+    allTickersFilteredData.sort((a, b) => {
+        let aVal = a[allTickersSortColumn];
+        let bVal = b[allTickersSortColumn];
+
+        // Handle nulls - for date sorting, nulls go to end
+        if (allTickersSortColumn === 'valuation_updated') {
+            if (!aVal && !bVal) return 0;
+            if (!aVal) return allTickersSortAsc ? 1 : -1;  // nulls last when ascending
+            if (!bVal) return allTickersSortAsc ? -1 : 1;
+            aVal = new Date(aVal).getTime();
+            bVal = new Date(bVal).getTime();
+        } else {
+            // Handle nulls for other columns
+            if (aVal === null || aVal === undefined) aVal = '';
+            if (bVal === null || bVal === undefined) bVal = '';
+
+            // Numeric sort for these columns
+            if (['current_price', 'eps_avg', 'eps_years', 'estimated_value', 'price_vs_value'].includes(allTickersSortColumn)) {
+                aVal = parseFloat(aVal) || 0;
+                bVal = parseFloat(bVal) || 0;
+            }
+        }
+
+        if (aVal < bVal) return allTickersSortAsc ? -1 : 1;
+        if (aVal > bVal) return allTickersSortAsc ? 1 : -1;
+        return 0;
+    });
+
+    // Calculate pagination
+    const totalItems = allTickersFilteredData.length;
+    const totalPages = Math.max(1, Math.ceil(totalItems / allTickersPageSize));
+
+    // Ensure current page is valid
+    if (allTickersCurrentPage > totalPages) {
+        allTickersCurrentPage = totalPages;
+    }
+
+    const startIndex = (allTickersCurrentPage - 1) * allTickersPageSize;
+    const endIndex = Math.min(startIndex + allTickersPageSize, totalItems);
+    const displayData = allTickersFilteredData.slice(startIndex, endIndex);
+
+    // Update count and pagination info
+    if (countSpan) {
+        if (totalItems === 0) {
+            countSpan.textContent = `0 of ${allTickersData.length} tickers`;
+        } else {
+            countSpan.textContent = `${startIndex + 1}-${endIndex} of ${totalItems} tickers`;
+        }
+    }
+
+    if (pageInfo) {
+        pageInfo.textContent = `Page ${allTickersCurrentPage} of ${totalPages}`;
+    }
+
+    // Update pagination button states
+    if (prevBtn) {
+        prevBtn.disabled = allTickersCurrentPage <= 1;
+    }
+    if (nextBtn) {
+        nextBtn.disabled = allTickersCurrentPage >= totalPages;
+    }
+
+    if (displayData.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="9" class="empty">No tickers match your filters</td></tr>';
+        return;
+    }
+
+    let html = '';
+    for (const t of displayData) {
+        const priceClass = t.current_price ? '' : 'no-data';
+        const epsClass = t.eps_source === 'sec' ? 'source-sec' : 'source-yf';
+        const vsValueClass = t.price_vs_value > 0 ? 'overvalued' : t.price_vs_value < -20 ? 'undervalued' : '';
+
+        // Format updated time
+        let updatedStr = '-';
+        if (t.valuation_updated) {
+            const updated = new Date(t.valuation_updated);
+            const now = new Date();
+            const diffMs = now - updated;
+            const diffHrs = Math.floor(diffMs / (1000 * 60 * 60));
+            const diffDays = Math.floor(diffHrs / 24);
+
+            if (diffDays > 0) {
+                updatedStr = `${diffDays}d ago`;
+            } else if (diffHrs > 0) {
+                updatedStr = `${diffHrs}h ago`;
+            } else {
+                const diffMins = Math.floor(diffMs / (1000 * 60));
+                updatedStr = `${diffMins}m ago`;
+            }
+        }
+
+        html += `
+            <tr class="ticker-row" onclick="viewCompany('${t.ticker}')">
+                <td class="ticker-col">${t.ticker}</td>
+                <td class="company-col" title="${t.company_name || ''}">${(t.company_name || '').substring(0, 25)}${(t.company_name || '').length > 25 ? '...' : ''}</td>
+                <td class="${priceClass}">${t.current_price ? '$' + t.current_price.toFixed(2) : '-'}</td>
+                <td>${t.eps_avg ? t.eps_avg.toFixed(2) : '-'}</td>
+                <td>${t.eps_years || '-'}</td>
+                <td class="${epsClass}">${t.eps_source === 'sec' ? 'SEC' : t.eps_source === 'yfinance' ? 'YF' : '-'}</td>
+                <td>${t.estimated_value ? '$' + t.estimated_value.toFixed(0) : '-'}</td>
+                <td class="${vsValueClass}">${t.price_vs_value !== null ? (t.price_vs_value > 0 ? '+' : '') + t.price_vs_value.toFixed(0) + '%' : '-'}</td>
+                <td class="updated-col" title="${t.valuation_updated || ''}">${updatedStr}</td>
+            </tr>
+        `;
+    }
+
+    tbody.innerHTML = html;
 }

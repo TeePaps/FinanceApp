@@ -151,8 +151,15 @@ def fetch_company_eps(ticker, cik):
             data = response.json()
             us_gaap = data.get('facts', {}).get('us-gaap', {})
 
-            # Extract both diluted and basic EPS to compare
-            def extract_annual_eps(field_name):
+            # EPS fields to extract, in order of preference (most specific to least)
+            eps_fields = [
+                ('EarningsPerShareDiluted', 'Diluted EPS'),
+                ('EarningsPerShareBasic', 'Basic EPS'),
+                ('IncomeLossFromContinuingOperationsPerDilutedShare', 'Continuing Ops (Diluted)'),
+                ('IncomeLossFromContinuingOperationsPerBasicShare', 'Continuing Ops (Basic)'),
+            ]
+
+            def extract_annual_eps(field_name, label):
                 """Extract annual EPS from 10-K filings for a given field"""
                 if field_name not in us_gaap:
                     return {}
@@ -175,34 +182,29 @@ def fetch_company_eps(ticker, cik):
                                     'eps': r['val'],
                                     'filed': r.get('filed'),
                                     'start': r.get('start'),
-                                    'end': r.get('end')
+                                    'end': r.get('end'),
+                                    'eps_type': label
                                 }
                 return annual
 
-            diluted_eps = extract_annual_eps('EarningsPerShareDiluted')
-            basic_eps = extract_annual_eps('EarningsPerShareBasic')
+            # Extract all EPS types
+            all_eps_data = {}
+            for field_name, label in eps_fields:
+                eps_data = extract_annual_eps(field_name, label)
+                for year, data in eps_data.items():
+                    if year not in all_eps_data:
+                        all_eps_data[year] = []
+                    all_eps_data[year].append(data)
 
-            if not diluted_eps and not basic_eps:
+            if not all_eps_data:
                 return None
 
-            # Combine: for each year, take the lower (more conservative) value
-            all_years = set(diluted_eps.keys()) | set(basic_eps.keys())
+            # For each year, take the lower (more conservative) EPS value
             annual_eps = {}
-
-            for fy in all_years:
-                diluted = diluted_eps.get(fy)
-                basic = basic_eps.get(fy)
-
-                if diluted and basic:
-                    # Both available - take the lower (more conservative) value
-                    if diluted['eps'] <= basic['eps']:
-                        annual_eps[fy] = {**diluted, 'eps_type': 'diluted'}
-                    else:
-                        annual_eps[fy] = {**basic, 'eps_type': 'basic'}
-                elif diluted:
-                    annual_eps[fy] = {**diluted, 'eps_type': 'diluted'}
-                else:
-                    annual_eps[fy] = {**basic, 'eps_type': 'basic'}
+            for fy, eps_list in all_eps_data.items():
+                # Sort by EPS value (ascending) and take the lowest
+                eps_list.sort(key=lambda x: x['eps'])
+                annual_eps[fy] = eps_list[0]
 
             # Sort by year descending
             sorted_eps = sorted(annual_eps.values(), key=lambda x: x['year'], reverse=True)
@@ -221,7 +223,11 @@ def fetch_company_eps(ticker, cik):
 
 
 def fetch_company_metrics(ticker, cik):
-    """Fetch key financial metrics from SEC EDGAR for a company"""
+    """Fetch key financial metrics from SEC EDGAR for a company.
+
+    Returns multi-year EPS data organized by type (for matrix display)
+    and annual dividend data.
+    """
     try:
         rate_limit()
         url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
@@ -231,55 +237,87 @@ def fetch_company_metrics(ticker, cik):
             data = response.json()
             us_gaap = data.get('facts', {}).get('us-gaap', {})
 
-            def get_latest_annual(field_name, unit='USD'):
-                """Get most recent annual value for a field"""
+            def get_annual_values(field_name, unit='USD'):
+                """Get all annual values for a field, organized by year"""
                 if field_name not in us_gaap:
-                    return None
+                    return {}
                 unit_key = 'USD/shares' if unit == 'USD/shares' else unit
                 records = us_gaap[field_name].get('units', {}).get(unit_key, [])
-                # Filter to 10-K annual records
-                annual = [r for r in records if r.get('form') == '10-K'
-                         and r.get('frame') and 'Q' not in r.get('frame', '')]
-                if not annual:
-                    return None
-                # Get most recent by frame
-                latest = max(annual, key=lambda x: x.get('frame', ''))
-                try:
-                    year = int(latest.get('frame', '').replace('CY', ''))
-                except ValueError:
-                    year = None
-                return {
-                    'value': latest.get('val'),
-                    'year': year,
-                    'period_start': latest.get('start'),
-                    'period_end': latest.get('end'),
-                    'filed': latest.get('filed')
-                }
 
-            # EPS Metrics
-            eps_metrics = {}
+                # Filter to 10-K annual records (full year, not quarterly)
+                annual = {}
+                for r in records:
+                    if r.get('form') == '10-K':
+                        frame = r.get('frame', '')
+                        # Full year records - frame like "CY2024" not "CY2024Q1"
+                        if frame and 'Q' not in frame:
+                            try:
+                                year = int(frame.replace('CY', ''))
+                            except ValueError:
+                                continue
+                            # Keep latest filing for each year
+                            if year not in annual or r.get('filed', '') > annual[year].get('filed', ''):
+                                annual[year] = {
+                                    'value': r.get('val'),
+                                    'year': year,
+                                    'period_start': r.get('start'),
+                                    'period_end': r.get('end'),
+                                    'filed': r.get('filed')
+                                }
+                return annual
+
+            # EPS fields to extract (multi-year)
             eps_fields = [
                 ('EarningsPerShareBasic', 'Basic EPS'),
                 ('EarningsPerShareDiluted', 'Diluted EPS'),
-                ('IncomeLossFromContinuingOperationsPerBasicShare', 'Continuing Ops EPS (Basic)'),
-                ('IncomeLossFromContinuingOperationsPerDilutedShare', 'Continuing Ops EPS (Diluted)'),
-                ('IncomeLossFromDiscontinuedOperationsNetOfTaxPerBasicShare', 'Discontinued Ops EPS (Basic)'),
-                ('IncomeLossFromDiscontinuedOperationsNetOfTaxPerDilutedShare', 'Discontinued Ops EPS (Diluted)'),
+                ('IncomeLossFromContinuingOperationsPerBasicShare', 'Continuing Ops (Basic)'),
+                ('IncomeLossFromContinuingOperationsPerDilutedShare', 'Continuing Ops (Diluted)'),
+                ('IncomeLossFromDiscontinuedOperationsNetOfTaxPerBasicShare', 'Discontinued Ops (Basic)'),
+                ('IncomeLossFromDiscontinuedOperationsNetOfTaxPerDilutedShare', 'Discontinued Ops (Diluted)'),
             ]
 
+            # Build EPS matrix: {eps_type: {year: value, ...}, ...}
+            eps_matrix = {}
+            all_years = set()
+
             for field, label in eps_fields:
-                result = get_latest_annual(field, 'USD/shares')
-                if result:
-                    eps_metrics[field] = {
-                        'label': label,
-                        **result
-                    }
+                annual_data = get_annual_values(field, 'USD/shares')
+                if annual_data:
+                    eps_matrix[label] = {}
+                    for year, data_point in annual_data.items():
+                        eps_matrix[label][year] = data_point['value']
+                        all_years.add(year)
+
+            # Get years sorted ascending
+            years = sorted(all_years)
+
+            # Dividend data - CommonStockDividendsPerShareDeclared
+            dividend_fields = [
+                ('CommonStockDividendsPerShareDeclared', 'Common Stock Dividend'),
+                ('CommonStockDividendsPerShareCashPaid', 'Common Stock Dividend (Paid)'),
+            ]
+
+            dividend_matrix = {}
+            dividend_years = set()
+
+            for field, label in dividend_fields:
+                annual_data = get_annual_values(field, 'USD/shares')
+                if annual_data:
+                    dividend_matrix[label] = {}
+                    for year, data_point in annual_data.items():
+                        dividend_matrix[label][year] = data_point['value']
+                        dividend_years.add(year)
+
+            div_years = sorted(dividend_years)
 
             return {
                 'ticker': ticker,
                 'cik': cik,
                 'company_name': data.get('entityName', ticker),
-                'eps_metrics': eps_metrics,
+                'eps_matrix': eps_matrix,
+                'eps_years': years[-8:] if len(years) > 8 else years,  # Last 8 years
+                'dividend_matrix': dividend_matrix,
+                'dividend_years': div_years[-8:] if len(div_years) > 8 else div_years,
                 'fetched': datetime.now().isoformat()
             }
     except Exception as e:
@@ -654,3 +692,109 @@ def get_eps_update_recommendations():
         'details': details,
         'generated': datetime.now().isoformat()
     }
+
+
+# --- 10-K Filing URLs ---
+
+FILINGS_CACHE_DAYS = 7  # Check for new filings weekly
+
+
+def fetch_10k_filings(ticker, cik):
+    """Fetch 10-K filing URLs from SEC submissions API"""
+    try:
+        rate_limit()
+        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        response = requests.get(url, headers=SEC_HEADERS, timeout=30)
+
+        if response.status_code != 200:
+            print(f"[SEC] Failed to fetch submissions for {ticker}: {response.status_code}")
+            return []
+
+        data = response.json()
+        filings = data.get('filings', {}).get('recent', {})
+
+        if not filings:
+            return []
+
+        # Extract 10-K filings
+        tenk_filings = []
+        forms = filings.get('form', [])
+        accession_numbers = filings.get('accessionNumber', [])
+        filing_dates = filings.get('filingDate', [])
+        primary_documents = filings.get('primaryDocument', [])
+        report_dates = filings.get('reportDate', [])
+
+        # CIK without leading zeros for URL construction
+        cik_no_pad = str(int(cik))
+
+        for i, form in enumerate(forms):
+            if form in ('10-K', '10-K/A'):
+                # Extract fiscal year from report date
+                report_date = report_dates[i] if i < len(report_dates) else ''
+                try:
+                    fiscal_year = int(report_date[:4]) if report_date else None
+                except (ValueError, TypeError):
+                    fiscal_year = None
+
+                if not fiscal_year:
+                    continue
+
+                # Construct document URL
+                accession = accession_numbers[i].replace('-', '')
+                primary_doc = primary_documents[i] if i < len(primary_documents) else ''
+                doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_no_pad}/{accession}/{primary_doc}"
+
+                tenk_filings.append({
+                    'fiscal_year': fiscal_year,
+                    'form_type': form,
+                    'accession_number': accession_numbers[i],
+                    'filing_date': filing_dates[i] if i < len(filing_dates) else '',
+                    'document_url': doc_url
+                })
+
+        # Sort by fiscal year descending
+        tenk_filings.sort(key=lambda x: x['fiscal_year'], reverse=True)
+
+        print(f"[SEC] Found {len(tenk_filings)} 10-K filings for {ticker}")
+        return tenk_filings
+
+    except Exception as e:
+        print(f"[SEC] Error fetching 10-K filings for {ticker}: {e}")
+        return []
+
+
+def is_filings_stale(ticker):
+    """Check if a ticker's filing URLs need refreshing"""
+    last_updated = db.get_sec_filings_last_updated(ticker)
+    if not last_updated:
+        return True
+
+    try:
+        updated = datetime.fromisoformat(last_updated)
+        return datetime.now() - updated >= timedelta(days=FILINGS_CACHE_DAYS)
+    except (ValueError, TypeError):
+        return True
+
+
+def get_10k_filings(ticker):
+    """Get 10-K filing URLs for a ticker, using cache when available"""
+    ticker = ticker.upper()
+
+    # Check if we have cached filings that aren't stale
+    if not is_filings_stale(ticker):
+        cached = db.get_sec_filings(ticker)
+        if cached:
+            return cached
+
+    # Fetch fresh data
+    cik = get_cik_for_ticker(ticker)
+    if not cik:
+        return []
+
+    filings = fetch_10k_filings(ticker, cik)
+    if filings:
+        db.save_sec_filings(ticker, filings)
+        return filings
+
+    # Return stale cache if fetch failed
+    return db.get_sec_filings(ticker)

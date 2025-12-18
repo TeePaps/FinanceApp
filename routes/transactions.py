@@ -27,7 +27,7 @@ def read_csv(filename):
 
 
 def write_user_csv(filepath, data, fieldnames):
-    """Write CSV file to user_data directory."""
+    """Write CSV file to data_private directory."""
     with open(filepath, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -35,14 +35,14 @@ def write_user_csv(filepath, data, fieldnames):
 
 
 def get_transactions():
-    """Load transactions from user_data directory."""
+    """Load transactions from data_private directory."""
     with open(TRANSACTIONS_FILE, 'r') as f:
         reader = csv.DictReader(f)
         return list(reader)
 
 
 def get_stocks():
-    """Load stocks from user_data directory."""
+    """Load stocks from data_private directory."""
     with open(STOCKS_FILE, 'r') as f:
         reader = csv.DictReader(f)
         return list(reader)

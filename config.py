@@ -7,20 +7,23 @@ Centralizes all magic numbers and thresholds for easy tuning and testing.
 import os
 
 # ============================================================================
-# Database Settings
+# Data Directories & Databases
 # ============================================================================
-DATABASE_PATH = os.path.join(os.path.dirname(__file__), 'finance_app.db')
+# Two separate databases for data isolation:
+# - data_public/public.db: Market data (SEC, indexes, valuations)
+# - data_private/private.db: Personal data (holdings, transactions)
 
-# Legacy file paths (kept for reference, now using SQLite database)
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
-USER_DATA_DIR = os.path.join(os.path.dirname(__file__), 'user_data')
+DATA_DIR = os.path.join(os.path.dirname(__file__), 'data_public')  # Public data
+USER_DATA_DIR = os.path.join(os.path.dirname(__file__), 'data_private')  # Private data
 ARCHIVE_DIR = os.path.join(os.path.dirname(__file__), 'archive')
 
-# Legacy CSV file paths (now stored in database)
+# Database paths (used by database.py)
+PUBLIC_DB_PATH = os.path.join(DATA_DIR, 'public.db')
+PRIVATE_DB_PATH = os.path.join(USER_DATA_DIR, 'private.db')
+
+# Legacy file paths (kept for migration scripts, data now in databases)
 STOCKS_FILE = os.path.join(USER_DATA_DIR, 'stocks.csv')
 TRANSACTIONS_FILE = os.path.join(USER_DATA_DIR, 'transactions.csv')
-
-# Legacy JSON file paths (for backward compatibility - now in database)
 EXCLUDED_TICKERS_FILE = os.path.join(DATA_DIR, 'excluded_tickers.json')
 TICKER_FAILURES_FILE = os.path.join(DATA_DIR, 'ticker_failures.json')
 
@@ -105,6 +108,18 @@ SELLOFF_VOLUME_MODERATE = 1.5  # 1.5x-2x normal volume
 YAHOO_BATCH_SIZE = 100        # Number of tickers per batch
 YAHOO_BATCH_DELAY = 0.5       # Seconds between batches
 YAHOO_SINGLE_DELAY = 0.3      # Seconds between single ticker requests
+
+# ============================================================================
+# Fallback Data Sources (Optional)
+# ============================================================================
+# Set these environment variables to enable fallback price sources when
+# yfinance fails (e.g., rate limiting, temporary outages).
+#
+# Financial Modeling Prep (free tier: 250 requests/day):
+#   export FMP_API_KEY="your_api_key_here"
+#   Get a free key at: https://financialmodelingprep.com/developer/docs/
+#
+# The app will automatically use these as fallbacks - no code changes needed.
 
 # ============================================================================
 # Valid Indices

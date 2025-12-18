@@ -27,8 +27,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import database as db
 
 BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE_DIR, 'data')
-USER_DATA_DIR = os.path.join(BASE_DIR, 'user_data')
+DATA_DIR = os.path.join(BASE_DIR, 'data_public')  # Public data (SEC, indexes)
+USER_DATA_DIR = os.path.join(BASE_DIR, 'data_private')  # Private data (holdings)
 SEC_DIR = os.path.join(DATA_DIR, 'sec')
 COMPANIES_DIR = os.path.join(SEC_DIR, 'companies')
 ARCHIVE_DIR = os.path.join(BASE_DIR, 'archive')

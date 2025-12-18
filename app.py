@@ -56,7 +56,7 @@ def write_csv(filename, data, fieldnames):
         writer.writerows(data)
 
 def write_user_csv(filepath, data, fieldnames):
-    """Write CSV to user_data directory (for personal holdings)"""
+    """Write CSV to data_private directory (for personal holdings)"""
     with open(filepath, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -378,9 +378,9 @@ def get_validated_eps(ticker, stock, income_stmt=None):
         sec_eps_data = [{
             'year': e['year'],
             'eps': e['eps'],
-            'eps_type': e.get('eps_type', 'diluted'),
-            'period_start': e.get('start'),
-            'period_end': e.get('end')
+            'eps_type': e.get('eps_type', 'Diluted EPS'),
+            'period_start': e.get('period_start') or e.get('start'),
+            'period_end': e.get('period_end') or e.get('end')
         } for e in sec_eps['eps_history']]
         # SEC data is authoritative - use it directly
         # Note: Years are fiscal years from the company's 10-K filings
@@ -837,8 +837,8 @@ def sanitize_for_json(obj):
         return obj
     return obj
 
-def get_index_tickers(index_name):
-    """Fetch index constituents from Wikipedia"""
+def fetch_index_tickers_from_web(index_name):
+    """Fetch fresh index constituents from Wikipedia (for updates only)"""
     try:
         import pandas as pd
         import requests
@@ -927,9 +927,9 @@ def get_all_ticker_indexes():
 
 
 def get_index_data(index_name='all'):
-    """Load index data from JSON file, create if doesn't exist.
-    Always uses centralized valuations.json for valuation data.
-    Index-specific files only store the ticker list."""
+    """Load index data from database.
+    Uses centralized valuations from database.
+    Index ticker lists are stored in ticker_indexes table."""
     if index_name not in VALID_INDICES:
         index_name = 'all'
 
@@ -949,35 +949,21 @@ def get_index_data(index_name='all'):
             'last_updated': last_updated
         }
 
-    filepath = os.path.join(DATA_DIR, f'{index_name}.json')
+    # Get tickers from database
+    tickers = db.get_index_tickers(index_name)
 
-    # If file doesn't exist, create it with fetched tickers
-    if not os.path.exists(filepath):
-        print(f"[Index] Creating {index_name}.json...")
-        tickers = get_index_tickers(index_name)
-        name, short_name = INDEX_NAMES.get(index_name, (index_name, index_name))
-        data = {
-            'name': name,
-            'short_name': short_name,
-            'tickers': tickers,
-            'valuations': {},
-            'last_updated': None
-        }
-        save_index_data(index_name, data)
-    else:
-        with open(filepath, 'r') as f:
-            data = json.load(f)
+    # If no tickers in database, fetch from web and store
+    if not tickers:
+        print(f"[Index] No tickers in database for {index_name}, fetching from web...")
+        tickers = fetch_index_tickers_from_web(index_name)
+        if tickers:
+            db.sync_index_membership(index_name, tickers)
 
-        # If tickers array is empty, try to fetch again
-        if not data.get('tickers'):
-            print(f"[Index] {index_name}.json has empty tickers, re-fetching...")
-            tickers = get_index_tickers(index_name)
-            if tickers:
-                data['tickers'] = tickers
-                save_index_data(index_name, data)
+    # Get index display names
+    name, short_name = INDEX_NAMES.get(index_name, (index_name, index_name))
 
     # Filter centralized valuations to only include this index's tickers
-    index_tickers = set(data.get('tickers', []))
+    index_tickers = set(tickers)
     filtered_valuations = {
         ticker: val for ticker, val in all_valuations.items()
         if ticker in index_tickers
@@ -985,9 +971,9 @@ def get_index_data(index_name='all'):
 
     # Return with centralized valuations filtered by index
     result = {
-        'name': data.get('name', index_name),
-        'short_name': data.get('short_name', index_name),
-        'tickers': data.get('tickers', []),
+        'name': name,
+        'short_name': short_name,
+        'tickers': tickers,
         'valuations': filtered_valuations,
         'last_updated': last_updated
     }
@@ -995,12 +981,12 @@ def get_index_data(index_name='all'):
     return sanitize_for_json(result)
 
 def save_index_data(index_name, data):
-    """Save index data to JSON file"""
+    """Save index tickers to database"""
     if index_name not in VALID_INDICES or index_name == 'all':
-        return  # 'all' is a virtual index, no file to save
-    filepath = os.path.join(DATA_DIR, f'{index_name}.json')
-    with open(filepath, 'w') as f:
-        json.dump(data, f, indent=2)
+        return  # 'all' is a virtual index, nothing to save
+    tickers = data.get('tickers', [])
+    if tickers:
+        db.sync_index_membership(index_name, tickers)
 
 # Keep old functions for backward compatibility
 def get_sp500_data():
@@ -2400,8 +2386,7 @@ def run_global_refresh():
         'no_eps_tickers': skip_reasons['success_no_eps'][:50]
     }
     try:
-        with open(os.path.join(DATA_DIR, 'refresh_summary.json'), 'w') as f:
-            json.dump(skip_summary, f, indent=2)
+        db.set_metadata('refresh_summary', json.dumps(skip_summary))
     except Exception as e:
         print(f"[Refresh] Error saving skip summary: {e}")
 
@@ -2725,6 +2710,64 @@ def api_valuation(ticker):
         })
 
     except Exception as e:
+        error_msg = str(e).lower()
+
+        # Check for rate limiting - try to use cached data as fallback
+        if 'rate' in error_msg or 'too many' in error_msg or '429' in error_msg:
+            # Try to get cached valuation data
+            all_valuations = data_manager.load_valuations().get('valuations', {})
+            cached = all_valuations.get(ticker)
+
+            if cached:
+                # Try to get SEC EPS history (doesn't require Yahoo Finance API)
+                eps_data = []
+                sec_eps = sec_data.get_sec_eps(ticker)
+                if sec_eps and sec_eps.get('eps_history'):
+                    for e in sec_eps['eps_history'][:8]:
+                        # Format fiscal period from start/end dates
+                        fiscal_period = ''
+                        start_date = e.get('period_start') or e.get('start')
+                        end_date = e.get('period_end') or e.get('end')
+                        if start_date and end_date:
+                            try:
+                                start = datetime.fromisoformat(start_date)
+                                end = datetime.fromisoformat(end_date)
+                                fiscal_period = f"{start.strftime('%b %Y')} - {end.strftime('%b %Y')}"
+                            except:
+                                pass
+                        eps_data.append({
+                            'year': e['year'],
+                            'eps': e['eps'],
+                            'type': e.get('eps_type', 'Diluted EPS'),
+                            'fiscal_period': fiscal_period
+                        })
+
+                # Return cached data with a note that it's from cache
+                return jsonify({
+                    'ticker': ticker,
+                    'company_name': cached.get('company_name', ticker),
+                    'current_price': cached.get('current_price'),
+                    'eps_data': eps_data,
+                    'eps_years': cached.get('eps_years', 0),
+                    'eps_source': cached.get('eps_source', 'cached'),
+                    'eps_avg': cached.get('eps_avg'),
+                    'min_years_recommended': 8,
+                    'has_enough_years': cached.get('eps_years', 0) >= 8,
+                    'annual_dividend': cached.get('annual_dividend', 0),
+                    'dividend_payments': [],
+                    'estimated_value': cached.get('estimated_value'),
+                    'price_vs_value': cached.get('price_vs_value'),
+                    'formula': f'Cached data from {cached.get("updated", "unknown")}',
+                    'selloff': None,
+                    'from_cache': True,
+                    'cache_note': f'Rate limited - showing cached data from {cached.get("updated", "earlier")}'
+                })
+            else:
+                return jsonify({
+                    'error': 'Too Many Requests. Rate limited. Try after a while.',
+                    'ticker': ticker
+                }), 429
+
         return jsonify({
             'error': str(e),
             'ticker': ticker
@@ -3281,15 +3324,14 @@ def api_data_status():
         'progress': screener_progress
     }
 
-    # Load refresh summary if available
+    # Load refresh summary from database
     refresh_summary = None
-    summary_file = os.path.join(DATA_DIR, 'refresh_summary.json')
-    if os.path.exists(summary_file):
-        try:
-            with open(summary_file, 'r') as f:
-                refresh_summary = json.load(f)
-        except Exception:
-            pass
+    try:
+        summary_str = db.get_metadata('refresh_summary')
+        if summary_str:
+            refresh_summary = json.loads(summary_str)
+    except Exception:
+        pass
 
     # Get excluded tickers info
     excluded_info = get_excluded_tickers_info()
@@ -3313,6 +3355,42 @@ def api_data_status():
         'refresh': refresh_status,
         'refresh_summary': refresh_summary,
         'excluded_tickers': excluded_info
+    })
+
+@app.route('/api/all-tickers')
+def api_all_tickers():
+    """Get all tickers with key details for the Data Sets table"""
+    # Get all valuations
+    all_valuations = data_manager.load_valuations().get('valuations', {})
+
+    # Get ticker status for index membership and SEC status
+    ticker_status = data_manager.load_ticker_status().get('tickers', {})
+
+    result = []
+    for ticker, val in all_valuations.items():
+        status = ticker_status.get(ticker, {})
+        result.append({
+            'ticker': ticker,
+            'company_name': val.get('company_name', ticker),
+            'current_price': val.get('current_price'),
+            'eps_avg': val.get('eps_avg'),
+            'eps_years': val.get('eps_years'),
+            'eps_source': val.get('eps_source'),
+            'estimated_value': val.get('estimated_value'),
+            'price_vs_value': val.get('price_vs_value'),
+            'annual_dividend': val.get('annual_dividend'),
+            'indexes': status.get('indexes', []),
+            'sec_status': status.get('sec_status', 'unknown'),
+            'valuation_updated': val.get('updated'),
+            'sec_checked': status.get('sec_checked')
+        })
+
+    # Sort by ticker
+    result.sort(key=lambda x: x['ticker'])
+
+    return jsonify({
+        'tickers': result,
+        'count': len(result)
     })
 
 @app.route('/api/excluded-tickers', methods=['GET'])
@@ -3355,6 +3433,13 @@ def api_sec_eps(ticker):
     if data:
         return jsonify(data)
     return jsonify({'error': 'No data available', 'ticker': ticker}), 404
+
+
+@app.route('/api/sec-filings/<ticker>')
+def api_sec_filings(ticker):
+    """Get 10-K filing URLs for a specific ticker"""
+    filings = sec_data.get_10k_filings(ticker.upper())
+    return jsonify(filings)
 
 
 @app.route('/api/eps-recommendations')

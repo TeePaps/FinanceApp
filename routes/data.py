@@ -16,6 +16,7 @@ import time
 import yfinance as yf
 from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request
+import database as db
 import data_manager
 import sec_data
 from config import (
@@ -145,13 +146,12 @@ def api_eps_recommendations():
 @data_bp.route('/refresh-summary')
 def api_refresh_summary():
     """Get summary of the last refresh operation."""
-    summary_file = os.path.join(DATA_DIR, 'refresh_summary.json')
-    if os.path.exists(summary_file):
-        try:
-            with open(summary_file, 'r') as f:
-                return jsonify(json.load(f))
-        except Exception:
-            pass
+    try:
+        summary_str = db.get_metadata('refresh_summary')
+        if summary_str:
+            return jsonify(json.loads(summary_str))
+    except Exception:
+        pass
     return jsonify({
         'last_refresh': None,
         'total_tickers': 0,

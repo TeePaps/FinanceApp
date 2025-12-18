@@ -1,15 +1,24 @@
 """
-Yahoo Finance API wrapper with caching and rate limiting.
+Yahoo Finance API wrapper with caching, rate limiting, and fallback sources.
 
-Provides centralized access to Yahoo Finance data with:
+Provides centralized access to stock price data with:
 - Price caching to reduce API calls
 - Batch downloading for efficiency
+- Fallback to alternate data sources when yfinance fails
 - Selloff metrics calculation
 - EPS extraction from income statements
+
+Fallback sources (in order):
+1. yfinance batch download
+2. yfinance individual ticker (fast_info)
+3. yfinance history
+4. Financial Modeling Prep API (if API key configured)
 """
 
+import os
 import time
 import math
+import requests
 import yfinance as yf
 from datetime import datetime, timedelta
 from config import (
@@ -21,13 +30,101 @@ from config import (
     SELLOFF_VOLUME_MODERATE
 )
 
+# Optional API keys for fallback sources (set via environment variables)
+FMP_API_KEY = os.environ.get('FMP_API_KEY')  # Financial Modeling Prep
+
 # Module-level price cache: {ticker: {'price': float, 'timestamp': float}}
 _price_cache = {}
+
+# Track persistent failures to avoid repeated API calls
+_persistent_failures = set()
+
+
+def _fetch_price_from_fmp(ticker):
+    """
+    Fetch price from Financial Modeling Prep API (fallback source).
+
+    Free tier: 250 requests/day - use sparingly for individual failures.
+
+    Args:
+        ticker: Stock ticker symbol
+
+    Returns:
+        Price as float, or None if not available
+    """
+    if not FMP_API_KEY:
+        return None
+
+    try:
+        url = f"https://financialmodelingprep.com/api/v3/quote-short/{ticker}?apikey={FMP_API_KEY}"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data and len(data) > 0 and 'price' in data[0]:
+                return float(data[0]['price'])
+    except Exception as e:
+        print(f"[FMP] Error fetching {ticker}: {e}")
+
+    return None
+
+
+def _fetch_price_with_retries(ticker, max_retries=3):
+    """
+    Fetch price for a single ticker with multiple fallback methods.
+
+    Tries in order:
+    1. yfinance fast_info
+    2. yfinance history
+    3. Financial Modeling Prep (if API key configured)
+
+    Args:
+        ticker: Stock ticker symbol
+        max_retries: Number of retry attempts per method
+
+    Returns:
+        Tuple of (price, source) or (None, None) if all methods fail
+    """
+    # Method 1: yfinance fast_info (fastest)
+    for attempt in range(max_retries):
+        try:
+            stock = yf.Ticker(ticker)
+            price = stock.fast_info.get('lastPrice') or stock.fast_info.get('regularMarketPrice')
+            if price and price > 0:
+                return float(price), 'yfinance_fast'
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+
+    # Method 2: yfinance history (more reliable but slower)
+    for attempt in range(max_retries):
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period='5d')
+            if hist is not None and not hist.empty and 'Close' in hist.columns:
+                price = hist['Close'].iloc[-1]
+                if price and price > 0:
+                    return float(price), 'yfinance_history'
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+
+    # Method 3: Financial Modeling Prep (if configured)
+    if FMP_API_KEY:
+        price = _fetch_price_from_fmp(ticker)
+        if price:
+            return price, 'fmp'
+
+    return None, None
 
 
 def fetch_stock_price(ticker):
     """
-    Fetch current stock price using yfinance with caching.
+    Fetch current stock price with caching and fallback sources.
+
+    Tries multiple data sources if primary fails:
+    1. yfinance fast_info (fastest)
+    2. yfinance history (more reliable)
+    3. Financial Modeling Prep (if API key configured)
 
     Args:
         ticker: Stock ticker symbol
@@ -43,25 +140,47 @@ def fetch_stock_price(ticker):
         if time.time() - cached['timestamp'] < PRICE_CACHE_DURATION:
             return cached['price']
 
-    try:
-        stock = yf.Ticker(ticker)
-        # fast_info is quicker than info
-        price = stock.fast_info.get('lastPrice')
-        if price:
-            _price_cache[ticker] = {
-                'price': price,
-                'timestamp': time.time()
-            }
-            return price
-    except Exception as e:
-        print(f"Error fetching price for {ticker}: {e}")
+    # Skip known persistent failures (delisted stocks, etc.)
+    if ticker in _persistent_failures:
+        return None
+
+    # Use enhanced retry logic with fallbacks
+    price, source = _fetch_price_with_retries(ticker, max_retries=2)
+
+    if price:
+        _price_cache[ticker] = {
+            'price': price,
+            'timestamp': time.time(),
+            'source': source
+        }
+        return price
 
     return None
 
 
+def mark_ticker_failed(ticker):
+    """Mark a ticker as persistently failed (delisted, invalid, etc.)."""
+    _persistent_failures.add(ticker)
+
+
+def clear_failed_tickers():
+    """Clear the persistent failures set (for retry after fixes)."""
+    _persistent_failures.clear()
+
+
+def get_failed_tickers():
+    """Get list of persistently failed tickers."""
+    return list(_persistent_failures)
+
+
 def fetch_multiple_prices(tickers):
     """
-    Fetch prices for multiple tickers using yfinance batch download with retry logic.
+    Fetch prices for multiple tickers with fallback sources.
+
+    Uses batch download for efficiency, with individual fallbacks for failures:
+    1. yfinance batch download (primary)
+    2. yfinance individual ticker (fast_info, then history)
+    3. Financial Modeling Prep API (if FMP_API_KEY env var is set)
 
     Args:
         tickers: List of ticker symbols
@@ -130,8 +249,13 @@ def fetch_multiple_prices(tickers):
                     failed_tickers = to_fetch.copy()
 
         # Fallback: try individual ticker fetching for failed tickers
+        still_failed = []
         if failed_tickers:
             for ticker in failed_tickers:
+                # Skip known persistent failures
+                if ticker in _persistent_failures:
+                    continue
+
                 try:
                     time.sleep(0.2)
                     stock = yf.Ticker(ticker)
@@ -141,15 +265,30 @@ def fetch_multiple_prices(tickers):
                         price = None
 
                     if not price:
-                        hist = stock.history(period='1d')
+                        hist = stock.history(period='5d')  # Try 5 days for more reliability
                         if not hist.empty and 'Close' in hist.columns:
                             price = hist['Close'].iloc[-1]
 
                     if price and price > 0:
-                        _price_cache[ticker] = {'price': float(price), 'timestamp': now}
+                        _price_cache[ticker] = {'price': float(price), 'timestamp': now, 'source': 'yfinance'}
                         cached_prices[ticker] = float(price)
+                    else:
+                        still_failed.append(ticker)
                 except Exception:
-                    pass
+                    still_failed.append(ticker)
+
+        # Final fallback: try Financial Modeling Prep for remaining failures
+        if still_failed and FMP_API_KEY:
+            fmp_recovered = 0
+            for ticker in still_failed[:50]:  # Limit to 50 to preserve daily quota
+                price = _fetch_price_from_fmp(ticker)
+                if price:
+                    _price_cache[ticker] = {'price': price, 'timestamp': now, 'source': 'fmp'}
+                    cached_prices[ticker] = price
+                    fmp_recovered += 1
+                time.sleep(0.1)  # Gentle rate limiting
+            if fmp_recovered > 0:
+                print(f"[FMP Fallback] Recovered {fmp_recovered}/{len(still_failed[:50])} tickers")
 
     return cached_prices
 
