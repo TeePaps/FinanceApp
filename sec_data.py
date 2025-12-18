@@ -2,34 +2,20 @@
 SEC EDGAR Data Module
 Handles fetching and caching of SEC financial data (EPS, etc.)
 
-Cache Structure:
-    data/sec/
-    ├── metadata.json         # Cache version, last update timestamps
-    ├── cik_mapping.json      # Ticker → CIK (updates weekly)
-    └── companies/
-        ├── AAPL.json
-        ├── MSFT.json
-        └── ...
+This module now uses SQLite database for all data storage.
+Data is stored in the following tables:
+- sec_companies: Company info and metadata
+- eps_history: EPS records per company
+- cik_mapping: Ticker to CIK mapping
 """
 import os
-import json
 import time
 import requests
 from datetime import datetime, timedelta
 import threading
 
-# Directory structure
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
-SEC_DIR = os.path.join(DATA_DIR, 'sec')
-COMPANIES_DIR = os.path.join(SEC_DIR, 'companies')
-METADATA_FILE = os.path.join(SEC_DIR, 'metadata.json')
-CIK_MAPPING_FILE = os.path.join(SEC_DIR, 'cik_mapping.json')
-
-# Legacy cache file (for migration)
-LEGACY_CACHE_FILE = os.path.join(DATA_DIR, 'sec_cache.json')
-
-# Cache version - increment when structure changes
-CACHE_VERSION = 2
+# Import database module for all operations
+import database as db
 
 # SEC requires User-Agent with contact info
 SEC_HEADERS = {'User-Agent': 'FinanceApp contact@example.com'}
@@ -47,11 +33,6 @@ sec_update_progress = {'current': 0, 'total': 0, 'ticker': '', 'status': 'idle'}
 last_sec_request = 0
 
 
-def ensure_directories():
-    """Ensure cache directories exist"""
-    os.makedirs(COMPANIES_DIR, exist_ok=True)
-
-
 def rate_limit():
     """Ensure we don't exceed SEC rate limits"""
     global last_sec_request
@@ -64,42 +45,33 @@ def rate_limit():
 # --- Metadata ---
 
 def load_metadata():
-    """Load cache metadata"""
-    if os.path.exists(METADATA_FILE):
-        try:
-            with open(METADATA_FILE, 'r') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-    return {'version': CACHE_VERSION, 'last_full_update': None}
+    """Load cache metadata from database"""
+    version = db.get_metadata('sec_cache_version')
+    last_update = db.get_metadata('sec_last_full_update')
+    return {
+        'version': int(version) if version else 2,
+        'last_full_update': last_update
+    }
 
 
 def save_metadata(data):
-    """Save cache metadata"""
-    ensure_directories()
-    data['version'] = CACHE_VERSION
-    with open(METADATA_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    """Save cache metadata to database"""
+    if 'version' in data:
+        db.set_metadata('sec_cache_version', str(data['version']))
+    if 'last_full_update' in data:
+        db.set_metadata('sec_last_full_update', data['last_full_update'])
 
 
 # --- CIK Mapping ---
 
 def load_cik_mapping():
-    """Load cached ticker->CIK mapping"""
-    if os.path.exists(CIK_MAPPING_FILE):
-        try:
-            with open(CIK_MAPPING_FILE, 'r') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-    return {'tickers': {}, 'updated': None}
+    """Load cached ticker->CIK mapping from database"""
+    return db.get_cik_mapping()
 
 
 def save_cik_mapping(data):
-    """Save ticker->CIK mapping to cache"""
-    ensure_directories()
-    with open(CIK_MAPPING_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    """Save ticker->CIK mapping to database"""
+    db.save_cik_mapping(data)
 
 
 def update_cik_mapping():
@@ -141,8 +113,11 @@ def get_cik_for_ticker(ticker):
 
     # Check if mapping needs refresh
     if mapping.get('updated'):
-        updated = datetime.fromisoformat(mapping['updated'])
-        if datetime.now() - updated > timedelta(days=CIK_CACHE_DAYS):
+        try:
+            updated = datetime.fromisoformat(mapping['updated'])
+            if datetime.now() - updated > timedelta(days=CIK_CACHE_DAYS):
+                mapping = update_cik_mapping()
+        except (ValueError, TypeError):
             mapping = update_cik_mapping()
     elif not mapping.get('tickers'):
         mapping = update_cik_mapping()
@@ -153,31 +128,16 @@ def get_cik_for_ticker(ticker):
     return None
 
 
-# --- Company EPS Data (per-ticker files) ---
-
-def get_company_cache_path(ticker):
-    """Get path to company cache file"""
-    return os.path.join(COMPANIES_DIR, f"{ticker.upper()}.json")
-
+# --- Company EPS Data (now stored in database) ---
 
 def load_company_cache(ticker):
-    """Load cached data for a single company"""
-    filepath = get_company_cache_path(ticker)
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, 'r') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-    return None
+    """Load cached data for a single company from database"""
+    return db.get_sec_company(ticker)
 
 
 def save_company_cache(ticker, data):
-    """Save data for a single company"""
-    ensure_directories()
-    filepath = get_company_cache_path(ticker)
-    with open(filepath, 'w') as f:
-        json.dump(data, f, indent=2)
+    """Save data for a single company to database"""
+    db.save_sec_company(ticker, data)
 
 
 def fetch_company_eps(ticker, cik):
@@ -381,9 +341,7 @@ def is_cache_stale(ticker):
 
 def has_cached_eps(ticker):
     """Check if we have any cached SEC data for a ticker (regardless of staleness)"""
-    ticker = ticker.upper()
-    cached = load_company_cache(ticker)
-    return cached is not None and cached.get('eps_history')
+    return db.has_sec_eps(ticker.upper())
 
 
 def fetch_sec_eps_if_missing(ticker):
@@ -504,10 +462,8 @@ def get_update_progress():
 
 def check_and_update_on_startup(tickers):
     """Check if SEC data needs updating on startup, run in background if so"""
-    ensure_directories()
-
-    # Migrate legacy cache if exists
-    migrate_legacy_cache()
+    # Initialize database
+    db.init_database()
 
     # Check CIK mapping first
     mapping = load_cik_mapping()
@@ -538,12 +494,6 @@ def check_and_update_on_startup(tickers):
 def get_cache_status():
     """Get status of SEC cache for UI display"""
     mapping = load_cik_mapping()
-    metadata = load_metadata()
-
-    # Count cached companies
-    company_count = 0
-    if os.path.exists(COMPANIES_DIR):
-        company_count = len([f for f in os.listdir(COMPANIES_DIR) if f.endswith('.json')])
 
     return {
         'cik_mapping': {
@@ -551,13 +501,13 @@ def get_cache_status():
             'updated': mapping.get('updated')
         },
         'companies': {
-            'count': company_count,
-            'last_full_update': metadata.get('last_full_update')
+            'count': db.get_sec_company_count(),
+            'last_full_update': db.get_metadata('sec_last_full_update')
         }
     }
 
 
-# --- Migration ---
+# --- EPS Update Recommendations ---
 
 def get_eps_update_recommendations():
     """
@@ -573,36 +523,59 @@ def get_eps_update_recommendations():
     - recently_updated: list of tickers with fresh data
     - details: per-ticker analysis info
     """
-    if not os.path.exists(COMPANIES_DIR):
+    # Get all SEC companies from database
+    with db.get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT sc.ticker, sc.company_name, sc.updated,
+                   eh.year, eh.eps, eh.filed, eh.period_start, eh.period_end
+            FROM sec_companies sc
+            LEFT JOIN eps_history eh ON sc.ticker = eh.ticker
+            WHERE sc.sec_no_eps = 0
+            ORDER BY sc.ticker, eh.year DESC
+        ''')
+        rows = cursor.fetchall()
+
+    if not rows:
         return {'needs_update': [], 'recently_updated': [], 'details': {}}
+
+    # Group by ticker
+    ticker_data = {}
+    for row in rows:
+        ticker = row['ticker']
+        if ticker not in ticker_data:
+            ticker_data[ticker] = {
+                'company_name': row['company_name'],
+                'updated': row['updated'],
+                'eps_history': []
+            }
+        if row['year']:
+            ticker_data[ticker]['eps_history'].append({
+                'year': row['year'],
+                'eps': row['eps'],
+                'filed': row['filed'],
+                'start': row['period_start'],
+                'end': row['period_end']
+            })
 
     needs_update = []
     recently_updated = []
     details = {}
     today = datetime.now()
 
-    for filename in os.listdir(COMPANIES_DIR):
-        if not filename.endswith('.json'):
+    for ticker, data in ticker_data.items():
+        if not data['eps_history']:
             continue
 
-        ticker = filename.replace('.json', '')
-        cached = load_company_cache(ticker)
-
-        if not cached or not cached.get('eps_history'):
-            continue
-
-        # Get most recent EPS entry
-        latest_eps = cached['eps_history'][0] if cached['eps_history'] else None
-        if not latest_eps:
-            continue
+        latest_eps = data['eps_history'][0]
 
         ticker_info = {
             'ticker': ticker,
-            'company_name': cached.get('company_name', ticker),
+            'company_name': data.get('company_name', ticker),
             'latest_fy': latest_eps.get('year'),
             'fiscal_year_end': latest_eps.get('end'),
             'last_filing_date': latest_eps.get('filed'),
-            'cache_updated': cached.get('updated'),
+            'cache_updated': data.get('updated'),
             'status': 'current',
             'reason': None
         }
@@ -616,31 +589,16 @@ def get_eps_update_recommendations():
             except ValueError:
                 pass
 
-        last_filing = None
-        if latest_eps.get('filed'):
-            try:
-                last_filing = datetime.strptime(latest_eps['filed'], '%Y-%m-%d')
-                ticker_info['last_filing_parsed'] = last_filing.strftime('%b %d, %Y')
-            except ValueError:
-                pass
-
         cache_updated = None
-        if cached.get('updated'):
+        if data.get('updated'):
             try:
-                cache_updated = datetime.fromisoformat(cached['updated'])
+                cache_updated = datetime.fromisoformat(data['updated'])
             except ValueError:
                 pass
 
         # Determine if new filing might be available
-        # Logic: If fiscal year ended 90+ days ago AND cache hasn't been updated since then,
-        # a new 10-K might be available
-
         if fiscal_year_end:
-            # Calculate next fiscal year end (approximately 1 year from last)
             next_fy_end = fiscal_year_end.replace(year=fiscal_year_end.year + 1)
-
-            # Companies file 10-K within 60-90 days of fiscal year end
-            # Use 75 days as middle ground
             expected_filing_date = next_fy_end + timedelta(days=75)
             ticker_info['next_fy_end'] = next_fy_end.strftime('%b %d, %Y')
             ticker_info['expected_filing'] = expected_filing_date.strftime('%b %d, %Y')
@@ -648,43 +606,31 @@ def get_eps_update_recommendations():
             days_since_fy_end = (today - next_fy_end).days
 
             if days_since_fy_end > 75:
-                # Fiscal year ended 75+ days ago - new filing likely available
-                if cache_updated:
-                    days_since_update = (today - cache_updated).days
-                    if cache_updated < expected_filing_date:
-                        # Cache was updated before expected filing date
-                        ticker_info['status'] = 'update_recommended'
-                        ticker_info['reason'] = f'FY{latest_eps.get("year")+1} 10-K likely available (FY ended {days_since_fy_end} days ago)'
-                        ticker_info['days_since_fy_end'] = days_since_fy_end
-                        ticker_info['priority'] = 'high' if days_since_fy_end > 120 else 'medium'
-                        needs_update.append(ticker)
-                    else:
-                        recently_updated.append(ticker)
-                else:
+                if cache_updated and cache_updated < expected_filing_date:
                     ticker_info['status'] = 'update_recommended'
                     ticker_info['reason'] = f'FY{latest_eps.get("year")+1} 10-K likely available'
+                    ticker_info['days_since_fy_end'] = days_since_fy_end
+                    ticker_info['priority'] = 'high' if days_since_fy_end > 120 else 'medium'
                     needs_update.append(ticker)
+                else:
+                    recently_updated.append(ticker)
             elif days_since_fy_end > 0:
-                # Fiscal year ended but too soon for 10-K
                 ticker_info['status'] = 'pending'
-                ticker_info['reason'] = f'FY ended {days_since_fy_end} days ago, 10-K expected in ~{75 - days_since_fy_end} days'
+                ticker_info['reason'] = f'FY ended {days_since_fy_end} days ago'
             else:
-                # Fiscal year hasn't ended yet
                 ticker_info['status'] = 'current'
-                ticker_info['reason'] = f'Current FY ends {next_fy_end.strftime("%b %d, %Y")}'
                 recently_updated.append(ticker)
         else:
-            # No fiscal year end info - check if cache is stale
             if is_cache_stale(ticker):
                 ticker_info['status'] = 'stale'
-                ticker_info['reason'] = 'Cache is stale (no fiscal year info available)'
+                ticker_info['reason'] = 'Cache is stale'
                 needs_update.append(ticker)
             else:
                 recently_updated.append(ticker)
 
         details[ticker] = ticker_info
 
-    # Sort needs_update by priority (high first) then by days since FY end
+    # Sort needs_update by priority
     needs_update_with_priority = []
     for ticker in needs_update:
         info = details[ticker]
@@ -708,35 +654,3 @@ def get_eps_update_recommendations():
         'details': details,
         'generated': datetime.now().isoformat()
     }
-
-
-def migrate_legacy_cache():
-    """Migrate old single-file cache to per-ticker files"""
-    if not os.path.exists(LEGACY_CACHE_FILE):
-        return
-
-    try:
-        with open(LEGACY_CACHE_FILE, 'r') as f:
-            legacy = json.load(f)
-
-        companies = legacy.get('companies', {})
-        if companies:
-            print(f"[SEC] Migrating {len(companies)} companies from legacy cache...")
-            ensure_directories()
-
-            for ticker, data in companies.items():
-                save_company_cache(ticker, data)
-
-            # Update metadata with legacy update time
-            metadata = load_metadata()
-            if legacy.get('last_full_update'):
-                metadata['last_full_update'] = legacy['last_full_update']
-            metadata['migrated_from_legacy'] = datetime.now().isoformat()
-            save_metadata(metadata)
-
-            # Remove legacy file after successful migration
-            os.remove(LEGACY_CACHE_FILE)
-            print(f"[SEC] Migration complete, removed legacy cache file")
-
-    except Exception as e:
-        print(f"[SEC] Error migrating legacy cache: {e}")

@@ -4,6 +4,15 @@ user_data/
 # Market data (can be regenerated)
 data/
 
+# SQLite database (contains personal data)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Archived flat files (after database migration)
+archive/
+
 # Python
 __pycache__/
 *.py[cod]

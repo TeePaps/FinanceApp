@@ -9,6 +9,7 @@ import math
 import threading
 import sec_data
 import data_manager
+import database as db
 from logger import log, log_yahoo_fetch, log_screener_progress, log_error
 from config import (
     DATA_DIR, USER_DATA_DIR, EXCLUDED_TICKERS_FILE, TICKER_FAILURES_FILE,
@@ -306,16 +307,12 @@ def fetch_multiple_prices(tickers):
     return cached_prices
 
 def get_stocks():
-    """Read stocks from user_data directory"""
-    with open(STOCKS_FILE, 'r') as f:
-        reader = csv.DictReader(f)
-        return list(reader)
+    """Read stocks from database"""
+    return db.get_stocks()
 
 def get_transactions():
-    """Read transactions from user_data directory"""
-    with open(TRANSACTIONS_FILE, 'r') as f:
-        reader = csv.DictReader(f)
-        return list(reader)
+    """Read transactions from database"""
+    return db.get_transactions()
 
 def calculate_fifo_cost_basis(ticker, transactions):
     """
@@ -745,39 +742,29 @@ def api_transactions():
 @app.route('/api/transactions', methods=['POST'])
 def add_transaction():
     data = request.json
-    transactions = get_transactions()
 
-    # Generate new ID
-    max_id = max(int(t['id']) for t in transactions) if transactions else 0
-    data['id'] = str(max_id + 1)
+    # Add transaction to database
+    txn_id = db.add_transaction(
+        ticker=data.get('ticker', ''),
+        action=data.get('action', ''),
+        shares=int(data.get('shares', 0)) if data.get('shares') else 0,
+        price=float(data.get('price', 0)) if data.get('price') else 0,
+        gain_pct=float(data.get('gain_pct')) if data.get('gain_pct') else None,
+        date=data.get('date'),
+        status=data.get('status')
+    )
 
-    transactions.append(data)
-    fieldnames = ['id', 'ticker', 'action', 'shares', 'price', 'gain_pct', 'date', 'status']
-    write_user_csv(TRANSACTIONS_FILE, transactions, fieldnames)
-
-    return jsonify({'success': True, 'id': data['id']})
+    return jsonify({'success': True, 'id': txn_id})
 
 @app.route('/api/transactions/<int:txn_id>', methods=['PUT'])
 def update_transaction(txn_id):
     data = request.json
-    transactions = get_transactions()
-
-    for i, txn in enumerate(transactions):
-        if int(txn['id']) == txn_id:
-            transactions[i].update(data)
-            break
-
-    fieldnames = ['id', 'ticker', 'action', 'shares', 'price', 'gain_pct', 'date', 'status']
-    write_user_csv(TRANSACTIONS_FILE, transactions, fieldnames)
+    db.update_transaction(txn_id, data)
     return jsonify({'success': True})
 
 @app.route('/api/transactions/<int:txn_id>', methods=['DELETE'])
 def delete_transaction(txn_id):
-    transactions = get_transactions()
-    transactions = [t for t in transactions if int(t['id']) != txn_id]
-
-    fieldnames = ['id', 'ticker', 'action', 'shares', 'price', 'gain_pct', 'date', 'status']
-    write_user_csv(TRANSACTIONS_FILE, transactions, fieldnames)
+    db.delete_transaction(txn_id)
     return jsonify({'success': True})
 
 @app.route('/api/stocks')
@@ -2986,9 +2973,11 @@ def add_stock():
     if any(s['ticker'] == data['ticker'] for s in stocks):
         return jsonify({'success': False, 'error': 'Stock already exists'})
 
-    stocks.append(data)
-    fieldnames = ['ticker', 'name', 'type']
-    write_user_csv(STOCKS_FILE, stocks, fieldnames)
+    db.add_stock(
+        ticker=data.get('ticker', ''),
+        name=data.get('name', ''),
+        stock_type=data.get('type', 'stock')
+    )
     return jsonify({'success': True})
 
 def parse_date(date_str):

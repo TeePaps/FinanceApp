@@ -5,33 +5,27 @@ Provides:
 - FIFO cost basis calculation
 - Holdings aggregation from transactions
 - Sell candidate identification
+
+This module now uses SQLite database for all data storage.
 """
 
-import csv
 import os
-from config import DATA_DIR, STOCKS_FILE, TRANSACTIONS_FILE
+import sys
 
+# Add parent directory for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-def read_csv(filename):
-    """Read CSV file from data directory."""
-    filepath = os.path.join(DATA_DIR, filename)
-    with open(filepath, 'r') as f:
-        reader = csv.DictReader(f)
-        return list(reader)
+import database as db
 
 
 def get_stocks():
-    """Load stocks from user_data directory."""
-    with open(STOCKS_FILE, 'r') as f:
-        reader = csv.DictReader(f)
-        return list(reader)
+    """Load stocks from database."""
+    return db.get_stocks()
 
 
 def get_transactions():
-    """Load transactions from user_data directory."""
-    with open(TRANSACTIONS_FILE, 'r') as f:
-        reader = csv.DictReader(f)
-        return list(reader)
+    """Load transactions from database."""
+    return db.get_transactions()
 
 
 def calculate_fifo_cost_basis(ticker, transactions):
@@ -250,3 +244,30 @@ class HoldingsService:
         # Sort by most compelling sell reasons
         candidates.sort(key=lambda x: len(x['reasons']), reverse=True)
         return candidates
+
+    # Database operations for stocks
+    def add_stock(self, ticker: str, name: str, stock_type: str = 'stock'):
+        """Add a stock to the registry."""
+        db.add_stock(ticker, name, stock_type)
+
+    def remove_stock(self, ticker: str):
+        """Remove a stock from the registry."""
+        db.remove_stock(ticker)
+
+    # Database operations for transactions
+    def add_transaction(self, ticker: str, action: str, shares: int, price: float,
+                       gain_pct: float = None, date: str = None, status: str = None) -> int:
+        """Add a transaction and return its ID."""
+        return db.add_transaction(ticker, action, shares, price, gain_pct, date, status)
+
+    def update_transaction(self, txn_id: int, updates: dict):
+        """Update a transaction."""
+        db.update_transaction(txn_id, updates)
+
+    def delete_transaction(self, txn_id: int):
+        """Delete a transaction."""
+        db.delete_transaction(txn_id)
+
+    def get_next_transaction_id(self) -> int:
+        """Get the next available transaction ID."""
+        return db.get_next_transaction_id()

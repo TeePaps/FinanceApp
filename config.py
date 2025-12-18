@@ -7,31 +7,31 @@ Centralizes all magic numbers and thresholds for easy tuning and testing.
 import os
 
 # ============================================================================
-# File Paths
+# Database Settings
 # ============================================================================
+DATABASE_PATH = os.path.join(os.path.dirname(__file__), 'finance_app.db')
+
+# Legacy file paths (kept for reference, now using SQLite database)
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 USER_DATA_DIR = os.path.join(os.path.dirname(__file__), 'user_data')
-EXCLUDED_TICKERS_FILE = os.path.join(DATA_DIR, 'excluded_tickers.json')
-TICKER_FAILURES_FILE = os.path.join(DATA_DIR, 'ticker_failures.json')
+ARCHIVE_DIR = os.path.join(os.path.dirname(__file__), 'archive')
 
-# User data files (personal holdings - excluded from git)
+# Legacy CSV file paths (now stored in database)
 STOCKS_FILE = os.path.join(USER_DATA_DIR, 'stocks.csv')
 TRANSACTIONS_FILE = os.path.join(USER_DATA_DIR, 'transactions.csv')
 
+# Legacy JSON file paths (for backward compatibility - now in database)
+EXCLUDED_TICKERS_FILE = os.path.join(DATA_DIR, 'excluded_tickers.json')
+TICKER_FAILURES_FILE = os.path.join(DATA_DIR, 'ticker_failures.json')
+
 # ============================================================================
-# Auto-create required directories and files
+# Auto-create required directories
 # ============================================================================
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(USER_DATA_DIR, exist_ok=True)
 
-# Create empty CSV files with headers if they don't exist
-if not os.path.exists(STOCKS_FILE):
-    with open(STOCKS_FILE, 'w') as f:
-        f.write('ticker,name,type\n')
-
-if not os.path.exists(TRANSACTIONS_FILE):
-    with open(TRANSACTIONS_FILE, 'w') as f:
-        f.write('id,ticker,action,shares,price,gain_pct,date,status\n')
+# Note: CSV file creation removed - data now stored in SQLite database
+# Run 'python migrate_to_db.py' to migrate existing flat files to database
 
 # ============================================================================
 # Cache Settings
