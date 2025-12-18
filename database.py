@@ -708,6 +708,55 @@ def get_sec_company_count() -> int:
         return cursor.fetchone()['count']
 
 
+def delete_sec_company(ticker: str):
+    """Delete SEC company data for a ticker (for force refresh)."""
+    ticker = ticker.upper()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM eps_history WHERE ticker = ?', (ticker,))
+        cursor.execute('DELETE FROM sec_companies WHERE ticker = ?', (ticker,))
+        conn.commit()
+
+
+def add_new_eps_years(ticker: str, eps_list: list) -> int:
+    """
+    Add only NEW EPS years that don't exist in the database.
+    Returns the count of new years added.
+    """
+    ticker = ticker.upper()
+    added = 0
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        for eps in eps_list:
+            # Try to insert, ignore if year already exists
+            cursor.execute('''
+                INSERT OR IGNORE INTO eps_history
+                (ticker, year, eps, filed, period_start, period_end, eps_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                ticker,
+                eps.get('year'),
+                eps.get('eps'),
+                eps.get('filed'),
+                eps.get('start') or eps.get('period_start'),
+                eps.get('end') or eps.get('period_end'),
+                eps.get('eps_type')
+            ))
+            if cursor.rowcount > 0:
+                added += 1
+
+        # Update the company's updated timestamp
+        cursor.execute('''
+            UPDATE sec_companies SET updated = ? WHERE ticker = ?
+        ''', (datetime.now().isoformat(), ticker))
+
+        conn.commit()
+
+    return added
+
+
 # =============================================================================
 # SEC Filings Operations (10-K document URLs)
 # =============================================================================

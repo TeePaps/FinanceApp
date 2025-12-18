@@ -1551,6 +1551,30 @@ td.editable {
     border-color: #17a2b8;
 }
 
+/* Company Refresh Button */
+.refresh-company-btn {
+    padding: 4px 10px;
+    font-size: 0.85rem;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    transition: all 0.2s;
+}
+
+.refresh-company-btn:hover {
+    border-color: #28a745;
+    background: rgba(40, 167, 69, 0.1);
+}
+
+[data-theme="dark"] .refresh-company-btn:hover {
+    background: rgba(40, 167, 69, 0.2);
+}
+
 /* SEC Metrics Section */
 .metrics-section {
     margin-top: 25px;

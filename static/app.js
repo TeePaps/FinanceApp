@@ -1432,23 +1432,73 @@ function getSelloffRateClass(rate) {
     return 'rate-normal';
 }
 
-// Global refresh button - comprehensive data refresh
-async function refreshCurrentData() {
-    const refreshBtn = document.querySelector('.refresh-data-btn');
+// ============================================================================
+// Unified Refresh Functions
+// ============================================================================
+
+// Toggle refresh dropdown menu
+function toggleRefreshMenu() {
+    const menu = document.getElementById('refresh-menu');
+    menu.classList.toggle('show');
+}
+
+// Close dropdown when clicking outside
+document.addEventListener('click', function(e) {
+    const dropdown = document.querySelector('.refresh-dropdown');
+    const menu = document.getElementById('refresh-menu');
+    if (dropdown && menu && !dropdown.contains(e.target)) {
+        menu.classList.remove('show');
+    }
+});
+
+// Quick Update - prices only (fastest)
+async function startQuickUpdate() {
+    closeRefreshMenu();
+    await runScreenerUpdate('/api/screener/quick-update', 'Quick Update');
+}
+
+// Smart Update - missing data + prices
+async function startSmartUpdate() {
+    closeRefreshMenu();
+    await runScreenerUpdate('/api/screener/smart-update', 'Smart Update');
+}
+
+// Full Update - EPS + Dividends + Prices
+async function startFullUpdate() {
+    closeRefreshMenu();
+    await runScreenerUpdate('/api/screener/start', 'Full Update');
+}
+
+function closeRefreshMenu() {
+    const menu = document.getElementById('refresh-menu');
+    if (menu) menu.classList.remove('show');
+}
+
+// Unified screener update function
+async function runScreenerUpdate(endpoint, updateType) {
+    const refreshBtn = document.getElementById('refresh-main-btn');
     const currentTab = window.location.hash.slice(1) || 'summary';
 
-    refreshBtn.disabled = true;
-    refreshBtn.textContent = 'Refreshing...';
+    if (refreshBtn) {
+        refreshBtn.disabled = true;
+        refreshBtn.textContent = `${updateType}...`;
+    }
+
+    // Disable menu buttons during update
+    const menuButtons = document.querySelectorAll('.refresh-menu button');
+    menuButtons.forEach(btn => btn.disabled = true);
 
     try {
-        // Start global refresh (fetches missing SEC data, updates prices, recalculates valuations)
-        const response = await fetch('/api/refresh', { method: 'POST' });
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ index: 'all' })
+        });
         const data = await response.json();
 
         if (data.error) {
             alert('Error: ' + data.error);
-            refreshBtn.disabled = false;
-            refreshBtn.textContent = 'Refresh Data';
+            resetRefreshButton();
             return;
         }
 
@@ -1464,63 +1514,95 @@ async function refreshCurrentData() {
             }
 
             // Poll for progress
-            const progressInterval = setInterval(async () => {
-                try {
-                    const progressResponse = await fetch('/api/screener/progress');
-                    const progress = await progressResponse.json();
-
-                    // Update both progress UIs if they exist
-                    const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
-                    const phase = progress.phase === 'sec_data' ? 'SEC Data' :
-                                 progress.phase === 'prices' ? 'Prices' :
-                                 progress.phase === 'valuations' ? 'Valuations' : 'Processing';
-                    const statusText = `[${phase}] ${progress.ticker} (${progress.current}/${progress.total})`;
-
-                    // Update screener tab progress (Market Analysis)
-                    const progressFill = document.getElementById('progress-fill');
-                    const progressText = document.getElementById('progress-text');
-                    if (progressFill) progressFill.style.width = `${pct}%`;
-                    if (progressText) progressText.textContent = statusText;
-
-                    // Update datasets tab progress (Data Sets)
-                    const refreshBar = document.getElementById('refresh-progress-bar');
-                    const refreshPhase = document.getElementById('refresh-phase');
-                    const refreshTicker = document.getElementById('refresh-ticker');
-                    const refreshCount = document.getElementById('refresh-count');
-                    if (refreshBar) refreshBar.style.width = `${pct}%`;
-                    if (refreshPhase) refreshPhase.textContent = phase;
-                    if (refreshTicker) refreshTicker.textContent = progress.ticker || '';
-                    if (refreshCount) refreshCount.textContent = `${progress.current} / ${progress.total} (${pct}%)`;
-
-                    if (progress.status === 'complete' || progress.status === 'cancelled') {
-                        clearInterval(progressInterval);
-                        if (screenerProgress) screenerProgress.style.display = 'none';
-                        if (datasetsProgress) datasetsProgress.style.display = 'none';
-                        refreshBtn.disabled = false;
-                        refreshBtn.textContent = 'Refresh Data';
-
-                        // Reload current view
-                        const nowTab = window.location.hash.slice(1) || 'summary';
-                        if (nowTab === 'screener') {
-                            loadScreener();
-                        } else if (nowTab === 'datasets') {
-                            loadDatasets();
-                        } else if (nowTab === 'research') {
-                            runValuation();
-                        } else {
-                            loadSummary();
-                        }
-                    }
-                } catch (e) {
-                    console.error('Error checking progress:', e);
-                }
-            }, 1000);
+            monitorUpdateProgress(updateType);
         }
     } catch (error) {
-        console.error('Error starting refresh:', error);
-        refreshBtn.disabled = false;
-        refreshBtn.textContent = 'Refresh Data';
+        console.error('Error starting update:', error);
+        resetRefreshButton();
     }
+}
+
+// Monitor update progress
+function monitorUpdateProgress(updateType) {
+    const progressInterval = setInterval(async () => {
+        try {
+            const progressResponse = await fetch('/api/screener/progress');
+            const progress = await progressResponse.json();
+
+            // Map phase names to display names
+            const phaseNames = {
+                'eps': 'SEC EPS',
+                'dividends': 'Dividends',
+                'prices': 'Prices',
+                'combining': 'Building',
+                'retrying': 'Retrying',
+                'valuations': 'Valuations'
+            };
+            const phase = phaseNames[progress.phase] || progress.phase || 'Processing';
+            const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+            const statusText = `[${phase}] ${progress.ticker} (${progress.current}/${progress.total})`;
+
+            // Update screener tab progress (Market Analysis)
+            const progressFill = document.getElementById('progress-fill');
+            const progressText = document.getElementById('progress-text');
+            if (progressFill) progressFill.style.width = `${pct}%`;
+            if (progressText) progressText.textContent = statusText;
+
+            // Update datasets tab progress (Data Sets)
+            const refreshBar = document.getElementById('refresh-progress-bar');
+            const refreshPhase = document.getElementById('refresh-phase');
+            const refreshTicker = document.getElementById('refresh-ticker');
+            const refreshCount = document.getElementById('refresh-count');
+            if (refreshBar) refreshBar.style.width = `${pct}%`;
+            if (refreshPhase) refreshPhase.textContent = phase;
+            if (refreshTicker) refreshTicker.textContent = progress.ticker || '';
+            if (refreshCount) refreshCount.textContent = `${progress.current} / ${progress.total} (${pct}%)`;
+
+            if (progress.status === 'complete' || progress.status === 'cancelled') {
+                clearInterval(progressInterval);
+                const screenerProgress = document.getElementById('screener-progress');
+                const datasetsProgress = document.getElementById('refresh-status');
+                if (screenerProgress) screenerProgress.style.display = 'none';
+                if (datasetsProgress) datasetsProgress.style.display = 'none';
+                resetRefreshButton();
+
+                // Reload current view
+                reloadCurrentView();
+            }
+        } catch (e) {
+            console.error('Error checking progress:', e);
+        }
+    }, 1000);
+}
+
+function resetRefreshButton() {
+    const refreshBtn = document.getElementById('refresh-main-btn');
+    if (refreshBtn) {
+        refreshBtn.disabled = false;
+        refreshBtn.textContent = 'Refresh ▾';
+    }
+    const menuButtons = document.querySelectorAll('.refresh-menu button');
+    menuButtons.forEach(btn => btn.disabled = false);
+}
+
+function reloadCurrentView() {
+    const nowTab = window.location.hash.slice(1) || 'summary';
+    if (nowTab === 'screener') {
+        loadScreener();
+    } else if (nowTab === 'datasets') {
+        loadDatasets();
+    } else if (nowTab === 'research') {
+        runValuation();
+    } else if (nowTab === 'recommendations') {
+        loadRecommendations();
+    } else {
+        loadSummary();
+    }
+}
+
+// Legacy function for backwards compatibility
+async function refreshCurrentData() {
+    await startFullUpdate();
 }
 
 // Refresh research/company lookup data
@@ -1554,6 +1636,45 @@ async function refreshResearchData() {
                 refreshInfo = '<div class="refresh-notice success">SEC EDGAR data fetched for the first time</div>';
             } else if (ri.sec_had_cached) {
                 refreshInfo = '<div class="refresh-notice">Using cached SEC data (already have it)</div>';
+            }
+        }
+
+        renderValuation(data, refreshInfo);
+    } catch (error) {
+        console.error('Error refreshing data:', error);
+        resultsDiv.innerHTML = '<p class="error">Error refreshing data</p>';
+    }
+}
+
+// Refresh data for a single company (checks for new SEC data + fresh prices)
+async function forceRefreshCompany(ticker) {
+    const resultsDiv = document.getElementById('research-results');
+
+    if (!ticker) {
+        return;
+    }
+
+    resultsDiv.innerHTML = `<p class="loading">Refreshing ${ticker}...<br><small>Checking SEC for new filings + fetching current prices</small></p>`;
+
+    try {
+        const response = await fetch(`/api/valuation/${ticker}/refresh?force=true`, {
+            method: 'POST'
+        });
+        const data = await response.json();
+
+        if (data.error) {
+            resultsDiv.innerHTML = `<p class="error">Error: ${data.error}</p>`;
+            return;
+        }
+
+        // Build refresh message based on what was found
+        let refreshInfo = '';
+        const ri = data.refresh_info;
+        if (ri) {
+            if (ri.new_eps_years > 0) {
+                refreshInfo = `<div class="refresh-notice success">Found ${ri.new_eps_years} new EPS year(s) from SEC</div>`;
+            } else {
+                refreshInfo = '<div class="refresh-notice">Checked SEC (no new data) + refreshed prices</div>';
             }
         }
 
@@ -1659,9 +1780,12 @@ function renderValuation(data, refreshInfo = '') {
     const hasEnoughYears = data.has_enough_years;
     const minYearsRecommended = data.min_years_recommended || 8;
 
-    // Data source badge and 10-K dropdown
+    // Data source badge, refresh button, and 10-K dropdown
     const sourceLabel = data.eps_source === 'sec' ? 'SEC EDGAR' : 'yfinance';
     const sourceBadge = `<span class="data-source-badge ${data.eps_source}">${sourceLabel}</span>`;
+    const refreshBtn = `<button class="refresh-company-btn" onclick="forceRefreshCompany('${data.ticker}')" title="Force refresh all data for this company">
+        🔄 Refresh
+    </button>`;
     const tenKDropdown = `<select id="tenk-filings-dropdown" class="tenk-dropdown" onchange="openTenKFiling(this.value)" disabled>
         <option value="">View 10-K...</option>
     </select>`;
@@ -1687,6 +1811,7 @@ function renderValuation(data, refreshInfo = '') {
             <h3>${data.ticker} - ${data.company_name}</h3>
             <div class="valuation-header-controls">
                 ${sourceBadge}
+                ${refreshBtn}
                 ${tenKDropdown}
             </div>
         </div>
@@ -2322,8 +2447,7 @@ async function quickUpdatePrices() {
         }
 
         if (data.status === 'started') {
-            document.getElementById('screener-quick-btn').style.display = 'none';
-            document.getElementById('screener-start-btn').style.display = 'none';
+            hideScreenerButtons();
             document.getElementById('screener-stop-btn').style.display = 'inline-block';
             document.getElementById('screener-progress').style.display = 'block';
 
@@ -2333,6 +2457,35 @@ async function quickUpdatePrices() {
         }
     } catch (error) {
         console.error('Error starting quick update:', error);
+        showScreenerError('Network error: ' + error.message);
+    }
+}
+
+async function smartUpdateScreener() {
+    try {
+        const response = await fetch('/api/screener/smart-update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ index: currentIndex })
+        });
+        const data = await response.json();
+
+        if (data.error) {
+            showScreenerError(data.error);
+            return;
+        }
+
+        if (data.status === 'started') {
+            hideScreenerButtons();
+            document.getElementById('screener-stop-btn').style.display = 'inline-block';
+            document.getElementById('screener-progress').style.display = 'block';
+
+            screenerInterval = setInterval(checkScreenerProgress, 1000);
+        } else {
+            showScreenerError('Unexpected response: ' + JSON.stringify(data));
+        }
+    } catch (error) {
+        console.error('Error starting smart update:', error);
         showScreenerError('Network error: ' + error.message);
     }
 }
@@ -2352,8 +2505,7 @@ async function startScreener() {
         }
 
         if (data.status === 'started') {
-            document.getElementById('screener-quick-btn').style.display = 'none';
-            document.getElementById('screener-start-btn').style.display = 'none';
+            hideScreenerButtons();
             document.getElementById('screener-stop-btn').style.display = 'inline-block';
             document.getElementById('screener-progress').style.display = 'block';
 
@@ -2365,6 +2517,24 @@ async function startScreener() {
         console.error('Error starting screener:', error);
         showScreenerError('Network error: ' + error.message);
     }
+}
+
+function hideScreenerButtons() {
+    const quickBtn = document.getElementById('screener-quick-btn');
+    const smartBtn = document.getElementById('screener-smart-btn');
+    const startBtn = document.getElementById('screener-start-btn');
+    if (quickBtn) quickBtn.style.display = 'none';
+    if (smartBtn) smartBtn.style.display = 'none';
+    if (startBtn) startBtn.style.display = 'none';
+}
+
+function showScreenerButtons() {
+    const quickBtn = document.getElementById('screener-quick-btn');
+    const smartBtn = document.getElementById('screener-smart-btn');
+    const startBtn = document.getElementById('screener-start-btn');
+    if (quickBtn) quickBtn.style.display = 'inline-block';
+    if (smartBtn) smartBtn.style.display = 'inline-block';
+    if (startBtn) startBtn.style.display = 'inline-block';
 }
 
 async function stopScreener() {
@@ -2437,8 +2607,7 @@ async function checkScreenerProgress() {
                 screenerInterval = setInterval(checkScreenerProgress, 1000);
             }
         } else {
-            document.getElementById('screener-quick-btn').style.display = 'inline-block';
-            document.getElementById('screener-start-btn').style.display = 'inline-block';
+            showScreenerButtons();
             document.getElementById('screener-stop-btn').style.display = 'none';
             document.getElementById('screener-progress').style.display = 'none';
 

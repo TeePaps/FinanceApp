@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=40">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=41">
 </head>
 <body>
     <div class="container">
@@ -18,9 +18,22 @@
             <div class="header-right">
                 <span id="global-last-updated" class="global-last-updated"></span>
                 <div class="header-buttons">
-                    <button class="refresh-data-btn" onclick="refreshCurrentData()" title="Refresh data for current view">
-                        Refresh Data
-                    </button>
+                    <div class="refresh-dropdown">
+                        <button class="refresh-data-btn" id="refresh-main-btn" onclick="toggleRefreshMenu()" title="Refresh data options">
+                            Refresh ▾
+                        </button>
+                        <div class="refresh-menu" id="refresh-menu">
+                            <button onclick="startQuickUpdate()" title="Update prices only (fastest)">
+                                <span class="menu-icon">⚡</span> Quick (Prices Only)
+                            </button>
+                            <button onclick="startSmartUpdate()" title="Fetch missing data + prices">
+                                <span class="menu-icon">🔄</span> Smart (Missing + Prices)
+                            </button>
+                            <button onclick="startFullUpdate()" title="Full refresh: EPS + Dividends + Prices">
+                                <span class="menu-icon">📊</span> Full Update
+                            </button>
+                        </div>
+                    </div>
                     <button class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode">
                         <span class="theme-icon">🌙</span>
                     </button>
@@ -216,8 +229,9 @@
                         <span id="screener-count"></span>
                     </div>
                     <div class="screener-buttons">
-                        <button id="screener-quick-btn" onclick="quickUpdatePrices()">Quick Update Prices</button>
-                        <button id="screener-start-btn" onclick="startScreener()">Full Update (EPS+Prices)</button>
+                        <button id="screener-quick-btn" onclick="quickUpdatePrices()" title="Update prices only (fastest)">Quick (Prices)</button>
+                        <button id="screener-smart-btn" onclick="smartUpdateScreener()" title="Fetch missing data + prices">Smart (Missing+Prices)</button>
+                        <button id="screener-start-btn" onclick="startScreener()" title="Full refresh: EPS + Dividends + Prices">Full (All Data)</button>
                         <button id="screener-stop-btn" onclick="stopScreener()" style="display: none;">Stop</button>
                     </div>
                 </div>
@@ -412,6 +426,6 @@
     </div>
 
     <!-- Main App Logic -->
-    <script src="{{ url_for('static', filename='app.js') }}?v=42"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=45"></script>
 </body>
 </html>
