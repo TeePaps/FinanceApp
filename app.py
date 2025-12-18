@@ -1264,14 +1264,31 @@ def run_screener(index_name='all'):
         return
 
     # =========================================================================
-    # PHASE 2: Dividends (fetch for ALL tickers missing dividend data)
+    # PHASE 2: Dividends (fetch only if MISSING or STALE)
     # =========================================================================
-    # Identify tickers needing dividend data - NOT dependent on price success
-    tickers_needing_dividends = [
-        t for t in tickers
-        if not existing_valuations.get(t, {}).get('annual_dividend')
-        and not eps_results.get(t, {}).get('annual_dividend')
-    ]
+    # Identify tickers needing dividend data:
+    # - Missing: no annual_dividend value
+    # - Stale: last_dividend_date is >4 months ago (most stocks pay quarterly)
+    from datetime import timedelta
+    four_months_ago = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
+
+    def needs_dividend_update(ticker):
+        existing = existing_valuations.get(ticker, {})
+        eps_info = eps_results.get(ticker, {})
+
+        # Check if we have any dividend data
+        annual_div = existing.get('annual_dividend') or eps_info.get('annual_dividend')
+        if not annual_div:
+            return True  # Missing - need to fetch
+
+        # Check if dividend data is stale (last update >4 months ago)
+        last_date = existing.get('last_dividend_date') or eps_info.get('last_dividend_date')
+        if last_date and last_date < four_months_ago:
+            return True  # Stale - might have new dividends
+
+        return False  # Have recent dividend data, skip
+
+    tickers_needing_dividends = [t for t in tickers if needs_dividend_update(t)]
 
     dividend_data = {}  # Store fetched dividend data
     if tickers_needing_dividends:
