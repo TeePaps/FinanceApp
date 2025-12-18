@@ -429,6 +429,66 @@ def fetch_sec_eps_if_missing(ticker):
     return None, True  # Return True so it counts as "attempted"
 
 
+def force_refresh_sec_eps(ticker):
+    """
+    Check SEC for newer EPS data and add any new years to the database.
+    Returns tuple: (data, new_years_added)
+    """
+    ticker = ticker.upper()
+
+    # Check if we have existing data
+    existing = load_company_cache(ticker)
+    existing_years = set()
+    if existing and existing.get('eps_history'):
+        existing_years = {eps['year'] for eps in existing['eps_history']}
+
+    # Get CIK for ticker
+    cik = get_cik_for_ticker(ticker)
+    if not cik:
+        if not existing:
+            save_company_cache(ticker, {
+                'ticker': ticker,
+                'cik': None,
+                'eps_history': [],
+                'sec_no_eps': True,
+                'reason': 'No CIK mapping found',
+                'updated': datetime.now().isoformat()
+            })
+        return existing, 0
+
+    # Fetch from SEC
+    fresh_data = fetch_company_eps(ticker, cik)
+
+    if not fresh_data or not fresh_data.get('eps_history'):
+        if not existing:
+            save_company_cache(ticker, {
+                'ticker': ticker,
+                'cik': cik,
+                'eps_history': [],
+                'sec_no_eps': True,
+                'reason': 'SEC XBRL has no EPS data for this company',
+                'updated': datetime.now().isoformat()
+            })
+        return existing, 0
+
+    # Find new years we don't have
+    fresh_years = {eps['year'] for eps in fresh_data['eps_history']}
+    new_years = fresh_years - existing_years
+
+    if new_years:
+        # Add only the new years
+        new_eps = [eps for eps in fresh_data['eps_history'] if eps['year'] in new_years]
+        added = db.add_new_eps_years(ticker, new_eps)
+
+        # Return updated data
+        updated_data = load_company_cache(ticker)
+        return updated_data, added
+    else:
+        # No new years, just update timestamp
+        db.add_new_eps_years(ticker, [])  # Updates timestamp only
+        return existing, 0
+
+
 # --- Background Updates ---
 
 def update_sec_data_for_tickers(tickers):

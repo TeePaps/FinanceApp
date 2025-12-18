@@ -2884,17 +2884,26 @@ def api_sec_metrics(ticker):
 def api_valuation_refresh(ticker):
     """
     Refresh valuation data for a ticker.
-    - Fetches SEC data only if not already cached
+    - Fetches SEC data only if not already cached (or force=true clears cache first)
     - Always fetches fresh yfinance data (different fiscal calendars)
     """
     ticker = ticker.upper()
+    force = request.args.get('force', 'false').lower() == 'true'
 
     try:
-        # Step 1: Fetch SEC data if we don't have it
+        # Step 1: Fetch SEC data
         sec_fetched = False
-        sec_had_data = sec_data.has_cached_eps(ticker)
-        if not sec_had_data:
-            _, sec_fetched = sec_data.fetch_sec_eps_if_missing(ticker)
+        sec_had_data = False
+        new_eps_years = 0
+        if force:
+            # Force refresh: check SEC for any new EPS years
+            _, new_eps_years = sec_data.force_refresh_sec_eps(ticker)
+            sec_had_data = sec_data.has_cached_eps(ticker)
+        else:
+            # Normal: only fetch if not cached
+            sec_had_data = sec_data.has_cached_eps(ticker)
+            if not sec_had_data:
+                _, sec_fetched = sec_data.fetch_sec_eps_if_missing(ticker)
 
         # Step 2: Fetch fresh yfinance data
         stock = yf.Ticker(ticker)
@@ -2967,8 +2976,10 @@ def api_valuation_refresh(ticker):
             'formula': f'(({round(eps_avg, 2) if eps_avg else "N/A"} avg EPS) + {round(annual_dividend, 2)} dividend) × 10 = ${round(estimated_value, 2) if estimated_value else "N/A"}',
             'selloff': selloff_metrics,
             'refresh_info': {
+                'force_refresh': force,
                 'sec_had_cached': sec_had_data,
                 'sec_fetched': sec_fetched,
+                'new_eps_years': new_eps_years,
                 'yfinance_refreshed': True
             }
         })
