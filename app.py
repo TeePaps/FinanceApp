@@ -1283,6 +1283,10 @@ def run_screener(index_name='all'):
         screener_progress['current'] = 0
 
         dividend_count = 0
+        rate_limit_count = 0
+        error_count = 0
+        backoff_delay = 0.3  # Start with 300ms between requests
+
         for i, ticker in enumerate(tickers_needing_dividends):
             if not screener_running:
                 break
@@ -1290,27 +1294,46 @@ def run_screener(index_name='all'):
                 screener_progress['current'] = i
                 screener_progress['ticker'] = f'Fetching dividends... {i}/{len(tickers_needing_dividends)} ({dividend_count} found)'
 
-            try:
-                stock = yf.Ticker(ticker)
-                dividends = stock.dividends
+            # Try up to 2 times with backoff for rate limits
+            for attempt in range(2):
+                try:
+                    stock = yf.Ticker(ticker)
+                    dividends = stock.dividends
 
-                if dividends is not None and len(dividends) > 0:
-                    from datetime import timedelta
-                    one_year_ago = datetime.now() - timedelta(days=365)
-                    recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
-                    annual_dividend = sum(float(d) for d in recent_dividends)
+                    if dividends is not None and len(dividends) > 0:
+                        from datetime import timedelta
+                        one_year_ago = datetime.now() - timedelta(days=365)
+                        recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
+                        annual_dividend = sum(float(d) for d in recent_dividends)
 
-                    if annual_dividend > 0:
-                        dividend_data[ticker] = {
-                            'annual_dividend': round(annual_dividend, 2),
-                            'last_dividend': round(float(dividends.iloc[-1]), 4),
-                            'last_dividend_date': dividends.index[-1].strftime('%Y-%m-%d')
-                        }
-                        dividend_count += 1
+                        if annual_dividend > 0:
+                            dividend_data[ticker] = {
+                                'annual_dividend': round(annual_dividend, 2),
+                                'last_dividend': round(float(dividends.iloc[-1]), 4),
+                                'last_dividend_date': dividends.index[-1].strftime('%Y-%m-%d')
+                            }
+                            dividend_count += 1
+                    break  # Success, exit retry loop
 
-                time.sleep(0.15)
-            except Exception:
-                pass
+                except Exception as e:
+                    error_str = str(e)
+                    if 'Rate' in error_str or 'Too Many' in error_str:
+                        rate_limit_count += 1
+                        if attempt == 0:
+                            # Increase backoff on rate limit
+                            backoff_delay = min(backoff_delay * 2, 2.0)
+                            time.sleep(backoff_delay * 2)  # Extra delay on rate limit
+                        else:
+                            error_count += 1
+                    else:
+                        error_count += 1
+                        break  # Non-rate-limit error, don't retry
+
+            time.sleep(backoff_delay)
+
+        # Log summary of any issues
+        if rate_limit_count > 0 or error_count > 0:
+            log.warning(f"Screener dividends: {rate_limit_count} rate limits, {error_count} errors")
 
         screener_progress['current'] = len(tickers_needing_dividends)
         log.info(f"Screener Phase 2 complete: {time.time() - phase2_start:.1f}s, found dividends for {dividend_count}/{len(tickers_needing_dividends)} tickers")
