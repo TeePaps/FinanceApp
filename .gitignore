@@ -1,7 +1,7 @@
 # =============================================================================
 # Private Data (NEVER commit)
 # =============================================================================
-# Personal holdings database
+# Personal holdings database and all contents
 data_private/
 
 # Legacy directories (pre-database migration)
@@ -9,9 +9,8 @@ user_data/
 data/
 
 # =============================================================================
-# SQLite Databases
+# SQLite Database Temporary Files
 # =============================================================================
-*.db
 *.db-journal
 *.db-wal
 *.db-shm
