@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict
 from enum import Enum
 
-from .index_providers import (
+from .providers import (
     get_index_orchestrator, IndexOrchestrator, IndexResult,
     fetch_index_tickers as _fetch_from_provider
 )

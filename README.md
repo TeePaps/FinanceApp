@@ -64,8 +64,10 @@ FinanceApp/
 │   │   ├── sec_provider.py
 │   │   └── defeatbeta_provider.py
 │   │
-│   ├── index_providers.py # Index constituent fetching (Wikipedia, iShares, etc.)
-│   ├── index_registry.py  # Index definitions and management
+│   ├── indexes/           # Index provider system
+│   │   ├── providers.py   # Index constituent fetching (Wikipedia, iShares, etc.)
+│   │   └── registry.py    # Index definitions and management
+│   │
 │   ├── screener.py        # Background batch processing
 │   ├── valuation.py       # Fair value calculations
 │   ├── recommendations.py # Scoring algorithm

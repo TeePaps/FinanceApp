@@ -124,5 +124,5 @@ YAHOO_SINGLE_DELAY = 0.3      # Seconds between single ticker requests
 # ============================================================================
 # Valid Indices
 # ============================================================================
-# Index definitions moved to services/index_registry.py for single source of truth
-from services.index_registry import VALID_INDICES, INDEX_NAMES as INDEX_DISPLAY_NAMES
+# Index definitions moved to services/indexes/ for single source of truth
+from services.indexes import VALID_INDICES, INDEX_NAMES as INDEX_DISPLAY_NAMES

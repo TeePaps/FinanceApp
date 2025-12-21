@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 from config import PE_RATIO_MULTIPLIER
 import data_manager
-from services.index_registry import INDEX_NAMES
+from services.indexes import INDEX_NAMES
 
 # Module-level state for background tasks
 _running = False
