@@ -13,7 +13,6 @@ import os
 import json
 import threading
 import time
-import yfinance as yf
 from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request
 import database as db
@@ -23,6 +22,7 @@ from config import (
     DATA_DIR, EXCLUDED_TICKERS_FILE, TICKER_FAILURES_FILE,
     FAILURE_THRESHOLD, VALID_INDICES
 )
+from services.providers import get_orchestrator
 
 data_bp = Blueprint('data', __name__, url_prefix='/api')
 
@@ -200,13 +200,12 @@ def api_screener_update_dividends():
             app_module.screener_progress['ticker'] = ticker
 
             try:
-                stock = yf.Ticker(ticker)
-                dividends = stock.dividends
+                orchestrator = get_orchestrator()
+                result = orchestrator.fetch_dividends(ticker)
 
-                if dividends is not None and len(dividends) > 0:
-                    one_year_ago = datetime.now() - timedelta(days=365)
-                    recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
-                    annual_dividend = sum(float(d) for d in recent_dividends)
+                if result.success and result.data:
+                    dividend_data_obj = result.data
+                    annual_dividend = dividend_data_obj.annual_dividend
 
                     # Get existing valuation to update
                     existing = data_manager.load_valuations().get('valuations', {}).get(ticker, {})

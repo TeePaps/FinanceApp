@@ -4,23 +4,37 @@ import os
 import time
 import json
 from datetime import datetime, timedelta
-import yfinance as yf
 import math
 import threading
 import sec_data
 import data_manager
 import database as db
 from logger import log, log_yahoo_fetch, log_screener_progress, log_error
+from services.providers import (
+    init_providers, get_orchestrator, get_registry,
+    get_config, update_config, get_provider_order, set_provider_order,
+    get_secret, set_secret, has_secret,
+    has_fmp_api_key, has_alpaca_credentials, get_alpaca_api_endpoint,
+    validate_fmp_api_key, validate_alpaca_api_key,
+    set_alpaca_credentials,
+    get_disabled_providers, enable_provider, disable_provider,
+    disconnect_ibkr
+)
+from services.valuation import get_validated_eps
 from config import (
     DATA_DIR, USER_DATA_DIR, EXCLUDED_TICKERS_FILE, TICKER_FAILURES_FILE,
     STOCKS_FILE, TRANSACTIONS_FILE,
-    PRICE_CACHE_DURATION, FAILURE_THRESHOLD, VALID_INDICES,
+    PRICE_CACHE_DURATION, FAILURE_THRESHOLD,
     PE_RATIO_MULTIPLIER, RECOMMENDED_EPS_YEARS,
     YAHOO_BATCH_SIZE, YAHOO_BATCH_DELAY, YAHOO_SINGLE_DELAY,
     DIVIDEND_NO_DIVIDEND_PENALTY, DIVIDEND_POINTS_PER_PERCENT, DIVIDEND_MAX_POINTS,
     SELLOFF_SEVERE_BONUS, SELLOFF_MODERATE_BONUS, SELLOFF_RECENT_BONUS,
     SELLOFF_VOLUME_SEVERE, SELLOFF_VOLUME_HIGH, SELLOFF_VOLUME_MODERATE,
     SCORING_WEIGHTS, RECOMMENDATION_MIN_EPS_YEARS
+)
+from services.index_registry import (
+    VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES,
+    fetch_index_tickers, IndexRegistry
 )
 
 app = Flask(__name__)
@@ -37,6 +51,51 @@ startup_check_done = False
 screener_running = False
 screener_current_index = 'all'
 screener_progress = {'current': 0, 'total': 0, 'ticker': '', 'status': 'idle', 'index': 'all'}
+
+# Provider logging - using temp file for cross-process sharing (Flask debug reloader)
+import tempfile
+import fcntl
+
+PROVIDER_LOG_FILE = os.path.join(tempfile.gettempdir(), 'finance_provider_logs.txt')
+PROVIDER_LOG_MAX_LINES = 10
+
+def log_provider_activity(message: str):
+    """Log provider activity for UI display (shared across Flask processes)."""
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    log_entry = f"[{timestamp}] {message}"
+    print(f"[ProviderLog] {log_entry}", flush=True)
+
+    # Append to shared log file with locking
+    try:
+        with open(PROVIDER_LOG_FILE, 'a+') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.seek(0)
+            lines = f.readlines()
+            lines.append(log_entry + '\n')
+            # Keep only last N lines
+            lines = lines[-PROVIDER_LOG_MAX_LINES:]
+            f.seek(0)
+            f.truncate()
+            f.writelines(lines)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        print(f"[ProviderLog] Error writing to log file: {e}", flush=True)
+
+
+def get_provider_logs():
+    """Read provider logs from shared file."""
+    try:
+        if os.path.exists(PROVIDER_LOG_FILE):
+            with open(PROVIDER_LOG_FILE, 'r') as f:
+                return [line.strip() for line in f.readlines() if line.strip()]
+    except Exception:
+        pass
+    return []
+
+
+# Legacy compatibility (for any code still using this)
+provider_logs = []
 
 # Price cache: {ticker: {'price': float, 'timestamp': float}}
 price_cache = {}
@@ -170,141 +229,33 @@ def get_excluded_tickers_info():
     return result
 
 def fetch_stock_price(ticker):
-    """Fetch current stock price using yfinance"""
-    global price_cache
-
-    # Check cache first
-    if ticker in price_cache:
-        cached = price_cache[ticker]
-        if time.time() - cached['timestamp'] < CACHE_DURATION:
-            return cached['price']
-
-    try:
-        stock = yf.Ticker(ticker)
-        # fast_info is quicker than info
-        price = stock.fast_info.get('lastPrice')
-        if price:
-            price_cache[ticker] = {
-                'price': price,
-                'timestamp': time.time()
-            }
-            return price
-    except Exception as e:
-        print(f"Error fetching price for {ticker}: {e}")
-
+    """Fetch current stock price using the provider system."""
+    orchestrator = get_orchestrator()
+    result = orchestrator.fetch_price(ticker)
+    if result.success:
+        return result.data
     return None
 
 def fetch_multiple_prices(tickers):
-    """Fetch prices for multiple tickers using yfinance batch download with retry logic"""
-    global price_cache
-    now = time.time()
+    """Fetch prices for multiple tickers using the provider system.
+
+    Uses the configured provider priority order with automatic fallbacks.
+    Caching is handled by the orchestrator.
+    """
     start_time = time.time()
 
-    # Check which tickers need fetching
-    to_fetch = []
-    cached_prices = {}
-    for ticker in tickers:
-        if ticker in price_cache and now - price_cache[ticker]['timestamp'] < CACHE_DURATION:
-            cached_prices[ticker] = price_cache[ticker]['price']
-        else:
-            to_fetch.append(ticker)
-
-    log.debug(f"fetch_multiple_prices: {len(tickers)} requested, {len(cached_prices)} cached, {len(to_fetch)} to fetch")
-
-    # Fetch uncached tickers in batch with retry logic
-    success_count = 0
-    fail_count = 0
-    failed_tickers = []
-
-    if to_fetch:
-        # Try batch download first with retries
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                log.debug(f"Yahoo batch download attempt {attempt + 1} for {len(to_fetch)} tickers...")
-                data = yf.download(to_fetch, period='1d', progress=False, threads=True)
-
-                if not data.empty:
-                    # Get the latest close price for each ticker
-                    if len(to_fetch) == 1:
-                        # Single ticker returns different structure
-                        ticker = to_fetch[0]
-                        if 'Close' in data.columns:
-                            price = data['Close'].iloc[-1]
-                            if price and not (hasattr(price, 'isna') and price.isna()):
-                                price_cache[ticker] = {'price': float(price), 'timestamp': now}
-                                cached_prices[ticker] = float(price)
-                                success_count += 1
-                            else:
-                                failed_tickers.append(ticker)
-                        else:
-                            failed_tickers.append(ticker)
-                    else:
-                        # Multiple tickers
-                        for ticker in to_fetch:
-                            try:
-                                if ('Close', ticker) in data.columns:
-                                    price = data[('Close', ticker)].iloc[-1]
-                                    if price and not (hasattr(price, 'isna') and price.isna()):
-                                        price_cache[ticker] = {'price': float(price), 'timestamp': now}
-                                        cached_prices[ticker] = float(price)
-                                        success_count += 1
-                                    else:
-                                        failed_tickers.append(ticker)
-                                else:
-                                    failed_tickers.append(ticker)
-                            except Exception:
-                                failed_tickers.append(ticker)
-                    break  # Success, exit retry loop
-                else:
-                    log.warning(f"Yahoo batch download attempt {attempt + 1} returned empty data")
-                    if attempt < max_retries - 1:
-                        time.sleep(1)  # Wait before retry
-                    else:
-                        failed_tickers = to_fetch.copy()
-            except Exception as e:
-                log.warning(f"Yahoo batch download attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                else:
-                    failed_tickers = to_fetch.copy()
-
-        # Fallback: try individual ticker fetching for failed tickers
-        if failed_tickers:
-            log.info(f"Falling back to individual fetching for {len(failed_tickers)} tickers")
-            for ticker in failed_tickers:
-                try:
-                    time.sleep(0.2)  # Small delay between individual requests
-                    stock = yf.Ticker(ticker)
-                    # Try fast_info first (more reliable)
-                    try:
-                        price = stock.fast_info.get('lastPrice') or stock.fast_info.get('regularMarketPrice')
-                    except Exception:
-                        price = None
-
-                    # Fallback to history if fast_info fails
-                    if not price:
-                        hist = stock.history(period='1d')
-                        if not hist.empty and 'Close' in hist.columns:
-                            price = hist['Close'].iloc[-1]
-
-                    if price and price > 0:
-                        price_cache[ticker] = {'price': float(price), 'timestamp': now}
-                        cached_prices[ticker] = float(price)
-                        success_count += 1
-                        log.debug(f"Individual fetch succeeded for {ticker}: ${price:.2f}")
-                    else:
-                        fail_count += 1
-                        log.debug(f"Individual fetch failed for {ticker}: no valid price")
-                except Exception as e:
-                    fail_count += 1
-                    log.debug(f"Individual fetch error for {ticker}: {e}")
+    # Use the provider orchestrator for fetching
+    orchestrator = get_orchestrator()
+    prices = orchestrator.fetch_prices(tickers)
 
     duration = time.time() - start_time
-    if to_fetch:
-        log_yahoo_fetch(to_fetch, success_count, fail_count, duration)
+    success_count = len(prices)
+    fail_count = len(tickers) - success_count
 
-    return cached_prices
+    if tickers:
+        log.debug(f"fetch_multiple_prices: {len(tickers)} requested, {success_count} succeeded, {fail_count} failed in {duration:.2f}s")
+
+    return prices
 
 def get_stocks():
     """Read stocks from database"""
@@ -361,171 +312,8 @@ def calculate_fifo_cost_basis(ticker, transactions):
     return sell_basis, lots
 
 
-def get_validated_eps(ticker, stock, income_stmt=None):
-    """
-    Get EPS data from SEC EDGAR (authoritative) or yfinance (fallback).
-    SEC EDGAR data uses company fiscal year and is the official source.
-    Returns (eps_data, source, validation_info)
-
-    Pass income_stmt if already fetched to avoid duplicate API calls.
-    """
-    ticker = ticker.upper()
-    validation_info = {'validated': False, 'years_available': 0}
-
-    # Get SEC EDGAR data first - this is the authoritative source (from 10-K filings)
-    sec_eps = sec_data.get_sec_eps(ticker)
-    if sec_eps and sec_eps.get('eps_history'):
-        sec_eps_data = [{
-            'year': e['year'],
-            'eps': e['eps'],
-            'eps_type': e.get('eps_type', 'Diluted EPS'),
-            'period_start': e.get('period_start') or e.get('start'),
-            'period_end': e.get('period_end') or e.get('end')
-        } for e in sec_eps['eps_history']]
-        # SEC data is authoritative - use it directly
-        # Note: Years are fiscal years from the company's 10-K filings
-        validation_info = {
-            'validated': True,
-            'source': 'SEC EDGAR 10-K filings',
-            'years_available': len(sec_eps_data),
-            'fiscal_year': True
-        }
-        return sec_eps_data[:8], 'sec', validation_info
-
-    # No SEC data available - fall back to yfinance
-    yf_eps_data = _extract_yf_eps(stock, income_stmt)
-    if yf_eps_data:
-        validation_info = {
-            'validated': False,
-            'source': 'yfinance (SEC data not available)',
-            'years_available': len(yf_eps_data)
-        }
-        return yf_eps_data[:8], 'yfinance', validation_info
-
-    return [], 'none', validation_info
-
-
-def _extract_yf_eps(stock, income_stmt=None):
-    """Extract EPS data from yfinance income statement."""
-    yf_eps_data = []
-    try:
-        if income_stmt is None:
-            income_stmt = stock.income_stmt
-        if income_stmt is not None and not income_stmt.empty:
-            eps_row = None
-            if 'Diluted EPS' in income_stmt.index:
-                eps_row = income_stmt.loc['Diluted EPS']
-            elif 'Basic EPS' in income_stmt.index:
-                eps_row = income_stmt.loc['Basic EPS']
-
-            if eps_row is not None:
-                for date, eps in eps_row.items():
-                    if eps is not None and not (isinstance(eps, float) and math.isnan(eps)):
-                        year = date.year if hasattr(date, 'year') else int(str(date)[:4])
-                        yf_eps_data.append({'year': int(year), 'eps': float(eps)})
-                yf_eps_data.sort(key=lambda x: x['year'], reverse=True)
-    except Exception:
-        pass
-    return yf_eps_data
-
-
-def calculate_selloff_metrics(stock):
-    """
-    Calculate selloff metrics based on volume on down days vs average volume.
-    Returns selloff rates for 1 day, 1 week, and 1 month timeframes.
-
-    Selloff Rate = (Volume on down days) / (Average volume for period)
-    Higher values indicate more selling pressure.
-    """
-    try:
-        # Get 30 days of history for monthly calculation
-        hist = stock.history(period='1mo')
-        if hist is None or hist.empty or len(hist) < 2:
-            return None
-
-        # Get average volume from info (20-day average)
-        info = stock.info
-        avg_volume = info.get('averageVolume', 0) or info.get('averageDailyVolume10Day', 0)
-        if not avg_volume or avg_volume == 0:
-            # Calculate from history if not available
-            avg_volume = hist['Volume'].mean()
-
-        # Calculate daily price changes
-        hist['price_change'] = hist['Close'].pct_change()
-        hist['is_down_day'] = hist['price_change'] < 0
-
-        # 1-Day selloff (today)
-        today = hist.iloc[-1] if len(hist) > 0 else None
-        day_selloff = None
-        if today is not None and avg_volume > 0:
-            if today['is_down_day']:
-                day_selloff = today['Volume'] / avg_volume
-            else:
-                day_selloff = 0  # Not a down day
-
-        # 1-Week selloff (last 5 trading days)
-        week_data = hist.tail(5)
-        week_down_days = week_data[week_data['is_down_day']]
-        week_selloff = None
-        if len(week_data) > 0 and avg_volume > 0:
-            if len(week_down_days) > 0:
-                # Average volume on down days relative to normal
-                week_down_volume = week_down_days['Volume'].mean()
-                week_selloff = week_down_volume / avg_volume
-            else:
-                week_selloff = 0  # No down days this week
-
-        # 1-Month selloff (all available data, ~22 trading days)
-        month_down_days = hist[hist['is_down_day']]
-        month_selloff = None
-        if len(hist) > 0 and avg_volume > 0:
-            if len(month_down_days) > 0:
-                month_down_volume = month_down_days['Volume'].mean()
-                month_selloff = month_down_volume / avg_volume
-            else:
-                month_selloff = 0
-
-        # Calculate overall selloff severity using config thresholds
-        severity = 'none'
-        max_selloff = max(day_selloff or 0, week_selloff or 0, month_selloff or 0)
-        if max_selloff >= SELLOFF_VOLUME_SEVERE:
-            severity = 'severe'  # 3x+ normal volume on down days
-        elif max_selloff >= SELLOFF_VOLUME_HIGH:
-            severity = 'high'    # 2x-3x normal volume
-        elif max_selloff >= SELLOFF_VOLUME_MODERATE:
-            severity = 'moderate' # 1.5x-2x normal volume
-        elif max_selloff >= 1.0:
-            severity = 'normal'   # Normal volume on down days
-
-        # Count down days
-        down_days_week = len(week_down_days)
-        down_days_month = len(month_down_days)
-        total_days_month = len(hist)
-
-        return {
-            'day': {
-                'selloff_rate': round(day_selloff, 2) if day_selloff is not None else None,
-                'is_down': bool(today['is_down_day']) if today is not None else None,
-                'volume': int(today['Volume']) if today is not None else None,
-                'price_change_pct': round(today['price_change'] * 100, 2) if today is not None and not math.isnan(today['price_change']) else None
-            },
-            'week': {
-                'selloff_rate': round(week_selloff, 2) if week_selloff is not None else None,
-                'down_days': down_days_week,
-                'total_days': len(week_data)
-            },
-            'month': {
-                'selloff_rate': round(month_selloff, 2) if month_selloff is not None else None,
-                'down_days': down_days_month,
-                'total_days': total_days_month
-            },
-            'avg_volume': int(avg_volume),
-            'severity': severity,
-            'formula': 'Selloff Rate = (Avg Volume on Down Days) / (Normal Avg Volume)'
-        }
-    except Exception as e:
-        print(f"Error calculating selloff metrics: {e}")
-        return None
+# get_validated_eps now imported from services.valuation
+# calculate_selloff_metrics now handled by orchestrator.fetch_selloff()
 
 
 def calculate_holdings(confirmed_only=False):
@@ -695,8 +483,8 @@ def api_holdings_analysis():
             'price_vs_value': price_vs_value,
             'avg_cost': round(avg_cost, 2) if avg_cost else None,
             'gain_pct': round(gain_pct, 1) if gain_pct else None,
-            'annual_dividend': val.get('annual_dividend', 0),
-            'dividend_yield': round((val.get('annual_dividend', 0) / current_price * 100), 2) if current_price and current_price > 0 else 0,
+            'annual_dividend': val.get('annual_dividend') or 0,
+            'dividend_yield': round(((val.get('annual_dividend') or 0) / current_price * 100), 2) if current_price and current_price > 0 else 0,
             'updated': val.get('updated')
         }
         enriched_holdings[ticker] = enriched
@@ -823,7 +611,7 @@ def api_prices():
         'cache_duration': CACHE_DURATION
     })
 
-# VALID_INDICES imported from config.py
+# VALID_INDICES, INDEX_NAMES, INDIVIDUAL_INDICES imported from services.index_registry
 
 def sanitize_for_json(obj):
     """Replace NaN and Inf values with None for JSON compatibility"""
@@ -838,91 +626,52 @@ def sanitize_for_json(obj):
     return obj
 
 def fetch_index_tickers_from_web(index_name):
-    """Fetch fresh index constituents from Wikipedia (for updates only)"""
-    try:
-        import pandas as pd
-        import requests
-        from io import StringIO
-
-        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
-
-        if index_name == 'sp500':
-            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-            resp = requests.get(url, headers=headers, timeout=30)
-            table = pd.read_html(StringIO(resp.text))[0]
-            return table['Symbol'].str.replace('.', '-', regex=False).tolist()
-        elif index_name == 'nasdaq100':
-            url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
-            resp = requests.get(url, headers=headers, timeout=30)
-            table = pd.read_html(StringIO(resp.text))[4]
-            return table['Ticker'].str.replace('.', '-', regex=False).tolist()
-        elif index_name == 'dow30':
-            url = 'https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average'
-            resp = requests.get(url, headers=headers, timeout=30)
-            table = pd.read_html(StringIO(resp.text))[2]  # Components table is at index 2
-            return table['Symbol'].str.replace('.', '-', regex=False).tolist()
-        elif index_name == 'sp600':
-            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies'
-            resp = requests.get(url, headers=headers, timeout=30)
-            table = pd.read_html(StringIO(resp.text))[0]
-            return table['Symbol'].str.replace('.', '-', regex=False).tolist()
-        elif index_name == 'russell2000':
-            # Fetch from GitHub CSV (community-maintained list)
-            url = 'https://raw.githubusercontent.com/ikoniaris/Russell2000/master/russell_2000_components.csv'
-            resp = requests.get(url, headers=headers, timeout=30)
-            df = pd.read_csv(StringIO(resp.text))
-            return df['Ticker'].str.replace('.', '-', regex=False).tolist()
-    except Exception as e:
-        print(f"[Index] Error fetching {index_name} constituents: {e}")
-    return []
-
-
-INDEX_NAMES = {
-    'all': ('All Indexes', 'All'),
-    'sp500': ('S&P 500', 'S&P 500'),
-    'nasdaq100': ('NASDAQ 100', 'NASDAQ 100'),
-    'dow30': ('Dow Jones Industrial Average', 'DJIA'),
-    'sp600': ('S&P SmallCap 600', 'S&P 600'),
-    'russell2000': ('Russell 2000', 'Russell 2000')
-}
-
-# Individual indexes (excludes 'all')
-INDIVIDUAL_INDICES = ['sp500', 'nasdaq100', 'dow30', 'sp600', 'russell2000']
+    """Fetch fresh index constituents from source (Wikipedia/GitHub)."""
+    return fetch_index_tickers(index_name)
 
 
 def get_all_unique_tickers():
-    """Get all unique tickers across all indexes (deduplicated)"""
+    """Get all unique tickers across all enabled indexes (deduplicated)"""
     all_tickers = set()
+    enabled_indexes = db.get_enabled_indexes()
     for index_name in INDIVIDUAL_INDICES:
-        data = get_index_data(index_name)
-        all_tickers.update(data.get('tickers', []))
+        if index_name in enabled_indexes:
+            data = get_index_data(index_name)
+            all_tickers.update(data.get('tickers', []))
     return sorted(list(all_tickers))
 
 def get_ticker_indexes(ticker):
-    """Get list of indexes a ticker belongs to"""
+    """Get list of enabled indexes a ticker belongs to"""
     indexes = []
+    enabled_indexes = db.get_enabled_indexes()
     for index_name in INDIVIDUAL_INDICES:
-        data = get_index_data(index_name)
-        if ticker in data.get('tickers', []):
-            short_name = INDEX_NAMES.get(index_name, (index_name, index_name))[1]
-            indexes.append(short_name)
+        if index_name in enabled_indexes:
+            data = get_index_data(index_name)
+            if ticker in data.get('tickers', []):
+                short_name = INDEX_NAMES.get(index_name, (index_name, index_name))[1]
+                indexes.append(short_name)
     return indexes
 
-# Cache for ticker-to-index mapping (built once)
+# Cache for ticker-to-index mapping (rebuilt when enabled indexes change)
 _ticker_index_cache = None
+_ticker_index_cache_enabled = None  # Track which indexes were enabled when cache was built
 
 def get_all_ticker_indexes():
-    """Get a mapping of all tickers to their indexes (cached)"""
-    global _ticker_index_cache
-    if _ticker_index_cache is None:
+    """Get a mapping of all tickers to their enabled indexes (cached)"""
+    global _ticker_index_cache, _ticker_index_cache_enabled
+    enabled_indexes = db.get_enabled_indexes()
+    # Rebuild cache if enabled indexes changed
+    if _ticker_index_cache is None or _ticker_index_cache_enabled != enabled_indexes:
         _ticker_index_cache = {}
+        _ticker_index_cache_enabled = enabled_indexes
         for index_name in INDIVIDUAL_INDICES:
-            data = get_index_data(index_name)
-            short_name = INDEX_NAMES.get(index_name, (index_name, index_name))[1]
-            for ticker in data.get('tickers', []):
-                if ticker not in _ticker_index_cache:
-                    _ticker_index_cache[ticker] = []
-                _ticker_index_cache[ticker].append(short_name)
+            if index_name in enabled_indexes:
+                data = get_index_data(index_name)
+                short_name = INDEX_NAMES.get(index_name, (index_name, index_name))[1]
+                for ticker in data.get('tickers', []):
+                    if ticker not in _ticker_index_cache:
+                        _ticker_index_cache[ticker] = []
+                    _ticker_index_cache[ticker].append(short_name)
     return _ticker_index_cache
 
 
@@ -949,15 +698,15 @@ def get_index_data(index_name='all'):
             'last_updated': last_updated
         }
 
-    # Get tickers from database
-    tickers = db.get_index_tickers(index_name)
+    # Get tickers from database (excludes inactive/delisted)
+    tickers = db.get_active_index_tickers(index_name)
 
     # If no tickers in database, fetch from web and store
     if not tickers:
         print(f"[Index] No tickers in database for {index_name}, fetching from web...")
         tickers = fetch_index_tickers_from_web(index_name)
         if tickers:
-            db.sync_index_membership(index_name, tickers)
+            db.refresh_index_membership(index_name, tickers)
 
     # Get index display names
     name, short_name = INDEX_NAMES.get(index_name, (index_name, index_name))
@@ -986,7 +735,7 @@ def save_index_data(index_name, data):
         return  # 'all' is a virtual index, nothing to save
     tickers = data.get('tickers', [])
     if tickers:
-        db.sync_index_membership(index_name, tickers)
+        db.refresh_index_membership(index_name, tickers)
 
 # Keep old functions for backward compatibility
 def get_sp500_data():
@@ -998,41 +747,43 @@ def save_sp500_data(data):
 def calculate_valuation(ticker):
     """Calculate valuation for a single ticker, returns dict or None on error"""
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        # Fetch data using orchestrator
+        orchestrator = get_orchestrator()
 
-        company_name = info.get('shortName', ticker)
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice', 0)
+        # Get stock info (company name, 52-week high/low)
+        info_result = orchestrator.fetch_stock_info(ticker)
+        if info_result.success and info_result.data:
+            info_data = info_result.data
+            company_name = info_data.company_name
+            fifty_two_week_high = info_data.fifty_two_week_high or 0
+            fifty_two_week_low = info_data.fifty_two_week_low or 0
+        else:
+            company_name = ticker
+            fifty_two_week_high = 0
+            fifty_two_week_low = 0
 
-        # Get price momentum data
-        fifty_two_week_high = info.get('fiftyTwoWeekHigh', 0)
-        fifty_two_week_low = info.get('fiftyTwoWeekLow', 0)
+        # Fetch current price from provider system
+        price_result = orchestrator.fetch_price(ticker)
+        current_price = price_result.data if price_result.success else 0
+        price_source = price_result.source if price_result.success else 'none'
 
         # Calculate % off 52-week high
         off_high_pct = None
         if fifty_two_week_high and current_price:
             off_high_pct = ((current_price - fifty_two_week_high) / fifty_two_week_high) * 100
 
-        # Get recent price history for momentum
-        hist = stock.history(period='3mo')
+        # Get recent price history for momentum using orchestrator
+        history_result = orchestrator.fetch_price_history(ticker, period='3mo')
         price_change_1m = None
         price_change_3m = None
 
-        if hist is not None and len(hist) > 0:
-            current = hist['Close'].iloc[-1] if len(hist) > 0 else None
-            one_month_ago = hist['Close'].iloc[-22] if len(hist) >= 22 else hist['Close'].iloc[0]
-            three_months_ago = hist['Close'].iloc[0]
+        if history_result.success and history_result.data:
+            price_data = history_result.data
+            price_change_1m = price_data.change_1m_pct
+            price_change_3m = price_data.change_3m_pct
 
-            if current and one_month_ago:
-                price_change_1m = ((current - one_month_ago) / one_month_ago) * 100
-            if current and three_months_ago:
-                price_change_3m = ((current - three_months_ago) / three_months_ago) * 100
-
-        # Fetch income_stmt once for reuse in validation
-        income_stmt = stock.income_stmt
-
-        # Get validated EPS data (cross-checks SEC against yfinance)
-        eps_data, eps_source, validation_info = get_validated_eps(ticker, stock, income_stmt)
+        # Get validated EPS data using orchestrator
+        eps_data, eps_source, validation_info = get_validated_eps(ticker)
 
         # Use SEC company name if available and SEC data was used
         if eps_source.startswith('sec'):
@@ -1040,22 +791,20 @@ def calculate_valuation(ticker):
             if sec_eps and sec_eps.get('company_name'):
                 company_name = sec_eps['company_name']
 
-        # Get dividends
-        dividends = stock.dividends
+        # Get dividends using orchestrator
+        dividend_result = orchestrator.fetch_dividends(ticker)
         annual_dividend = 0
         last_dividend = None
         last_dividend_date = None
 
-        if dividends is not None and len(dividends) > 0:
-            from datetime import timedelta
-            # Last dividend info
-            last_dividend_date = dividends.index[-1].strftime('%Y-%m-%d')
-            last_dividend = round(float(dividends.iloc[-1]), 4)
-
-            # Annual dividend (last 12 months)
-            one_year_ago = datetime.now() - timedelta(days=365)
-            recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
-            annual_dividend = sum(float(d) for d in recent_dividends)
+        if dividend_result.success and dividend_result.data:
+            dividend_data = dividend_result.data
+            annual_dividend = dividend_data.annual_dividend
+            if dividend_data.payments and len(dividend_data.payments) > 0:
+                # Get last dividend from payments list
+                last_payment = dividend_data.payments[-1]
+                last_dividend_date = last_payment['date']
+                last_dividend = round(float(last_payment['amount']), 4)
 
         # Calculate valuation: (Average EPS over up to 8 years + Annual Dividend) × 10
         min_years_recommended = 8
@@ -1113,41 +862,37 @@ def fetch_eps_for_ticker(ticker, existing_valuation=None, retry_count=0):
     """Fetch EPS and dividend data for a single ticker (used in parallel processing)"""
     max_retries = 2
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        # Get company name from orchestrator
+        orchestrator = get_orchestrator()
+        info_result = orchestrator.fetch_stock_info(ticker)
+        if info_result.success and info_result.data:
+            company_name = info_result.data.company_name
+        else:
+            company_name = ticker
 
-        # Check for rate limiting
-        if info is None or (isinstance(info, dict) and len(info) == 0):
-            if retry_count < max_retries:
-                time.sleep(2 ** retry_count)  # Exponential backoff: 1s, 2s, 4s
-                return fetch_eps_for_ticker(ticker, existing_valuation, retry_count + 1)
-            return {'error': 'rate_limited', 'ticker': ticker}
-
-        income_stmt = stock.income_stmt
-
-        # Get validated EPS data
-        eps_data, eps_source, validation_info = get_validated_eps(ticker, stock, income_stmt)
+        # Get validated EPS data using orchestrator
+        eps_data, eps_source, validation_info = get_validated_eps(ticker)
 
         # Get company name (prefer SEC if available)
-        company_name = info.get('shortName', ticker)
         if eps_source.startswith('sec'):
             sec_eps = sec_data.get_sec_eps(ticker)
             if sec_eps and sec_eps.get('company_name'):
                 company_name = sec_eps['company_name']
 
-        # Get dividends
-        dividends = stock.dividends
+        # Get dividends using orchestrator
+        dividend_result = orchestrator.fetch_dividends(ticker)
         annual_dividend = 0
         last_dividend = None
         last_dividend_date = None
 
-        if dividends is not None and len(dividends) > 0:
-            from datetime import timedelta
-            last_dividend_date = dividends.index[-1].strftime('%Y-%m-%d')
-            last_dividend = round(float(dividends.iloc[-1]), 4)
-            one_year_ago = datetime.now() - timedelta(days=365)
-            recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
-            annual_dividend = sum(float(d) for d in recent_dividends)
+        if dividend_result.success and dividend_result.data:
+            dividend_data = dividend_result.data
+            annual_dividend = dividend_data.annual_dividend
+            if dividend_data.payments and len(dividend_data.payments) > 0:
+                # Get last dividend from payments list
+                last_payment = dividend_data.payments[-1]
+                last_dividend_date = last_payment['date']
+                last_dividend = round(float(last_payment['amount']), 4)
 
         # Calculate EPS average
         eps_avg = None
@@ -1194,6 +939,27 @@ def run_screener(index_name='all'):
 
     screener_running = True
     screener_current_index = index_name
+
+    # Sync index membership before fetching data
+    log.info("Syncing index membership...")
+    if index_name != 'all':
+        current_tickers = fetch_index_tickers_from_web(index_name)
+        if current_tickers:
+            result = db.refresh_index_membership(index_name, current_tickers)
+            log.info(f"[Index] Synced {index_name}: {result['total']} current, {result['added']} added, {result['removed']} removed")
+    else:
+        # For 'all', sync each individual index
+        for idx in INDIVIDUAL_INDICES:
+            current_tickers = fetch_index_tickers_from_web(idx)
+            if current_tickers:
+                result = db.refresh_index_membership(idx, current_tickers)
+                log.info(f"[Index] Synced {idx}: {result['total']} current, {result['added']} added, {result['removed']} removed")
+
+        # For full update, remove orphan valuations (tickers no longer in any active index)
+        orphan_result = db.remove_orphan_valuations()
+        if orphan_result['orphans_found'] > 0:
+            log.info(f"[Orphans] Removed {orphan_result['orphans_found']} orphan valuations")
+
     data = get_index_data(index_name)
     tickers = data['tickers']
     existing_valuations = data.get('valuations', {})  # Get cached data early for reuse
@@ -1314,20 +1080,22 @@ def run_screener(index_name='all'):
             # Try up to 2 times with backoff for rate limits
             for attempt in range(2):
                 try:
-                    stock = yf.Ticker(ticker)
-                    dividends = stock.dividends
+                    orchestrator = get_orchestrator()
+                    result = orchestrator.fetch_dividends(ticker)
 
-                    if dividends is not None and len(dividends) > 0:
-                        from datetime import timedelta
-                        one_year_ago = datetime.now() - timedelta(days=365)
-                        recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
-                        annual_dividend = sum(float(d) for d in recent_dividends)
+                    if result.success and result.data:
+                        dividend_data_obj = result.data
+                        annual_dividend = dividend_data_obj.annual_dividend
 
                         if annual_dividend > 0:
+                            # Get last payment for last_dividend and last_dividend_date
+                            payments = dividend_data_obj.payments
+                            last_payment = payments[-1] if payments else None
+
                             dividend_data[ticker] = {
                                 'annual_dividend': round(annual_dividend, 2),
-                                'last_dividend': round(float(dividends.iloc[-1]), 4),
-                                'last_dividend_date': dividends.index[-1].strftime('%Y-%m-%d')
+                                'last_dividend': round(last_payment['amount'], 4) if last_payment else 0,
+                                'last_dividend_date': last_payment['date'] if last_payment else ''
                             }
                             dividend_count += 1
                     break  # Success, exit retry loop
@@ -1373,10 +1141,19 @@ def run_screener(index_name='all'):
     screener_progress['total'] = len(tickers)
     screener_progress['current'] = 0
 
-    price_data = None
+    history_results = {}
     info_cache = {}
     try:
-        price_data = yf.download(tickers, period='3mo', progress=False, threads=True)
+        log_provider_activity(f"Fetching 3mo history for {len(tickers)} tickers...")
+        orchestrator = get_orchestrator()
+        history_results = orchestrator.fetch_price_history_batch(tickers, period='3mo')
+        log_provider_activity(f"✓ 3mo history: {len(history_results)} tickers downloaded")
+
+        # Mark tickers that failed across all providers as delisted
+        failed_tickers = [t for t in tickers if t not in history_results]
+        if failed_tickers:
+            db.mark_tickers_delisted(failed_tickers)
+            print(f"[Screener] Marked {len(failed_tickers)} tickers as delisted")
 
         # Reuse cached 52-week data from existing valuations (rarely changes)
         for t in tickers:
@@ -1391,7 +1168,7 @@ def run_screener(index_name='all'):
         log.info(f"Screener Phase 3 complete: {time.time() - phase3_start:.1f}s, reusing cached 52-week data for {len(info_cache)} tickers")
     except Exception as e:
         log_error(f"Screener Phase 3 failed after {time.time() - phase3_start:.1f}s", e)
-        price_data = None
+        history_results = {}
         info_cache = {}
 
     if not screener_running:
@@ -1413,34 +1190,19 @@ def run_screener(index_name='all'):
     try:
         import numpy as np
 
-        # Vectorized price calculations - all tickers at once
-        if price_data is not None and len(tickers) > 1:
-            close_prices = price_data['Close']
+        # Extract price data from HistoricalPriceData objects
+        current_prices_dict = {}
+        price_change_3m_dict = {}
+        price_change_1m_dict = {}
 
-            # Current prices (last row)
-            current_prices = close_prices.iloc[-1]
-
-            # 3-month ago prices (first row)
-            prices_3m_ago = close_prices.iloc[0]
-
-            # 1-month ago prices (22 trading days back, or first if not enough data)
-            if len(close_prices) >= 22:
-                prices_1m_ago = close_prices.iloc[-22]
-            else:
-                prices_1m_ago = prices_3m_ago
-
-            # Calculate percentage changes (vectorized)
-            price_change_3m_all = ((current_prices - prices_3m_ago) / prices_3m_ago) * 100
-            price_change_1m_all = ((current_prices - prices_1m_ago) / prices_1m_ago) * 100
-
-            # Convert to dict for fast lookup
-            current_prices_dict = current_prices.to_dict()
-            price_change_3m_dict = price_change_3m_all.to_dict()
-            price_change_1m_dict = price_change_1m_all.to_dict()
-        else:
-            current_prices_dict = {}
-            price_change_3m_dict = {}
-            price_change_1m_dict = {}
+        for ticker, result in history_results.items():
+            if result.success and result.data:
+                hist_data = result.data
+                current_prices_dict[ticker] = hist_data.current_price
+                if hist_data.change_3m_pct is not None:
+                    price_change_3m_dict[ticker] = hist_data.change_3m_pct
+                if hist_data.change_1m_pct is not None:
+                    price_change_1m_dict[ticker] = hist_data.change_1m_pct
 
         # Phase 3.5: Retry failed tickers individually
         failed_tickers = [t for t in tickers if t not in current_prices_dict or
@@ -1452,6 +1214,7 @@ def run_screener(index_name='all'):
             log.info(f"Screener: Retrying {len(failed_tickers)} tickers that failed batch download...")
 
             retry_count = 0
+            orchestrator = get_orchestrator()
             for i, ticker in enumerate(failed_tickers):
                 if not screener_running:
                     break
@@ -1460,33 +1223,42 @@ def run_screener(index_name='all'):
                     screener_progress['ticker'] = f'Retrying failed tickers... {i}/{len(failed_tickers)} ({retry_count} recovered)'
 
                 try:
-                    stock = yf.Ticker(ticker)
-                    price = None
-                    try:
-                        price = stock.fast_info.get('lastPrice') or stock.fast_info.get('regularMarketPrice')
-                    except Exception:
-                        pass
+                    log_provider_activity(f"Retrying {ticker} via orchestrator...")
+                    result = orchestrator.fetch_price(ticker, skip_cache=True)
 
-                    if not price:
-                        hist = stock.history(period='3mo')
-                        if hist is not None and not hist.empty and 'Close' in hist.columns:
-                            price = hist['Close'].iloc[-1]
-                            if len(hist) >= 22:
-                                price_1m_ago = hist['Close'].iloc[-22]
-                                price_change_1m_dict[ticker] = ((price - price_1m_ago) / price_1m_ago) * 100
-                            if len(hist) > 1:
-                                price_3m_ago = hist['Close'].iloc[0]
-                                price_change_3m_dict[ticker] = ((price - price_3m_ago) / price_3m_ago) * 100
-
-                    if price and price > 0:
+                    if result.success and result.data:
+                        price = result.data
+                        log_provider_activity(f"✓ {result.source} retry: {ticker} = ${price:.2f}")
                         current_prices_dict[ticker] = float(price)
                         retry_count += 1
+                    else:
+                        log_provider_activity(f"✗ Failed to fetch {ticker}: {result.error or 'No data'}")
 
                     time.sleep(0.2)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_provider_activity(f"✗ Exception fetching {ticker}: {e}")
 
             log.info(f"Screener: Recovered {retry_count}/{len(failed_tickers)} tickers from individual fetches")
+
+        # Phase 3.6: Override current prices with provider system (respects priority: Alpaca > yfinance > FMP)
+        screener_progress['ticker'] = 'Fetching current prices from configured providers...'
+        price_sources_dict = {}
+        try:
+            orchestrator = get_orchestrator()
+            # Fetch fresh prices from provider system (skips cache to get real-time prices)
+            provider_prices, provider_sources = orchestrator.fetch_prices(tickers, skip_cache=True, return_sources=True)
+
+            # Override yfinance prices with provider prices
+            overridden_count = 0
+            for ticker, price in provider_prices.items():
+                if price and price > 0:
+                    current_prices_dict[ticker] = float(price)
+                    price_sources_dict[ticker] = provider_sources.get(ticker)
+                    overridden_count += 1
+
+            log.info(f"Screener: Got {overridden_count}/{len(tickers)} prices from provider system")
+        except Exception as e:
+            log.warning(f"Screener: Provider price fetch failed, using yfinance prices: {e}")
 
         # Build valuations using pre-computed data
         # Note: Dividends were fetched in Phase 2 (before prices)
@@ -1561,6 +1333,7 @@ def run_screener(index_name='all'):
                 'ticker': ticker,
                 'company_name': company_name,
                 'current_price': round(current_price, 2),
+                'price_source': price_sources_dict.get(ticker),
                 'eps_avg': round(eps_avg, 2) if eps_avg is not None else None,
                 'eps_years': eps_info.get('eps_years', 0),
                 'eps_source': eps_info.get('eps_source', 'unknown'),
@@ -1597,6 +1370,18 @@ def run_screener(index_name='all'):
     if valuations_batch:
         data_manager.bulk_update_valuations(valuations_batch)
         log.info(f"Screener: Saved {len(valuations_batch)} valuations to data_manager")
+
+        # Update ticker status with SEC info (so EPS Data Status reflects actual state)
+        ticker_status_updates = {}
+        for ticker, val in valuations_batch.items():
+            sec_status = 'available' if val.get('eps_source') == 'sec' else 'unavailable'
+            ticker_status_updates[ticker] = {
+                'sec_status': sec_status,
+                'valuation_updated': now_iso,
+                'company_name': val.get('company_name')
+            }
+        data_manager.bulk_update_ticker_status(ticker_status_updates)
+        log.info(f"Screener: Updated sec_status for {len(ticker_status_updates)} tickers")
 
     # Also save to index-specific file if not 'all'
     if index_name != 'all':
@@ -1641,80 +1426,67 @@ def run_quick_price_update(index_name='all'):
     }
 
     try:
-        # Phase 1: Batch download prices in chunks to avoid rate limiting
-        all_price_data = []
-        total_batches = (len(tickers) + YAHOO_BATCH_SIZE - 1) // YAHOO_BATCH_SIZE
+        # Phase 1: Fetch historical price data using orchestrator
+        screener_progress['current'] = 0
+        screener_progress['ticker'] = 'Downloading price history...'
 
-        for batch_idx in range(0, len(tickers), YAHOO_BATCH_SIZE):
-            if not screener_running:
-                screener_progress['status'] = 'cancelled'
-                return
+        log_provider_activity(f"Fetching 3mo history for {len(tickers)} tickers...")
+        orchestrator = get_orchestrator()
+        history_results = orchestrator.fetch_price_history_batch(tickers, period='3mo')
+        log_provider_activity(f"✓ 3mo history: {len(history_results)} tickers downloaded")
 
-            batch = tickers[batch_idx:batch_idx + YAHOO_BATCH_SIZE]
-            batch_num = batch_idx // YAHOO_BATCH_SIZE + 1
-            screener_progress['current'] = batch_idx
-            screener_progress['ticker'] = f'Downloading batch {batch_num}/{total_batches}...'
-
-            # Try up to 3 times with increasing delays
-            for attempt in range(3):
-                try:
-                    batch_data = yf.download(batch, period='3mo', progress=False, threads=True)
-                    if batch_data is not None and not batch_data.empty:
-                        all_price_data.append(batch_data)
-                        print(f"[Quick Update] Batch {batch_num}/{total_batches}: {len(batch)} tickers OK")
-                        break
-                except Exception as e:
-                    if 'Rate' in str(e) and attempt < 2:
-                        wait_time = (attempt + 1) * 5
-                        print(f"[Quick Update] Batch {batch_num} rate limited, waiting {wait_time}s...")
-                        screener_progress['ticker'] = f'Rate limited, waiting {wait_time}s...'
-                        time.sleep(wait_time)
-                    else:
-                        print(f"[Quick Update] Batch {batch_num} error: {e}")
-                        break
-
-            # Delay between batches to avoid rate limiting
-            if batch_idx + YAHOO_BATCH_SIZE < len(tickers):
-                time.sleep(2)
-
-        if not all_price_data:
-            print("[Quick Update] No price data returned from any batch")
+        if not history_results:
+            print("[Quick Update] No price data returned")
             screener_progress['status'] = 'complete'
             screener_running = False
             return
 
-        # Combine all batch data
-        price_data = pd.concat(all_price_data, axis=1)
-        # Remove duplicate columns (same ticker might appear in multiple batches)
-        price_data = price_data.loc[:, ~price_data.columns.duplicated()]
+        # Mark tickers that failed across all providers as delisted
+        failed_tickers = [t for t in tickers if t not in history_results]
+        if failed_tickers:
+            db.mark_tickers_delisted(failed_tickers)
+            print(f"[Quick Update] Marked {len(failed_tickers)} tickers as delisted")
 
         screener_progress['current'] = len(tickers)
         screener_progress['ticker'] = 'Processing prices...'
         screener_progress['phase'] = 'combining'
 
-        # Phase 2: Vectorized price calculations (no API calls)
-        if 'Close' in price_data.columns:
-            close_prices = price_data['Close']
-        elif len(tickers) == 1:
-            close_prices = price_data[['Close']].rename(columns={'Close': tickers[0]})
-        else:
-            # Handle multi-index columns from concat
-            close_cols = [c for c in price_data.columns if c[0] == 'Close']
-            if close_cols:
-                close_prices = price_data[close_cols].droplevel(0, axis=1)
-            else:
-                print("[Quick Update] No Close prices found in data")
-                screener_progress['status'] = 'complete'
-                screener_running = False
-                return
+        # Phase 2: Extract price data from HistoricalPriceData objects
+        current_prices_dict = {}
+        price_change_3m_dict = {}
+        price_change_1m_dict = {}
 
-        current_prices = close_prices.iloc[-1]
-        prices_3m_ago = close_prices.iloc[0]
-        prices_1m_ago = close_prices.iloc[-22] if len(close_prices) >= 22 else prices_3m_ago
+        for ticker, result in history_results.items():
+            if result.success and result.data:
+                hist_data = result.data
+                current_prices_dict[ticker] = hist_data.current_price
+                if hist_data.change_3m_pct is not None:
+                    price_change_3m_dict[ticker] = hist_data.change_3m_pct
+                if hist_data.change_1m_pct is not None:
+                    price_change_1m_dict[ticker] = hist_data.change_1m_pct
 
-        # Vectorized percentage changes
-        price_change_3m = ((current_prices - prices_3m_ago) / prices_3m_ago * 100).replace([np.inf, -np.inf], np.nan)
-        price_change_1m = ((current_prices - prices_1m_ago) / prices_1m_ago * 100).replace([np.inf, -np.inf], np.nan)
+        # Convert to pandas Series for compatibility with existing code
+        import pandas as pd
+        current_prices = pd.Series(current_prices_dict)
+        price_change_3m = pd.Series(price_change_3m_dict)
+        price_change_1m = pd.Series(price_change_1m_dict)
+
+        # Override current prices with real-time provider system (respects priority: Alpaca > yfinance > FMP)
+        screener_progress['ticker'] = 'Fetching current prices from configured providers...'
+        price_sources_dict = {}
+        try:
+            provider_prices, provider_sources = orchestrator.fetch_prices(tickers, skip_cache=True, return_sources=True)
+
+            # Override with provider prices
+            for ticker, price in provider_prices.items():
+                if price and price > 0:
+                    current_prices_dict[ticker] = float(price)
+                    price_sources_dict[ticker] = provider_sources.get(ticker)
+            current_prices = pd.Series(current_prices_dict)
+
+            print(f"[Quick Update] Got {len(provider_prices)}/{len(tickers)} prices from provider system")
+        except Exception as e:
+            print(f"[Quick Update] Provider price fetch failed, using historical prices: {e}")
 
         # Phase 3: Update valuations using cached data (no API calls)
         valuations_batch = {}
@@ -1780,6 +1552,7 @@ def run_quick_price_update(index_name='all'):
                     'ticker': ticker,
                     'company_name': company_name,
                     'current_price': round(current_price, 2),
+                    'price_source': price_sources_dict.get(ticker),
                     'estimated_value': round(estimated_value, 2) if estimated_value else None,
                     'price_vs_value': round(price_vs_value, 1) if price_vs_value is not None else None,
                     'off_high_pct': round(off_high_pct, 1) if off_high_pct is not None else None,
@@ -1850,11 +1623,14 @@ def run_smart_update(index_name='all'):
         screener_progress['phase'] = 'missing'
 
         valuation = calculate_valuation(ticker)
-        if valuation:
+        if valuation and valuation.get('current_price', 0) > 0:
             data['valuations'][ticker] = valuation
             # Save periodically to preserve progress
             if (i + 1) % 10 == 0:
                 save_index_data(index_name, data)
+        else:
+            # Mark ticker as delisted if valuation fails or has no price
+            db.mark_ticker_delisted(ticker)
 
         time.sleep(0.5)
 
@@ -1866,21 +1642,51 @@ def run_smart_update(index_name='all'):
         screener_progress['ticker'] = 'Batch downloading prices...'
 
         try:
-            price_data = yf.download(existing_tickers, period='3mo', progress=False, threads=True)
+            log_provider_activity(f"Fetching 3mo history for {len(existing_tickers)} existing tickers...")
+            orchestrator = get_orchestrator()
+            history_results = orchestrator.fetch_price_history_batch(existing_tickers, period='3mo')
+            log_provider_activity(f"✓ 3mo history: {len(history_results)} tickers downloaded")
 
-            if price_data is not None and not price_data.empty:
-                # Vectorized price calculations
-                if len(existing_tickers) > 1:
-                    close_prices = price_data['Close']
-                else:
-                    close_prices = price_data[['Close']].rename(columns={'Close': existing_tickers[0]})
+            # Mark tickers that failed across all providers as delisted
+            failed_tickers = [t for t in existing_tickers if t not in history_results]
+            if failed_tickers:
+                db.mark_tickers_delisted(failed_tickers)
+                print(f"[Smart Update] Marked {len(failed_tickers)} tickers as delisted")
 
-                current_prices = close_prices.iloc[-1]
-                prices_3m_ago = close_prices.iloc[0]
-                prices_1m_ago = close_prices.iloc[-22] if len(close_prices) >= 22 else prices_3m_ago
+            if history_results:
+                # Extract price data from HistoricalPriceData objects
+                current_prices_dict = {}
+                price_change_3m_dict = {}
+                price_change_1m_dict = {}
 
-                price_change_3m = ((current_prices - prices_3m_ago) / prices_3m_ago * 100).replace([np.inf, -np.inf], np.nan)
-                price_change_1m = ((current_prices - prices_1m_ago) / prices_1m_ago * 100).replace([np.inf, -np.inf], np.nan)
+                for ticker, result in history_results.items():
+                    if result.success and result.data:
+                        hist_data = result.data
+                        current_prices_dict[ticker] = hist_data.current_price
+                        if hist_data.change_3m_pct is not None:
+                            price_change_3m_dict[ticker] = hist_data.change_3m_pct
+                        if hist_data.change_1m_pct is not None:
+                            price_change_1m_dict[ticker] = hist_data.change_1m_pct
+
+                # Convert to pandas Series
+                import pandas as pd
+                current_prices = pd.Series(current_prices_dict)
+                price_change_3m = pd.Series(price_change_3m_dict)
+                price_change_1m = pd.Series(price_change_1m_dict)
+
+                # Override current prices with real-time provider system (respects priority: Alpaca > yfinance > FMP)
+                price_sources_dict = {}
+                try:
+                    provider_prices, provider_sources = orchestrator.fetch_prices(existing_tickers, skip_cache=True, return_sources=True)
+
+                    for ticker, price in provider_prices.items():
+                        if price and price > 0:
+                            current_prices_dict[ticker] = float(price)
+                            price_sources_dict[ticker] = provider_sources.get(ticker)
+                    current_prices = pd.Series(current_prices_dict)
+                    log.info(f"Smart Update: Got {len(provider_prices)}/{len(existing_tickers)} prices from provider system")
+                except Exception as e:
+                    log.warning(f"Smart Update: Provider price fetch failed, using historical prices: {e}")
 
                 for i, ticker in enumerate(existing_tickers):
                     if not screener_running:
@@ -1938,6 +1744,7 @@ def run_smart_update(index_name='all'):
                             **existing,
                             'ticker': ticker,
                             'current_price': round(current_price, 2),
+                            'price_source': price_sources_dict.get(ticker),
                             'estimated_value': round(estimated_value, 2) if estimated_value else None,
                             'price_vs_value': round(price_vs_value, 1) if price_vs_value is not None else None,
                             'off_high_pct': round(off_high_pct, 1) if off_high_pct is not None else None,
@@ -1976,9 +1783,21 @@ def run_smart_update(index_name='all'):
 
 @app.route('/api/indices')
 def api_indices():
-    """Get list of available indices"""
+    """Get list of available indices (only enabled ones)"""
+    # Get enabled indexes from database
+    enabled_indexes = set(db.get_enabled_indexes())
+
+    # Always include 'all' if any individual indexes are enabled
+    individual_enabled = [idx for idx in enabled_indexes if idx != 'all']
+    if individual_enabled:
+        enabled_indexes.add('all')
+
     indices = []
     for index_name in VALID_INDICES:
+        # Skip disabled indexes
+        if index_name not in enabled_indexes:
+            continue
+
         data = get_index_data(index_name)
         indices.append({
             'id': index_name,
@@ -2094,6 +1913,28 @@ def api_screener_stop():
     return jsonify({'status': 'stopping'})
 
 
+@app.route('/api/orphans')
+def api_get_orphans():
+    """Get list of orphan tickers (valuations not in any active index)"""
+    orphans = db.get_orphan_tickers()
+    return jsonify({
+        'success': True,
+        'count': len(orphans),
+        'tickers': orphans
+    })
+
+
+@app.route('/api/orphans/remove', methods=['POST'])
+def api_remove_orphans():
+    """Remove all orphan valuations and related data"""
+    result = db.remove_orphan_valuations()
+    log.info(f"Removed orphans: {result}")
+    return jsonify({
+        'success': True,
+        'removed': result
+    })
+
+
 def run_global_refresh():
     """
     Optimized refresh across all indexes:
@@ -2135,90 +1976,59 @@ def run_global_refresh():
         'phase': 'prices'
     }
 
-    # Phase 1: Batch download prices in chunks to avoid rate limiting
-    all_price_data = []
-    total_batches = (total_tickers + YAHOO_BATCH_SIZE - 1) // YAHOO_BATCH_SIZE
+    # Phase 1: Fetch historical price data using orchestrator
+    print(f"[Refresh] Downloading prices for {total_tickers} tickers...")
 
-    print(f"[Refresh] Downloading prices for {total_tickers} tickers in {total_batches} batches...")
-
-    for batch_idx in range(0, total_tickers, YAHOO_BATCH_SIZE):
-        if not screener_running:
-            screener_progress['status'] = 'cancelled'
-            return
-
-        batch = all_tickers[batch_idx:batch_idx + YAHOO_BATCH_SIZE]
-        batch_num = batch_idx // YAHOO_BATCH_SIZE + 1
-        screener_progress['current'] = batch_idx
-        screener_progress['ticker'] = f'Downloading batch {batch_num}/{total_batches}...'
-
-        # Try up to 3 times with increasing delays
-        for attempt in range(3):
-            try:
-                batch_data = yf.download(batch, period='3mo', progress=False, threads=True)
-                if batch_data is not None and not batch_data.empty:
-                    all_price_data.append(batch_data)
-                    print(f"[Refresh] Batch {batch_num}/{total_batches}: {len(batch)} tickers OK")
-                    break
-            except Exception as e:
-                if 'Rate' in str(e) and attempt < 2:
-                    wait_time = (attempt + 1) * 5
-                    print(f"[Refresh] Batch {batch_num} rate limited, waiting {wait_time}s...")
-                    screener_progress['ticker'] = f'Rate limited, waiting {wait_time}s...'
-                    time.sleep(wait_time)
-                else:
-                    print(f"[Refresh] Batch {batch_num} error: {e}")
-                    break
-
-        # Delay between batches to avoid rate limiting
-        if batch_idx + YAHOO_BATCH_SIZE < total_tickers:
-            time.sleep(2)
-
-    if not screener_running:
-        screener_progress['status'] = 'cancelled'
-        return
-
-    # Phase 2: Combine and calculate price changes
-    screener_progress['phase'] = 'calculating'
-    screener_progress['ticker'] = 'Calculating price changes...'
-    screener_progress['current'] = total_tickers
+    screener_progress['current'] = 0
+    screener_progress['ticker'] = 'Downloading price history...'
 
     current_prices_dict = {}
     price_change_1m_dict = {}
     price_change_3m_dict = {}
 
-    if all_price_data:
+    try:
+        log_provider_activity(f"Fetching 3mo history for {total_tickers} tickers...")
+        orchestrator = get_orchestrator()
+        history_results = orchestrator.fetch_price_history_batch(all_tickers, period='3mo')
+        log_provider_activity(f"✓ 3mo history: {len(history_results)} tickers downloaded")
+
+        if not screener_running:
+            screener_progress['status'] = 'cancelled'
+            return
+
+        # Phase 2: Extract price data from HistoricalPriceData objects
+        screener_progress['phase'] = 'calculating'
+        screener_progress['ticker'] = 'Calculating price changes...'
+        screener_progress['current'] = total_tickers
+
+        for ticker, result in history_results.items():
+            if result.success and result.data:
+                hist_data = result.data
+                current_prices_dict[ticker] = hist_data.current_price
+                if hist_data.change_3m_pct is not None:
+                    price_change_3m_dict[ticker] = hist_data.change_3m_pct
+                if hist_data.change_1m_pct is not None:
+                    price_change_1m_dict[ticker] = hist_data.change_1m_pct
+
+        print(f"[Refresh] Got prices for {len(current_prices_dict)} tickers")
+
+        # Override current prices with real-time provider system (respects priority: Alpaca > yfinance > FMP)
+        price_sources_dict = {}
         try:
-            # Combine all batch data
-            price_data = pd.concat(all_price_data, axis=1)
-            price_data = price_data.loc[:, ~price_data.columns.duplicated()]
+            provider_prices, provider_sources = orchestrator.fetch_prices(all_tickers, skip_cache=True, return_sources=True)
 
-            # Extract close prices
-            if 'Close' in price_data.columns:
-                close_prices = price_data['Close']
-            else:
-                close_cols = [c for c in price_data.columns if c[0] == 'Close']
-                if close_cols:
-                    close_prices = price_data[close_cols].droplevel(0, axis=1)
-                else:
-                    print("[Refresh] No Close prices found")
-                    close_prices = None
-
-            if close_prices is not None:
-                current_prices = close_prices.iloc[-1]
-                prices_3m_ago = close_prices.iloc[0]
-                prices_1m_ago = close_prices.iloc[-22] if len(close_prices) >= 22 else prices_3m_ago
-
-                price_change_3m_all = ((current_prices - prices_3m_ago) / prices_3m_ago) * 100
-                price_change_1m_all = ((current_prices - prices_1m_ago) / prices_1m_ago) * 100
-
-                current_prices_dict = current_prices.to_dict()
-                price_change_3m_dict = price_change_3m_all.to_dict()
-                price_change_1m_dict = price_change_1m_all.to_dict()
-                print(f"[Refresh] Got prices for {len(current_prices_dict)} tickers")
+            for ticker, price in provider_prices.items():
+                if price and price > 0:
+                    current_prices_dict[ticker] = float(price)
+                    price_sources_dict[ticker] = provider_sources.get(ticker)
+            print(f"[Refresh] Got {len(provider_prices)}/{len(all_tickers)} prices from provider system")
         except Exception as e:
-            print(f"[Refresh] Error in vectorized calculations: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[Refresh] Provider price fetch failed, using historical prices: {e}")
+
+    except Exception as e:
+        print(f"[Refresh] Error fetching price data: {e}")
+        import traceback
+        traceback.print_exc()
 
     # Phase 3: Retry failed tickers individually (handles rate-limited tickers)
     failed_tickers = [t for t in all_tickers if t not in current_prices_dict or
@@ -2230,6 +2040,7 @@ def run_global_refresh():
         print(f"[Refresh] Retrying {len(failed_tickers)} tickers that failed batch download...")
 
         retry_count = 0
+        orchestrator = get_orchestrator()
         for i, ticker in enumerate(failed_tickers):
             if not screener_running:
                 break
@@ -2238,34 +2049,20 @@ def run_global_refresh():
                 screener_progress['ticker'] = f'Retrying failed tickers... {i}/{len(failed_tickers)} ({retry_count} recovered)'
 
             try:
-                stock = yf.Ticker(ticker)
-                # Try fast_info first (faster)
-                price = None
-                try:
-                    price = stock.fast_info.get('lastPrice') or stock.fast_info.get('regularMarketPrice')
-                except Exception:
-                    pass
+                log_provider_activity(f"Retrying {ticker} via orchestrator...")
+                result = orchestrator.fetch_price(ticker, skip_cache=True)
 
-                # Fall back to history if fast_info fails
-                if not price:
-                    hist = stock.history(period='3mo')
-                    if hist is not None and not hist.empty and 'Close' in hist.columns:
-                        price = hist['Close'].iloc[-1]
-                        # Also get price changes
-                        if len(hist) >= 22:
-                            price_1m_ago = hist['Close'].iloc[-22]
-                            price_change_1m_dict[ticker] = ((price - price_1m_ago) / price_1m_ago) * 100
-                        if len(hist) > 1:
-                            price_3m_ago = hist['Close'].iloc[0]
-                            price_change_3m_dict[ticker] = ((price - price_3m_ago) / price_3m_ago) * 100
-
-                if price and price > 0:
+                if result.success and result.data:
+                    price = result.data
+                    log_provider_activity(f"✓ {result.source} retry: {ticker} = ${price:.2f}")
                     current_prices_dict[ticker] = float(price)
                     retry_count += 1
+                else:
+                    log_provider_activity(f"✗ Failed to fetch {ticker}: {result.error or 'No data'}")
 
                 time.sleep(0.2)  # Rate limit individual fetches
             except Exception as e:
-                pass  # Skip this ticker
+                log_provider_activity(f"✗ Exception fetching {ticker}: {e}")
 
         print(f"[Refresh] Recovered {retry_count}/{len(failed_tickers)} tickers from individual fetches")
 
@@ -2289,21 +2086,23 @@ def run_global_refresh():
                 screener_progress['ticker'] = f'Fetching dividends... {i}/{len(tickers_needing_dividends)} ({dividend_count} with dividends)'
 
             try:
-                stock = yf.Ticker(ticker)
-                dividends = stock.dividends
+                orchestrator = get_orchestrator()
+                result = orchestrator.fetch_dividends(ticker)
 
-                if dividends is not None and len(dividends) > 0:
-                    from datetime import timedelta
-                    one_year_ago = datetime.now() - timedelta(days=365)
-                    recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
-                    annual_dividend = sum(float(d) for d in recent_dividends)
+                if result.success and result.data:
+                    dividend_data_obj = result.data
+                    annual_dividend = dividend_data_obj.annual_dividend
 
                     if annual_dividend > 0:
+                        # Get last payment for last_dividend and last_dividend_date
+                        payments = dividend_data_obj.payments
+                        last_payment = payments[-1] if payments else None
+
                         if ticker not in existing_valuations:
                             existing_valuations[ticker] = {}
                         existing_valuations[ticker]['annual_dividend'] = round(annual_dividend, 2)
-                        existing_valuations[ticker]['last_dividend'] = round(float(dividends.iloc[-1]), 4)
-                        existing_valuations[ticker]['last_dividend_date'] = dividends.index[-1].strftime('%Y-%m-%d')
+                        existing_valuations[ticker]['last_dividend'] = round(last_payment['amount'], 4) if last_payment else 0
+                        existing_valuations[ticker]['last_dividend_date'] = last_payment['date'] if last_payment else ''
                         dividend_count += 1
 
                 time.sleep(0.15)
@@ -2407,6 +2206,7 @@ def run_global_refresh():
             'ticker': ticker,
             'company_name': company_name,
             'current_price': round(current_price, 2) if current_price else None,
+            'price_source': price_sources_dict.get(ticker),
             'eps_avg': round(eps_avg, 2) if eps_avg else None,
             'eps_years': eps_years,
             'eps_source': eps_source,
@@ -2499,7 +2299,9 @@ def api_global_refresh():
 @app.route('/api/screener/progress')
 def api_screener_progress():
     """Get screener progress"""
-    return jsonify(screener_progress)
+    progress_data = screener_progress.copy()
+    progress_data['provider_logs'] = get_provider_logs()
+    return jsonify(progress_data)
 
 @app.route('/api/recommendations')
 def api_recommendations():
@@ -2521,6 +2323,10 @@ def api_recommendations():
     scored_stocks = []
 
     for ticker, val in all_valuations.items():
+        # Skip stocks not in any enabled index
+        if ticker not in ticker_indexes:
+            continue
+
         # Skip stocks without key metrics
         if not val.get('current_price') or val.get('current_price', 0) <= 0:
             continue
@@ -2528,9 +2334,9 @@ def api_recommendations():
             continue
 
         current_price = val.get('current_price', 0)
-        price_vs_value = val.get('price_vs_value', 0)
-        annual_dividend = val.get('annual_dividend', 0)
-        off_high_pct = val.get('off_high_pct', 0) or 0
+        price_vs_value = val.get('price_vs_value') or 0
+        annual_dividend = val.get('annual_dividend') or 0
+        off_high_pct = val.get('off_high_pct') or 0
         in_selloff = val.get('in_selloff', False)
         selloff_severity = val.get('selloff_severity', 'none')
         eps_years = val.get('eps_years', 0)
@@ -2572,6 +2378,20 @@ def api_recommendations():
         total_score = (undervalue_score * SCORING_WEIGHTS['undervaluation']) + \
                       (dividend_score * SCORING_WEIGHTS['dividend']) + \
                       (selloff_score * SCORING_WEIGHTS['selloff'])
+
+        # 4. Major index bonus: slight preference for blue-chip stocks
+        stock_indexes = ticker_indexes.get(ticker, [])
+        index_bonus = 0
+        index_names_lower = [idx.lower().replace(' ', '').replace('&', '') for idx in stock_indexes]
+
+        if any('dow' in idx or 'djia' in idx for idx in index_names_lower):
+            index_bonus = 10  # Dow 30 - most prestigious blue chips
+        elif any('sp500' in idx for idx in index_names_lower):
+            index_bonus = 8   # S&P 500 - large cap, stable
+        elif any('nasdaq' in idx for idx in index_names_lower):
+            index_bonus = 6   # NASDAQ 100 - large cap tech
+
+        total_score += index_bonus
 
         # Build reasoning
         reasons = []
@@ -2669,25 +2489,22 @@ def api_screener_update_dividends():
             screener_progress['ticker'] = ticker
 
             try:
-                stock = yf.Ticker(ticker)
-                dividends = stock.dividends
+                orchestrator = get_orchestrator()
+                result = orchestrator.fetch_dividends(ticker)
 
-                if dividends is not None and len(dividends) > 0:
-                    # Get last dividend
-                    last_div_date = dividends.index[-1]
-                    last_div_amount = float(dividends.iloc[-1])
+                if result.success and result.data:
+                    dividend_data_obj = result.data
+                    annual_dividend = dividend_data_obj.annual_dividend
 
-                    # Annual dividend (last 12 months)
-                    from datetime import timedelta
-                    one_year_ago = datetime.now() - timedelta(days=365)
-                    recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
-                    annual_dividend = sum(float(d) for d in recent_dividends)
+                    # Get last payment for last_dividend and last_dividend_date
+                    payments = dividend_data_obj.payments
+                    last_payment = payments[-1] if payments else None
 
                     # Update the cached data
                     if ticker in data['valuations']:
                         data['valuations'][ticker]['annual_dividend'] = round(annual_dividend, 2)
-                        data['valuations'][ticker]['last_dividend'] = round(last_div_amount, 4)
-                        data['valuations'][ticker]['last_dividend_date'] = last_div_date.strftime('%Y-%m-%d')
+                        data['valuations'][ticker]['last_dividend'] = round(last_payment['amount'], 4) if last_payment else 0
+                        data['valuations'][ticker]['last_dividend_date'] = last_payment['date'] if last_payment else ''
 
                         # Recalculate estimated value
                         eps_avg = data['valuations'][ticker].get('eps_avg', 0)
@@ -2721,18 +2538,24 @@ def api_valuation(ticker):
     ticker = ticker.upper()
 
     try:
-        stock = yf.Ticker(ticker)
+        # Fetch data using orchestrator
+        from services.providers import get_orchestrator
+        orchestrator = get_orchestrator()
 
         # Get company info
-        info = stock.info
-        company_name = info.get('shortName', ticker)
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice', 0)
+        info_result = orchestrator.fetch_stock_info(ticker)
+        if info_result.success and info_result.data:
+            company_name = info_result.data.company_name
+        else:
+            company_name = ticker
 
-        # Fetch income_stmt once for reuse in validation
-        income_stmt = stock.income_stmt
+        # Fetch current price from provider system
+        price_result = orchestrator.fetch_price(ticker)
+        current_price = price_result.data if price_result.success else 0
+        price_source = price_result.source if price_result.success else 'none'
 
-        # Get validated EPS data (cross-checks SEC against yfinance)
-        eps_data, eps_source, validation_info = get_validated_eps(ticker, stock, income_stmt)
+        # Get validated EPS data using orchestrator
+        eps_data, eps_source, validation_info = get_validated_eps(ticker)
 
         # Use SEC company name if available and SEC data was used
         if eps_source.startswith('sec'):
@@ -2740,25 +2563,25 @@ def api_valuation(ticker):
             if sec_eps and sec_eps.get('company_name'):
                 company_name = sec_eps['company_name']
 
-        # Get selloff metrics
-        selloff_metrics = calculate_selloff_metrics(stock)
-
-        # Get dividend info
-        dividends = stock.dividends
+        # Get dividend info using orchestrator
+        dividend_result = orchestrator.fetch_dividends(ticker)
         annual_dividend = 0
         dividend_info = []
 
-        if dividends is not None and len(dividends) > 0:
-            from datetime import timedelta
-            one_year_ago = datetime.now() - timedelta(days=365)
-            recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
+        if dividend_result.success and dividend_result.data:
+            dividend_data = dividend_result.data
+            annual_dividend = dividend_data.annual_dividend
+            dividend_info = dividend_data.payments
 
-            for date, amount in recent_dividends.items():
-                dividend_info.append({
-                    'date': date.strftime('%Y-%m-%d'),
-                    'amount': float(amount)
-                })
-                annual_dividend += float(amount)
+        # Get selloff metrics via orchestrator
+        selloff_metrics = None
+        selloff_result = orchestrator.fetch_selloff(ticker)
+        if selloff_result.success and selloff_result.data:
+            sd = selloff_result.data
+            selloff_metrics = {
+                'day': sd.day, 'week': sd.week, 'month': sd.month,
+                'avg_volume': sd.avg_volume, 'severity': sd.severity
+            }
 
         # Calculate valuation: (Average EPS over up to 8 years + Annual Dividend) × 10
         min_years_recommended = 8
@@ -2779,6 +2602,7 @@ def api_valuation(ticker):
             'ticker': ticker,
             'company_name': company_name,
             'current_price': round(current_price, 2) if current_price else None,
+            'price_source': price_source,
             'eps_data': eps_data,
             'eps_years': len(eps_data),
             'eps_source': eps_source,
@@ -2905,19 +2729,21 @@ def api_valuation_refresh(ticker):
             if not sec_had_data:
                 _, sec_fetched = sec_data.fetch_sec_eps_if_missing(ticker)
 
-        # Step 2: Fetch fresh yfinance data
-        stock = yf.Ticker(ticker)
+        # Step 2: Fetch current price using provider system
+        orchestrator = get_orchestrator()
+        price_result = orchestrator.fetch_price(ticker)
+        current_price = price_result.data if price_result.success else 0
+        price_source = price_result.source if price_result.success else 'none'
 
-        # Get company info
-        info = stock.info
-        company_name = info.get('shortName', ticker)
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice', 0)
+        # Step 3: Get company info from orchestrator
+        info_result = orchestrator.fetch_stock_info(ticker)
+        if info_result.success and info_result.data:
+            company_name = info_result.data.company_name
+        else:
+            company_name = ticker
 
-        # Fetch income_stmt once for reuse in validation
-        income_stmt = stock.income_stmt
-
-        # Get validated EPS data (cross-checks SEC against yfinance)
-        eps_data, eps_source, validation_info = get_validated_eps(ticker, stock, income_stmt)
+        # Get validated EPS data using orchestrator
+        eps_data, eps_source, validation_info = get_validated_eps(ticker)
 
         # Use SEC company name if available and SEC data was used
         if eps_source.startswith('sec'):
@@ -2925,25 +2751,25 @@ def api_valuation_refresh(ticker):
             if sec_eps and sec_eps.get('company_name'):
                 company_name = sec_eps['company_name']
 
-        # Get selloff metrics
-        selloff_metrics = calculate_selloff_metrics(stock)
-
-        # Get dividend info
-        dividends = stock.dividends
+        # Get dividend info using orchestrator
+        dividend_result = orchestrator.fetch_dividends(ticker)
         annual_dividend = 0
         dividend_info = []
 
-        if dividends is not None and len(dividends) > 0:
-            from datetime import timedelta
-            one_year_ago = datetime.now() - timedelta(days=365)
-            recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
+        if dividend_result.success and dividend_result.data:
+            dividend_data = dividend_result.data
+            annual_dividend = dividend_data.annual_dividend
+            dividend_info = dividend_data.payments
 
-            for date, amount in recent_dividends.items():
-                dividend_info.append({
-                    'date': date.strftime('%Y-%m-%d'),
-                    'amount': float(amount)
-                })
-                annual_dividend += float(amount)
+        # Get selloff metrics via orchestrator
+        selloff_metrics = None
+        selloff_result = orchestrator.fetch_selloff(ticker)
+        if selloff_result.success and selloff_result.data:
+            sd = selloff_result.data
+            selloff_metrics = {
+                'day': sd.day, 'week': sd.week, 'month': sd.month,
+                'avg_volume': sd.avg_volume, 'severity': sd.severity
+            }
 
         # Calculate valuation
         min_years_recommended = 8
@@ -2958,10 +2784,32 @@ def api_valuation_refresh(ticker):
             if current_price and current_price > 0 and estimated_value > 0:
                 price_vs_value = ((current_price - estimated_value) / estimated_value) * 100
 
+        # Save valuation to database
+        valuation_to_save = {
+            'company_name': company_name,
+            'current_price': round(current_price, 2) if current_price else None,
+            'price_source': price_source,
+            'eps_avg': round(eps_avg, 2) if eps_avg else None,
+            'eps_years': len(eps_data),
+            'eps_source': eps_source,
+            'annual_dividend': round(annual_dividend, 2),
+            'estimated_value': round(estimated_value, 2) if estimated_value else None,
+            'price_vs_value': round(price_vs_value, 1) if price_vs_value else None,
+            'updated': datetime.now().isoformat()
+        }
+        # Add selloff data if available
+        if selloff_metrics:
+            valuation_to_save['fifty_two_week_high'] = selloff_metrics.get('high_52w')
+            valuation_to_save['fifty_two_week_low'] = selloff_metrics.get('low_52w')
+            valuation_to_save['off_high_pct'] = selloff_metrics.get('pct_off_high')
+
+        data_manager.bulk_update_valuations({ticker: valuation_to_save})
+
         return jsonify({
             'ticker': ticker,
             'company_name': company_name,
             'current_price': round(current_price, 2) if current_price else None,
+            'price_source': price_source,
             'eps_data': eps_data,
             'eps_years': len(eps_data),
             'eps_source': eps_source,
@@ -2980,7 +2828,7 @@ def api_valuation_refresh(ticker):
                 'sec_had_cached': sec_had_data,
                 'sec_fetched': sec_fetched,
                 'new_eps_years': new_eps_years,
-                'yfinance_refreshed': True
+                'price_provider': price_source
             }
         })
 
@@ -3576,13 +3424,13 @@ def api_eps_recommendations():
         if sec_status in tickers_by_status:
             tickers_by_status[sec_status].add(ticker)
 
-    # Build per-index breakdowns
+    # Build per-index breakdowns (skip 'all' to avoid double-counting)
     missing_by_index = {}
     unavailable_by_index = {}
-    total_missing = 0
-    total_unavailable = 0
+    all_missing_tickers = set()
+    all_unavailable_tickers = set()
 
-    for index_name in VALID_INDICES:
+    for index_name in INDIVIDUAL_INDICES:
         # Get index tickers from data_manager or fall back to old file
         index_tickers = set(data_manager.get_index_tickers(index_name))
         if not index_tickers:
@@ -3600,7 +3448,7 @@ def api_eps_recommendations():
                 'total_count': len(index_tickers),
                 'missing_tickers': sorted(list(missing))[:50]
             }
-            total_missing += len(missing)
+            all_missing_tickers.update(missing)
 
         # Unavailable = SEC has no EPS data (will use yfinance)
         unavailable = index_tickers & tickers_by_status['unavailable']
@@ -3611,7 +3459,11 @@ def api_eps_recommendations():
                 'total_count': len(index_tickers),
                 'unavailable_tickers': sorted(list(unavailable))[:50]
             }
-            total_unavailable += len(unavailable)
+            all_unavailable_tickers.update(unavailable)
+
+    # Count unique missing/unavailable tickers across all indexes
+    total_missing = len(all_missing_tickers)
+    total_unavailable = len(all_unavailable_tickers)
 
     return jsonify({
         'needs_update_count': recommendations['needs_update_count'],
@@ -3646,37 +3498,28 @@ def api_sec_compare(ticker):
         comparison['sec']['eps_data'] = sec_eps['eps_history']
         comparison['sec']['company_name'] = sec_eps.get('company_name', ticker)
 
-    # Get yfinance data
+    # Get yfinance data via orchestrator
     try:
-        stock = yf.Ticker(ticker)
-        income_stmt = stock.income_stmt
+        orchestrator = get_orchestrator()
+        result = orchestrator.fetch_eps(ticker)
 
-        if income_stmt is not None and not income_stmt.empty:
+        if result.success and result.data:
+            eps_data = result.data
+            # Convert orchestrator format to expected format
             yf_eps = []
-            eps_row = None
-            eps_type = None
+            for entry in eps_data.eps_history:
+                if 'eps' in entry and entry['eps'] is not None:
+                    yf_eps.append({
+                        'year': int(entry['year']),
+                        'eps': round(float(entry['eps']), 2)
+                    })
 
-            # Try diluted first (matches SEC preference), then basic
-            if 'Diluted EPS' in income_stmt.index:
-                eps_row = income_stmt.loc['Diluted EPS']
-                eps_type = 'Diluted'
-            elif 'Basic EPS' in income_stmt.index:
-                eps_row = income_stmt.loc['Basic EPS']
-                eps_type = 'Basic'
-
-            if eps_row is not None:
-                for date, eps in eps_row.items():
-                    if eps is not None and not (isinstance(eps, float) and math.isnan(eps)):
-                        year = date.year if hasattr(date, 'year') else int(str(date)[:4])
-                        yf_eps.append({
-                            'year': int(year),
-                            'eps': round(float(eps), 2)
-                        })
-
+            if yf_eps:
                 yf_eps.sort(key=lambda x: x['year'], reverse=True)
                 comparison['yfinance']['available'] = True
                 comparison['yfinance']['eps_data'] = yf_eps
-                comparison['yfinance']['eps_type'] = eps_type
+                comparison['yfinance']['eps_type'] = 'Diluted'  # orchestrator prefers diluted
+                comparison['yfinance']['source'] = eps_data.source
     except Exception as e:
         comparison['yfinance']['error'] = str(e)
 
@@ -3747,6 +3590,265 @@ def api_clear_logs():
     clear_log()
     return jsonify({'status': 'ok', 'message': 'Log file cleared'})
 
+# Provider configuration endpoints
+
+@app.route('/api/providers/config')
+def api_provider_config():
+    """Get provider configuration and status"""
+    config = get_config()
+    registry = get_registry()
+    disabled = set(config.disabled_providers)
+
+    # Get status of all providers
+    available_providers = []
+    for provider in registry.get_all_providers():
+        available_providers.append({
+            'name': provider.name,
+            'display_name': provider.display_name,
+            'available': provider.is_available(),
+            'enabled': provider.name not in disabled,
+            'data_types': [dt.value for dt in provider.data_types],
+            'supports_batch': provider.supports_batch
+        })
+
+    return jsonify({
+        'price_providers': config.price_providers,
+        'eps_providers': config.eps_providers,
+        'dividend_providers': config.dividend_providers,
+        'disabled_providers': config.disabled_providers,
+        'available_providers': available_providers,
+        'has_fmp_key': has_fmp_api_key(),
+        'has_alpaca_key': has_alpaca_credentials(),
+        'alpaca_endpoint': get_alpaca_api_endpoint() or '',
+        'price_cache_seconds': config.price_cache_seconds,
+        'prefer_batch': config.prefer_batch
+    })
+
+@app.route('/api/providers/config', methods=['POST'])
+def api_update_provider_config():
+    """Update provider configuration"""
+    data = request.json
+
+    if 'price_providers' in data:
+        set_provider_order('price', data['price_providers'])
+    if 'eps_providers' in data:
+        set_provider_order('eps', data['eps_providers'])
+    if 'dividend_providers' in data:
+        set_provider_order('dividend', data['dividend_providers'])
+
+    # Update other settings
+    update_kwargs = {}
+    if 'price_cache_seconds' in data:
+        update_kwargs['price_cache_seconds'] = int(data['price_cache_seconds'])
+    if 'prefer_batch' in data:
+        update_kwargs['prefer_batch'] = bool(data['prefer_batch'])
+
+    if update_kwargs:
+        update_config(**update_kwargs)
+
+    return jsonify({'status': 'ok', 'message': 'Configuration updated'})
+
+@app.route('/api/providers/api-key', methods=['POST'])
+def api_set_provider_api_key():
+    """Set API key for a provider"""
+    data = request.json
+    provider = data.get('provider')
+
+    if provider == 'fmp':
+        api_key = data.get('api_key', '').strip()
+        if not api_key:
+            return jsonify({'status': 'error', 'message': 'API key required'}), 400
+
+        # Validate the key first
+        is_valid, message = validate_fmp_api_key(api_key)
+        if not is_valid:
+            return jsonify({'status': 'error', 'message': message}), 400
+
+        set_secret('FMP_API_KEY', api_key)
+        return jsonify({'status': 'ok', 'message': 'FMP API key saved and validated'})
+
+    elif provider == 'alpaca':
+        api_key = data.get('api_key', '').strip()
+        api_secret = data.get('api_secret', '').strip()
+        api_endpoint = data.get('api_endpoint', '').strip() or None
+        if not api_key or not api_secret:
+            return jsonify({'status': 'error', 'message': 'API key and secret required'}), 400
+
+        # Validate the credentials with the optional endpoint
+        is_valid, message = validate_alpaca_api_key(api_key, api_secret, api_endpoint)
+        if not is_valid:
+            return jsonify({'status': 'error', 'message': message}), 400
+
+        set_alpaca_credentials(api_key, api_secret, api_endpoint)
+        return jsonify({'status': 'ok', 'message': 'Alpaca credentials saved and validated'})
+
+    else:
+        return jsonify({'status': 'error', 'message': f'Unknown provider: {provider}'}), 400
+
+@app.route('/api/providers/toggle', methods=['POST'])
+def api_toggle_provider():
+    """Enable or disable a provider"""
+    data = request.json
+    provider_name = data.get('provider')
+    enabled = data.get('enabled', True)
+
+    if not provider_name:
+        return jsonify({'status': 'error', 'message': 'Provider name required'}), 400
+
+    # Verify provider exists
+    registry = get_registry()
+    provider = registry.get_provider(provider_name)
+    if not provider:
+        return jsonify({'status': 'error', 'message': f'Unknown provider: {provider_name}'}), 404
+
+    if enabled:
+        enable_provider(provider_name)
+        return jsonify({'status': 'ok', 'message': f'{provider.display_name} enabled'})
+    else:
+        disable_provider(provider_name)
+        return jsonify({'status': 'ok', 'message': f'{provider.display_name} disabled'})
+
+@app.route('/api/providers/test/<provider_name>')
+def api_test_provider(provider_name):
+    """Test a provider by fetching price for AAPL"""
+    registry = get_registry()
+    provider = registry.get_provider(provider_name)
+
+    if not provider:
+        return jsonify({'status': 'error', 'message': f'Provider not found: {provider_name}'}), 404
+
+    if not provider.is_available():
+        return jsonify({
+            'status': 'error',
+            'message': 'Provider not available (missing API key or dependency)',
+            'available': False
+        }), 400
+
+    try:
+        # Test by fetching AAPL price
+        from services.providers.base import PriceProvider
+        if isinstance(provider, PriceProvider):
+            result = provider.fetch_price('AAPL')
+            if result.success:
+                return jsonify({
+                    'status': 'ok',
+                    'message': f'Successfully fetched AAPL price: ${result.data:.2f}',
+                    'price': result.data,
+                    'source': result.source
+                })
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': result.error
+                }), 400
+        else:
+            return jsonify({
+                'status': 'ok',
+                'message': 'Provider is available but does not support price fetching'
+            })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/providers/cache/stats')
+def api_provider_cache_stats():
+    """Get cache statistics"""
+    orchestrator = get_orchestrator()
+    return jsonify(orchestrator.get_cache_stats())
+
+@app.route('/api/providers/cache/clear', methods=['POST'])
+def api_clear_provider_cache():
+    """Clear provider cache"""
+    data = request.json or {}
+    data_type = data.get('data_type')
+    ticker = data.get('ticker')
+
+    orchestrator = get_orchestrator()
+
+    if data_type:
+        from services.providers.base import DataType
+        try:
+            dt = DataType(data_type)
+            entries_cleared = orchestrator.clear_cache(data_type=dt, ticker=ticker)
+        except ValueError:
+            return jsonify({'status': 'error', 'message': f'Invalid data type: {data_type}'}), 400
+    else:
+        entries_cleared = orchestrator.clear_cache(ticker=ticker)
+
+    return jsonify({
+        'status': 'ok',
+        'message': f'Cache cleared ({entries_cleared} prices invalidated in database)'
+    })
+
+
+# ============================================
+# Index Settings API
+# ============================================
+
+@app.route('/api/indexes/settings')
+def api_index_settings():
+    """Get all indexes with their enabled state."""
+    indexes = db.get_all_indexes()
+    return jsonify(indexes)
+
+
+@app.route('/api/indexes/settings', methods=['POST'])
+def api_update_index_settings():
+    """Update index enabled states."""
+    data = request.json
+    if not data:
+        return jsonify({'success': False, 'error': 'No data provided'}), 400
+
+    # Expect format: {'sp500': true, 'dow30': false, ...}
+    updated = db.set_indexes_enabled(data)
+
+    # Recalculate ticker enabled states based on new index settings
+    ticker_stats = db.recalculate_ticker_enabled_states()
+
+    return jsonify({
+        'success': True,
+        'updated': updated,
+        'message': f'Updated {updated} index settings',
+        'tickers_enabled': ticker_stats['enabled'],
+        'tickers_disabled': ticker_stats['disabled']
+    })
+
+
+@app.route('/api/indexes/settings/<index_name>', methods=['POST'])
+def api_toggle_index(index_name):
+    """Toggle a single index enabled state."""
+    data = request.json or {}
+    enabled = data.get('enabled', True)
+
+    success = db.set_index_enabled(index_name, enabled)
+
+    if success:
+        # Recalculate ticker enabled states based on new index settings
+        ticker_stats = db.recalculate_ticker_enabled_states()
+
+        return jsonify({
+            'success': True,
+            'index': index_name,
+            'enabled': enabled,
+            'tickers_enabled': ticker_stats['enabled'],
+            'tickers_disabled': ticker_stats['disabled']
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'error': f'Index not found: {index_name}'
+        }), 404
+
+
+@app.route('/api/indexes/enabled-ticker-count')
+def api_enabled_ticker_count():
+    """Get count of unique tickers across all enabled indexes."""
+    tickers = get_all_unique_tickers()
+    return jsonify({
+        'count': len(tickers),
+        'enabled_indexes': list(db.get_enabled_indexes())
+    })
+
+
 @app.before_request
 def check_startup_tasks():
     """Run startup tasks on first request"""
@@ -3767,5 +3869,18 @@ def check_startup_tasks():
         except Exception as e:
             print(f"[Startup] Error checking SEC data: {e}")
 
+def cleanup_providers():
+    """Clean up provider connections on shutdown."""
+    try:
+        disconnect_ibkr()
+        print("[Cleanup] IBKR connection closed")
+    except Exception as e:
+        print(f"[Cleanup] Error closing IBKR: {e}")
+
 if __name__ == '__main__':
+    import atexit
+    atexit.register(cleanup_providers)
+
+    # Initialize market data providers
+    init_providers()
     app.run(debug=True, port=8080)

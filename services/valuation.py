@@ -8,62 +8,85 @@ Provides:
 """
 
 import math
-import yfinance as yf
 from datetime import datetime, timedelta
 from config import PE_RATIO_MULTIPLIER, RECOMMENDED_EPS_YEARS
-import sec_data
-from .yahoo_finance import extract_yf_eps, calculate_selloff_metrics
 
 
-def get_validated_eps(ticker, stock, income_stmt=None):
+def get_validated_eps(ticker):
     """
-    Get EPS data from SEC EDGAR (authoritative) or yfinance (fallback).
+    Get EPS data using the orchestrator (SEC EDGAR first, then yfinance fallback).
 
     SEC EDGAR data uses company fiscal year and is the official source.
 
     Args:
         ticker: Stock ticker symbol
-        stock: yfinance Ticker object
-        income_stmt: Optional pre-fetched income statement
 
     Returns:
         Tuple of (eps_data, source, validation_info)
         - eps_data: List of dicts with year and eps values
-        - source: 'sec', 'yfinance', or 'none'
+        - source: 'sec_edgar', 'yfinance', or 'none'
         - validation_info: Dict with validation details
     """
     ticker = ticker.upper()
     validation_info = {'validated': False, 'years_available': 0}
 
-    # Get SEC EDGAR data first - this is the authoritative source (from 10-K filings)
-    sec_eps = sec_data.get_sec_eps(ticker)
-    if sec_eps and sec_eps.get('eps_history'):
-        sec_eps_data = [{
-            'year': e['year'],
-            'eps': e['eps'],
-            'eps_type': e.get('eps_type', 'diluted'),
-            'period_start': e.get('start'),
-            'period_end': e.get('end')
-        } for e in sec_eps['eps_history']]
-        # SEC data is authoritative - use it directly
-        # Note: Years are fiscal years from the company's 10-K filings
-        validation_info = {
-            'validated': True,
-            'source': 'SEC EDGAR 10-K filings',
-            'years_available': len(sec_eps_data),
-            'fiscal_year': True
-        }
-        return sec_eps_data[:8], 'sec', validation_info
+    # Use orchestrator to fetch EPS (handles SEC-first-then-yfinance fallback)
+    from services.providers import get_orchestrator
+    orchestrator = get_orchestrator()
 
-    # No SEC data available - fall back to yfinance
-    yf_eps_data = extract_yf_eps(stock, income_stmt)
-    if yf_eps_data:
-        validation_info = {
-            'validated': False,
-            'source': 'yfinance (SEC data not available)',
-            'years_available': len(yf_eps_data)
-        }
-        return yf_eps_data[:8], 'yfinance', validation_info
+    result = orchestrator.fetch_eps(ticker)
+
+    if result.success and result.data:
+        eps_data = result.data
+
+        # Convert orchestrator format to expected format
+        eps_list = []
+        for entry in eps_data.eps_history:
+            if 'eps' in entry and entry['eps'] is not None:
+                eps_entry = {
+                    'year': int(entry['year']),
+                    'eps': float(entry['eps'])
+                }
+                # Add optional fields if present
+                if 'eps_type' in entry:
+                    eps_entry['eps_type'] = entry['eps_type']
+                if 'period_start' in entry:
+                    eps_entry['period_start'] = entry['period_start']
+                if 'period_end' in entry:
+                    eps_entry['period_end'] = entry['period_end']
+                eps_list.append(eps_entry)
+
+        # Determine validation info based on source
+        source = eps_data.source
+        # Include company name from EPS data if available
+        sec_company_name = eps_data.company_name
+
+        if source == 'sec_edgar':
+            validation_info = {
+                'validated': True,
+                'source': 'SEC EDGAR 10-K filings',
+                'years_available': len(eps_list),
+                'fiscal_year': True,
+                'company_name': sec_company_name
+            }
+            return eps_list[:8], 'sec', validation_info
+        elif source == 'yfinance':
+            validation_info = {
+                'validated': False,
+                'source': 'yfinance (SEC data not available)',
+                'years_available': len(eps_list),
+                'company_name': sec_company_name
+            }
+            return eps_list[:8], 'yfinance', validation_info
+        else:
+            # Other sources (defeatbeta, etc.)
+            validation_info = {
+                'validated': True,
+                'source': source,
+                'years_available': len(eps_list),
+                'company_name': sec_company_name
+            }
+            return eps_list[:8], source, validation_info
 
     return [], 'none', validation_info
 
@@ -84,44 +107,56 @@ def calculate_valuation(ticker, stock=None):
     ticker = ticker.upper()
 
     try:
-        if stock is None:
-            stock = yf.Ticker(ticker)
+        # Fetch data using orchestrator
+        from services.providers import get_orchestrator
+        orchestrator = get_orchestrator()
 
         # Get company info
-        info = stock.info
-        company_name = info.get('shortName', ticker)
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice', 0)
+        info_result = orchestrator.fetch_stock_info(ticker)
+        if info_result.success and info_result.data:
+            info_data = info_result.data
+            company_name = info_data.company_name
+            fifty_two_week_high = info_data.fifty_two_week_high
+            fifty_two_week_low = info_data.fifty_two_week_low
+        else:
+            company_name = ticker
+            fifty_two_week_high = None
+            fifty_two_week_low = None
 
-        # Fetch income_stmt once for reuse in validation
-        income_stmt = stock.income_stmt
+        # Fetch current price from provider system
+        price_result = orchestrator.fetch_price(ticker)
+        current_price = price_result.data if price_result.success else 0
+        price_source = price_result.source if price_result.success else 'none'
 
-        # Get validated EPS data (cross-checks SEC against yfinance)
-        eps_data, eps_source, validation_info = get_validated_eps(ticker, stock, income_stmt)
+        # Get validated EPS data using orchestrator
+        eps_data, eps_source, validation_info = get_validated_eps(ticker)
 
-        # Use SEC company name if available and SEC data was used
-        if eps_source.startswith('sec'):
-            sec_eps = sec_data.get_sec_eps(ticker)
-            if sec_eps and sec_eps.get('company_name'):
-                company_name = sec_eps['company_name']
+        # Use company name from EPS data if available (SEC or other authoritative source)
+        if validation_info.get('company_name'):
+            company_name = validation_info['company_name']
 
-        # Get selloff metrics
-        selloff_metrics = calculate_selloff_metrics(stock)
-
-        # Get dividend info
-        dividends = stock.dividends
+        # Get dividend info using orchestrator
+        dividend_result = orchestrator.fetch_dividends(ticker)
         annual_dividend = 0
         dividend_info = []
 
-        if dividends is not None and len(dividends) > 0:
-            one_year_ago = datetime.now() - timedelta(days=365)
-            recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
+        if dividend_result.success and dividend_result.data:
+            dividend_data = dividend_result.data
+            annual_dividend = dividend_data.annual_dividend
+            dividend_info = dividend_data.payments
 
-            for date, amount in recent_dividends.items():
-                dividend_info.append({
-                    'date': date.strftime('%Y-%m-%d'),
-                    'amount': float(amount)
-                })
-                annual_dividend += float(amount)
+        # Get selloff metrics via orchestrator
+        selloff_metrics = None
+        selloff_result = orchestrator.fetch_selloff(ticker)
+        if selloff_result.success and selloff_result.data:
+            selloff_data = selloff_result.data
+            selloff_metrics = {
+                'day': selloff_data.day,
+                'week': selloff_data.week,
+                'month': selloff_data.month,
+                'avg_volume': selloff_data.avg_volume,
+                'severity': selloff_data.severity
+            }
 
         # Calculate valuation: (Average EPS over up to 8 years + Annual Dividend) x multiplier
         eps_avg = None
@@ -191,9 +226,31 @@ class ValuationService:
             Tuple of (eps_list, source)
         """
         try:
-            stock = yf.Ticker(ticker)
-            eps_data, source, _ = get_validated_eps(ticker, stock)
-            return eps_data, source
+            from services.providers import get_orchestrator
+            orchestrator = get_orchestrator()
+            result = orchestrator.fetch_eps(ticker)
+
+            if result.success and result.data:
+                eps_data = result.data
+                # Convert orchestrator format to expected format
+                eps_list = []
+                for entry in eps_data.eps_history:
+                    if 'eps' in entry and entry['eps'] is not None:
+                        eps_entry = {
+                            'year': int(entry['year']),
+                            'eps': float(entry['eps'])
+                        }
+                        # Add optional fields if present
+                        if 'eps_type' in entry:
+                            eps_entry['eps_type'] = entry['eps_type']
+                        if 'period_start' in entry:
+                            eps_entry['period_start'] = entry['period_start']
+                        if 'period_end' in entry:
+                            eps_entry['period_end'] = entry['period_end']
+                        eps_list.append(eps_entry)
+                return eps_list, eps_data.source
+
+            return [], 'none'
         except Exception as e:
             print(f"Error getting EPS history for {ticker}: {e}")
             return [], 'none'

@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=41">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=42">
 </head>
 <body>
     <div class="container">
@@ -23,17 +23,25 @@
                             Refresh ▾
                         </button>
                         <div class="refresh-menu" id="refresh-menu">
-                            <button onclick="startQuickUpdate()" title="Update prices only (fastest)">
+                            <button onclick="startQuickUpdate()" title="Update prices for current index">
                                 <span class="menu-icon">⚡</span> Quick (Prices Only)
                             </button>
+                            <button onclick="startAllPricesUpdate()" title="Update prices for all enabled indexes" id="all-prices-btn"><span class="menu-icon">🌐</span> All Prices <span id="all-prices-count">(...)</span></button>
                             <button onclick="startSmartUpdate()" title="Fetch missing data + prices">
                                 <span class="menu-icon">🔄</span> Smart (Missing + Prices)
                             </button>
                             <button onclick="startFullUpdate()" title="Full refresh: EPS + Dividends + Prices">
                                 <span class="menu-icon">📊</span> Full Update
                             </button>
+                            <hr style="margin: 4px 0; border-color: var(--border-color);">
+                            <button onclick="removeOrphans()" title="Remove valuations for tickers no longer in any index">
+                                <span class="menu-icon">🗑️</span> Remove Orphans
+                            </button>
                         </div>
                     </div>
+                    <button class="settings-btn" onclick="showTab('settings')" title="Settings">
+                        <span class="settings-icon">⚙️</span>
+                    </button>
                     <button class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode">
                         <span class="theme-icon">🌙</span>
                     </button>
@@ -43,9 +51,14 @@
 
         <nav class="tabs">
             <button class="tab-btn active" onclick="showTab('summary')">Summary</button>
-            <button class="tab-btn" onclick="showTab('profit')">Profit Timeline</button>
-            <button class="tab-btn" onclick="showTab('holdings')">Holdings</button>
-            <button class="tab-btn" onclick="showTab('add')">Add Transaction</button>
+            <div class="tab-dropdown">
+                <button class="tab-btn tab-dropdown-btn" onclick="toggleTabDropdown(event)">My Portfolio ▾</button>
+                <div class="tab-dropdown-menu" id="portfolio-dropdown">
+                    <button class="tab-dropdown-item" onclick="showTab('profit'); closeTabDropdown()">Profit Timeline</button>
+                    <button class="tab-dropdown-item" onclick="showTab('holdings'); closeTabDropdown()">Holdings</button>
+                    <button class="tab-dropdown-item" onclick="showTab('add'); closeTabDropdown()">Add Transaction</button>
+                </div>
+            </div>
             <button class="tab-btn" onclick="showTab('research')">Company Lookup</button>
             <button class="tab-btn" onclick="showTab('screener')">Market Analysis</button>
             <button class="tab-btn" onclick="showTab('recommendations')">Recommendations</button>
@@ -213,12 +226,7 @@
                     <div class="index-selector">
                         <label for="index-select">Index:</label>
                         <select id="index-select" onchange="changeIndex(this.value)">
-                            <option value="all">All Indexes</option>
-                            <option value="sp500" selected>S&P 500</option>
-                            <option value="nasdaq100">Nasdaq 100</option>
-                            <option value="dow30">Dow 30</option>
-                            <option value="sp600">S&P 600</option>
-                            <option value="russell2000">Russell 2000</option>
+                            <!-- Populated dynamically from /api/indices -->
                         </select>
                     </div>
                 </div>
@@ -308,6 +316,11 @@
                             <span id="refresh-count"></span>
                         </div>
                     </div>
+                    <!-- Provider activity log -->
+                    <div class="provider-logs" id="provider-logs">
+                        <div class="log-header">Provider Activity</div>
+                        <div class="log-content" id="log-content"></div>
+                    </div>
                     <button class="stop-btn" onclick="stopRefresh()">Stop Refresh</button>
                 </div>
 
@@ -368,11 +381,7 @@
                         <input type="text" id="ticker-search" placeholder="Search tickers..." class="ticker-search-input">
                         <select id="ticker-filter-index" class="ticker-filter-select">
                             <option value="">All Indexes</option>
-                            <option value="sp500">S&P 500</option>
-                            <option value="nasdaq100">NASDAQ 100</option>
-                            <option value="dow30">Dow 30</option>
-                            <option value="sp600">S&P 600</option>
-                            <option value="russell2000">Russell 2000</option>
+                            <!-- Additional options populated dynamically from /api/indices -->
                         </select>
                         <select id="ticker-filter-source" class="ticker-filter-select">
                             <option value="">All Sources</option>
@@ -423,9 +432,125 @@
                 </div>
             </section>
         </div>
+
+        <div id="settings-tab" class="tab-content">
+            <section id="settings-section">
+                <h2>Settings</h2>
+
+                <!-- Index Configuration -->
+                <div class="settings-card">
+                    <h3>Stock Indexes</h3>
+                    <p class="settings-desc">Choose which indexes to track. Disabled indexes won't appear in dropdowns or screener.</p>
+
+                    <div class="index-toggles" id="index-toggles">
+                        <span class="loading">Loading indexes...</span>
+                    </div>
+
+                    <div class="index-actions">
+                        <button class="btn-secondary" onclick="selectAllIndexes(true)">Enable All</button>
+                        <button class="btn-secondary" onclick="selectAllIndexes(false)">Disable All</button>
+                        <button class="btn-primary" onclick="saveIndexSettings()">Save Index Settings</button>
+                    </div>
+                </div>
+
+                <!-- Provider Configuration -->
+                <div class="settings-card">
+                    <h3>Market Data Providers</h3>
+                    <p class="settings-desc">Configure which providers to use for fetching market data and their priority order.</p>
+
+                    <div class="provider-status" id="provider-status">
+                        <h4>Provider Status</h4>
+                        <div class="provider-list" id="provider-list">
+                            <span class="loading">Loading providers...</span>
+                        </div>
+                    </div>
+
+                    <div class="provider-order-section">
+                        <h4>Price Provider Priority</h4>
+                        <p class="settings-hint">Drag to reorder. First provider is tried first.</p>
+                        <ul class="provider-order-list" id="price-provider-order">
+                            <!-- Populated by JavaScript -->
+                        </ul>
+
+                        <h4>EPS Provider Priority</h4>
+                        <ul class="provider-order-list" id="eps-provider-order">
+                            <!-- Populated by JavaScript -->
+                        </ul>
+
+                        <h4>Dividend Provider Priority</h4>
+                        <ul class="provider-order-list" id="dividend-provider-order">
+                            <!-- Populated by JavaScript -->
+                        </ul>
+
+                        <button class="btn-primary" onclick="saveProviderOrder()">Save Provider Order</button>
+                    </div>
+                </div>
+
+                <!-- API Keys -->
+                <div class="settings-card">
+                    <h3>API Keys</h3>
+                    <p class="settings-desc">Configure API keys for premium data providers.</p>
+
+                    <div class="api-key-form">
+                        <div class="api-key-row">
+                            <label>Financial Modeling Prep (FMP)</label>
+                            <div class="api-key-input-group">
+                                <input type="password" id="fmp-api-key" placeholder="Enter FMP API key">
+                                <span class="api-key-status" id="fmp-key-status"></span>
+                            </div>
+                            <button class="btn-secondary" onclick="saveFmpApiKey()">Save Key</button>
+                            <button class="btn-secondary" onclick="testProvider('fmp')">Test</button>
+                        </div>
+
+                        <div class="api-key-row">
+                            <label>Alpaca Markets</label>
+                            <div class="api-key-input-group">
+                                <input type="password" id="alpaca-api-key" placeholder="API Key">
+                                <input type="password" id="alpaca-api-secret" placeholder="API Secret">
+                                <input type="text" id="alpaca-api-endpoint" placeholder="API Endpoint (optional, e.g., https://data.alpaca.markets)">
+                                <span class="api-key-status" id="alpaca-key-status"></span>
+                            </div>
+                            <button class="btn-secondary" onclick="saveAlpacaCredentials()">Save Credentials</button>
+                            <button class="btn-secondary" onclick="testProvider('alpaca')">Test</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Cache Settings -->
+                <div class="settings-card">
+                    <h3>Cache Settings</h3>
+                    <p class="settings-desc">Control how long data is cached before fetching fresh data.</p>
+
+                    <div class="cache-settings">
+                        <div class="cache-setting-row">
+                            <label>Price Cache Duration</label>
+                            <input type="number" id="price-cache-seconds" min="60" max="3600" value="300">
+                            <span class="cache-unit">seconds</span>
+                        </div>
+                        <div class="cache-setting-row">
+                            <label>Prefer Batch Requests</label>
+                            <input type="checkbox" id="prefer-batch" checked>
+                            <span class="cache-hint">Use batch-capable providers first for efficiency</span>
+                        </div>
+                    </div>
+
+                    <div class="cache-actions">
+                        <button class="btn-secondary" onclick="saveCacheSettings()">Save Cache Settings</button>
+                        <button class="btn-warning" onclick="clearProviderCache()">Clear All Cache</button>
+                    </div>
+
+                    <div class="cache-stats" id="cache-stats">
+                        <h4>Cache Statistics</h4>
+                        <div id="cache-stats-content">
+                            <span class="loading">Loading...</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </div>
     </div>
 
     <!-- Main App Logic -->
-    <script src="{{ url_for('static', filename='app.js') }}?v=45"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=47"></script>
 </body>
 </html>

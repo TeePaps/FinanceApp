@@ -12,7 +12,7 @@ from flask import Blueprint, jsonify, request
 from datetime import datetime, timedelta
 import data_manager
 from services.holdings import calculate_holdings, get_transactions
-from services.yahoo_finance import fetch_multiple_prices
+from services.stock_utils import fetch_multiple_prices
 from config import PRICE_CACHE_DURATION
 
 summary_bp = Blueprint('summary', __name__, url_prefix='/api')

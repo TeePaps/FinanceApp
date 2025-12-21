@@ -10,11 +10,11 @@ Handles:
 - GET /api/sec/compare/<ticker> - Compare SEC vs yfinance EPS
 """
 
-import yfinance as yf
 from flask import Blueprint, jsonify, request
 import sec_data
 import data_manager
 from config import VALID_INDICES
+from services.providers import get_orchestrator
 
 sec_bp = Blueprint('sec', __name__, url_prefix='/api')
 
@@ -80,25 +80,18 @@ def api_sec_compare(ticker):
     # Get SEC EPS
     sec_eps = sec_data.get_sec_eps(ticker)
 
-    # Get yfinance EPS
+    # Get yfinance EPS via orchestrator
+    yf_eps = {}
     try:
-        stock = yf.Ticker(ticker)
-        income_stmt = stock.income_stmt
+        orchestrator = get_orchestrator()
+        result = orchestrator.fetch_eps(ticker)
 
-        yf_eps = {}
-        if income_stmt is not None and not income_stmt.empty:
-            eps_row = None
-            if 'Diluted EPS' in income_stmt.index:
-                eps_row = income_stmt.loc['Diluted EPS']
-            elif 'Basic EPS' in income_stmt.index:
-                eps_row = income_stmt.loc['Basic EPS']
-
-            if eps_row is not None:
-                import math
-                for date, eps in eps_row.items():
-                    if eps is not None and not (isinstance(eps, float) and math.isnan(eps)):
-                        year = date.year if hasattr(date, 'year') else int(str(date)[:4])
-                        yf_eps[int(year)] = float(eps)
+        if result.success and result.data:
+            eps_data = result.data
+            # Convert orchestrator format to dict format {year: eps}
+            for entry in eps_data.eps_history:
+                if 'eps' in entry and entry['eps'] is not None:
+                    yf_eps[int(entry['year'])] = float(entry['eps'])
     except Exception as e:
         yf_eps = {}
 

@@ -4,6 +4,36 @@ let stocksList = [];
 let tickerCache = [];
 let autocompleteSelectedIndex = -1;
 
+// EPS Source name formatting utilities
+// Centralizes source name display to avoid scattered hardcoded strings
+const EPS_SOURCE_LABELS = {
+    'sec': 'SEC EDGAR',
+    'sec_edgar': 'SEC EDGAR',
+    'yfinance': 'Yahoo Finance',
+    'defeatbeta': 'DefeatBeta',
+    'fmp': 'FMP'
+};
+
+const EPS_SOURCE_SHORT_LABELS = {
+    'sec': 'SEC',
+    'sec_edgar': 'SEC',
+    'yfinance': 'YF',
+    'defeatbeta': 'DB',
+    'fmp': 'FMP'
+};
+
+/**
+ * Get human-readable label for an EPS source.
+ * @param {string} source - Source identifier (e.g., 'sec', 'yfinance')
+ * @param {boolean} short - If true, return abbreviated label
+ * @returns {string} Human-readable source label
+ */
+function formatEpsSource(source, short = false) {
+    if (!source) return '-';
+    const labels = short ? EPS_SOURCE_SHORT_LABELS : EPS_SOURCE_LABELS;
+    return labels[source] || source;
+}
+
 // Collapsible section toggle
 function toggleCollapsible(sectionId) {
     const section = document.getElementById(sectionId);
@@ -221,6 +251,8 @@ document.addEventListener('DOMContentLoaded', function() {
     restoreTabFromHash();
     loadGlobalLastUpdated();
     initTickerAutocomplete();
+    loadIndices();  // Populate index dropdowns from API
+    updateAllPricesCount();  // Update enabled ticker count for All Prices button
 });
 
 // Handle browser back/forward buttons
@@ -333,10 +365,20 @@ function showTab(tabName) {
     // Show selected tab
     document.getElementById(`${tabName}-tab`).classList.add('active');
 
-    // Find and activate the correct button
-    const tabBtn = document.querySelector(`.tab-btn[onclick*="'${tabName}'"]`);
-    if (tabBtn) {
-        tabBtn.classList.add('active');
+    // Check if this is a portfolio sub-tab
+    const portfolioTabs = ['profit', 'holdings', 'add'];
+    if (portfolioTabs.includes(tabName)) {
+        // Activate the dropdown button
+        const dropdownBtn = document.querySelector('.tab-dropdown-btn');
+        if (dropdownBtn) {
+            dropdownBtn.classList.add('active');
+        }
+    } else {
+        // Find and activate the correct button
+        const tabBtn = document.querySelector(`.tab-btn[onclick*="'${tabName}'"]`);
+        if (tabBtn) {
+            tabBtn.classList.add('active');
+        }
     }
 
     // Update URL hash for refresh persistence
@@ -355,8 +397,31 @@ function showTab(tabName) {
         loadRecommendations();
     } else if (tabName === 'datasets') {
         loadDatasets();
+    } else if (tabName === 'settings') {
+        loadProviderSettings();
     }
 }
+
+// Tab dropdown functions
+function toggleTabDropdown(event) {
+    event.stopPropagation();
+    const dropdown = document.getElementById('portfolio-dropdown');
+    dropdown.classList.toggle('show');
+}
+
+function closeTabDropdown() {
+    const dropdown = document.getElementById('portfolio-dropdown');
+    if (dropdown) {
+        dropdown.classList.remove('show');
+    }
+}
+
+// Close dropdown when clicking outside
+document.addEventListener('click', function(event) {
+    if (!event.target.closest('.tab-dropdown')) {
+        closeTabDropdown();
+    }
+});
 
 // Profit Timeline
 function setProfitRange(range) {
@@ -1451,22 +1516,77 @@ document.addEventListener('click', function(e) {
     }
 });
 
-// Quick Update - prices only (fastest)
+// Quick Update - prices only for selected index
 async function startQuickUpdate() {
     closeRefreshMenu();
-    await runScreenerUpdate('/api/screener/quick-update', 'Quick Update');
+    const index = typeof currentIndex !== 'undefined' ? currentIndex : 'sp500';
+    await runScreenerUpdate('/api/screener/quick-update', 'Quick Update', index);
+}
+
+// All Prices Update - prices for all enabled indexes
+async function startAllPricesUpdate() {
+    closeRefreshMenu();
+    await runScreenerUpdate('/api/screener/quick-update', 'All Prices', 'all');
 }
 
 // Smart Update - missing data + prices
 async function startSmartUpdate() {
     closeRefreshMenu();
-    await runScreenerUpdate('/api/screener/smart-update', 'Smart Update');
+    await runScreenerUpdate('/api/screener/smart-update', 'Smart Update', 'all');
 }
 
 // Full Update - EPS + Dividends + Prices
 async function startFullUpdate() {
     closeRefreshMenu();
-    await runScreenerUpdate('/api/screener/start', 'Full Update');
+    await runScreenerUpdate('/api/screener/start', 'Full Update', 'all');
+}
+
+// Remove orphan valuations (tickers no longer in any active index)
+async function removeOrphans() {
+    closeRefreshMenu();
+
+    // First get the count to show in confirmation
+    try {
+        const countResp = await fetch('/api/orphans');
+        const countData = await countResp.json();
+
+        if (countData.count === 0) {
+            alert('No orphan valuations found.');
+            return;
+        }
+
+        const confirmed = confirm(
+            `Found ${countData.count} orphan valuations.\n\n` +
+            `These are tickers that have valuation data but are no longer members of any tracked index.\n\n` +
+            `Remove them?`
+        );
+
+        if (!confirmed) return;
+
+        const response = await fetch('/api/orphans/remove', { method: 'POST' });
+        const result = await response.json();
+
+        if (result.success) {
+            const r = result.removed;
+            alert(
+                `Removed ${r.orphans_found} orphan valuations.\n\n` +
+                `Details:\n` +
+                `- Valuations: ${r.valuations_removed}\n` +
+                `- EPS history: ${r.eps_removed}\n` +
+                `- SEC companies: ${r.sec_companies_removed}\n` +
+                `- Ticker index entries: ${r.ticker_indexes_removed}\n` +
+                `- Tickers: ${r.tickers_removed}`
+            );
+            // Refresh current view
+            const currentTab = window.location.hash.slice(1) || 'summary';
+            showTab(currentTab);
+        } else {
+            alert('Error removing orphans');
+        }
+    } catch (error) {
+        console.error('Error removing orphans:', error);
+        alert('Error removing orphans: ' + error.message);
+    }
 }
 
 function closeRefreshMenu() {
@@ -1475,7 +1595,7 @@ function closeRefreshMenu() {
 }
 
 // Unified screener update function
-async function runScreenerUpdate(endpoint, updateType) {
+async function runScreenerUpdate(endpoint, updateType, index = 'all') {
     const refreshBtn = document.getElementById('refresh-main-btn');
     const currentTab = window.location.hash.slice(1) || 'summary';
 
@@ -1492,7 +1612,7 @@ async function runScreenerUpdate(endpoint, updateType) {
         const response = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ index: 'all' })
+            body: JSON.stringify({ index: index })
         });
         const data = await response.json();
 
@@ -1557,6 +1677,16 @@ function monitorUpdateProgress(updateType) {
             if (refreshPhase) refreshPhase.textContent = phase;
             if (refreshTicker) refreshTicker.textContent = progress.ticker || '';
             if (refreshCount) refreshCount.textContent = `${progress.current} / ${progress.total} (${pct}%)`;
+
+            if (progress.provider_logs && progress.provider_logs.length > 0) {
+                const logContent = document.getElementById('log-content');
+                if (logContent) {
+                    const recentLogs = progress.provider_logs.slice(-5);
+                    logContent.innerHTML = recentLogs
+                        .map(log => `<div class="log-line">${log.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`)
+                        .join('');
+                }
+            }
 
             if (progress.status === 'complete' || progress.status === 'cancelled') {
                 clearInterval(progressInterval);
@@ -1781,7 +1911,7 @@ function renderValuation(data, refreshInfo = '') {
     const minYearsRecommended = data.min_years_recommended || 8;
 
     // Data source badge, refresh button, and 10-K dropdown
-    const sourceLabel = data.eps_source === 'sec' ? 'SEC EDGAR' : 'yfinance';
+    const sourceLabel = formatEpsSource(data.eps_source);
     const sourceBadge = `<span class="data-source-badge ${data.eps_source}">${sourceLabel}</span>`;
     const refreshBtn = `<button class="refresh-company-btn" onclick="forceRefreshCompany('${data.ticker}')" title="Force refresh all data for this company">
         🔄 Refresh
@@ -2109,7 +2239,45 @@ function renderValuation(data, refreshInfo = '') {
 
 // Screener
 let screenerInterval = null;
-let currentIndex = 'sp500';
+let currentIndex = 'sp500';  // Default, will be updated by loadIndices()
+let availableIndices = [];   // Cached index list from API
+
+/**
+ * Load available indices from API and populate all index dropdowns.
+ * Called on page load to dynamically populate index selectors.
+ */
+async function loadIndices() {
+    try {
+        const response = await fetch('/api/indices');
+        availableIndices = await response.json();
+
+        // Populate the screener index selector
+        const screenerSelect = document.getElementById('index-select');
+        if (screenerSelect) {
+            screenerSelect.innerHTML = availableIndices.map(idx =>
+                `<option value="${idx.id}"${idx.id === 'sp500' ? ' selected' : ''}>${idx.short_name || idx.name}</option>`
+            ).join('');
+            // Set currentIndex from the selected option
+            currentIndex = screenerSelect.value || 'sp500';
+        }
+
+        // Populate the Data Sets ticker filter (keep "All Indexes" as first option)
+        const tickerFilterSelect = document.getElementById('ticker-filter-index');
+        if (tickerFilterSelect) {
+            const individualIndices = availableIndices.filter(idx => idx.id !== 'all');
+            tickerFilterSelect.innerHTML = '<option value="">All Indexes</option>' +
+                individualIndices.map(idx =>
+                    `<option value="${idx.id}">${idx.short_name || idx.name}</option>`
+                ).join('');
+        }
+
+        return availableIndices;
+    } catch (error) {
+        console.error('Error loading indices:', error);
+        // Fallback: keep dropdowns as-is or add minimal options
+        return [];
+    }
+}
 
 function changeIndex(indexName) {
     currentIndex = indexName;
@@ -2753,6 +2921,11 @@ async function loadRecommendations() {
         let html = `
             <div class="recommendations-header">
                 <span class="analyzed-count">Analyzed ${data.total_analyzed} stocks</span>
+                <div class="index-legend">
+                    <span class="legend-item legend-dow">Dow 30</span>
+                    <span class="legend-item legend-sp500">S&P 500</span>
+                    <span class="legend-item legend-nasdaq">NASDAQ</span>
+                </div>
             </div>
         `;
 
@@ -2762,7 +2935,33 @@ async function loadRecommendations() {
                               stock.price_vs_value < 0 ? 'undervalued' : 'overvalued';
             const selloffClass = stock.in_selloff ? `selloff-${stock.selloff_severity}` : '';
 
+            // Determine index class for color coding (priority: Dow > S&P 500 > NASDAQ)
+            const indexesLower = (stock.indexes || []).map(i => i.toLowerCase());
+            let indexClass = '';
+            if (indexesLower.some(i => i.includes('dow') || i.includes('djia'))) {
+                indexClass = 'index-dow';
+            } else if (indexesLower.some(i => i.includes('sp500') || i.includes('s&p 500'))) {
+                indexClass = 'index-sp500';
+            } else if (indexesLower.some(i => i.includes('nasdaq'))) {
+                indexClass = 'index-nasdaq';
+            }
+
             const updatedText = stock.updated ? formatTimeAgo(stock.updated) : '';
+
+            // Create colored index badges
+            const indexBadges = (stock.indexes || []).map(idx => {
+                const idxLower = idx.toLowerCase();
+                let badgeClass = 'index-badge';
+                if (idxLower.includes('dow') || idxLower.includes('djia')) {
+                    badgeClass += ' index-badge-dow';
+                } else if (idxLower.includes('sp500') || idxLower.includes('s&p 500')) {
+                    badgeClass += ' index-badge-sp500';
+                } else if (idxLower.includes('nasdaq')) {
+                    badgeClass += ' index-badge-nasdaq';
+                }
+                return `<span class="${badgeClass}">${idx}</span>`;
+            }).join('');
+
             html += `
                 <div class="recommendation-card ${selloffClass}">
                     <div class="recommendation-rank">#${rank}</div>
@@ -2770,7 +2969,7 @@ async function loadRecommendations() {
                         <div class="recommendation-header">
                             <a href="#research" class="recommendation-ticker" onclick="lookupTicker('${stock.ticker}', event)">${stock.ticker}</a>
                             <span class="recommendation-name">${stock.company_name}</span>
-                            ${stock.indexes && stock.indexes.length > 0 ? `<span class="recommendation-indexes">${stock.indexes.join(', ')}</span>` : ''}
+                            ${indexBadges ? `<span class="recommendation-indexes">${indexBadges}</span>` : ''}
                             ${updatedText ? `<span class="stock-updated" title="${new Date(stock.updated).toLocaleString()}">${updatedText}</span>` : ''}
                             <span class="recommendation-score">Score: ${stock.score}</span>
                         </div>
@@ -3582,7 +3781,7 @@ function renderAllTickersTable() {
     let html = '';
     for (const t of displayData) {
         const priceClass = t.current_price ? '' : 'no-data';
-        const epsClass = t.eps_source === 'sec' ? 'source-sec' : 'source-yf';
+        const epsClass = (t.eps_source === 'sec' || t.eps_source === 'sec_edgar') ? 'source-sec' : 'source-yf';
         const vsValueClass = t.price_vs_value > 0 ? 'overvalued' : t.price_vs_value < -20 ? 'undervalued' : '';
 
         // Format updated time
@@ -3611,7 +3810,7 @@ function renderAllTickersTable() {
                 <td class="${priceClass}">${t.current_price ? '$' + t.current_price.toFixed(2) : '-'}</td>
                 <td>${t.eps_avg ? t.eps_avg.toFixed(2) : '-'}</td>
                 <td>${t.eps_years || '-'}</td>
-                <td class="${epsClass}">${t.eps_source === 'sec' ? 'SEC' : t.eps_source === 'yfinance' ? 'YF' : '-'}</td>
+                <td class="${epsClass}">${formatEpsSource(t.eps_source, true)}</td>
                 <td>${t.estimated_value ? '$' + t.estimated_value.toFixed(0) : '-'}</td>
                 <td class="${vsValueClass}">${t.price_vs_value !== null ? (t.price_vs_value > 0 ? '+' : '') + t.price_vs_value.toFixed(0) + '%' : '-'}</td>
                 <td class="updated-col" title="${t.valuation_updated || ''}">${updatedStr}</td>
@@ -3620,4 +3819,571 @@ function renderAllTickersTable() {
     }
 
     tbody.innerHTML = html;
+}
+
+// =====================
+// Provider Settings
+// =====================
+
+let providerConfig = null;
+
+async function loadProviderSettings() {
+    try {
+        const response = await fetch('/api/providers/config');
+        providerConfig = await response.json();
+
+        renderProviderStatus();
+        renderProviderOrder();
+        renderApiKeyStatus();
+        renderCacheSettings();
+        loadCacheStats();
+        loadIndexSettings();  // Load index toggle settings
+    } catch (error) {
+        console.error('Error loading provider settings:', error);
+    }
+}
+
+function renderProviderStatus() {
+    const container = document.getElementById('provider-list');
+    if (!providerConfig || !providerConfig.available_providers) {
+        container.innerHTML = '<span class="error">Failed to load providers</span>';
+        return;
+    }
+
+    let html = '<div class="provider-grid">';
+    for (const provider of providerConfig.available_providers) {
+        const statusClass = provider.available ? 'status-available' : 'status-unavailable';
+        const enabledClass = provider.enabled ? '' : 'provider-disabled';
+        const statusText = !provider.available ? 'Not Configured' : (provider.enabled ? 'Enabled' : 'Disabled');
+        const dataTypes = provider.data_types.join(', ');
+        const batchBadge = provider.supports_batch ? '<span class="badge badge-batch">Batch</span>' : '';
+        const toggleChecked = provider.enabled ? 'checked' : '';
+        const toggleDisabled = !provider.available ? 'disabled' : '';
+
+        html += `
+            <div class="provider-item ${statusClass} ${enabledClass}">
+                <div class="provider-header">
+                    <div class="provider-name">${provider.display_name} ${batchBadge}</div>
+                    <label class="toggle-switch">
+                        <input type="checkbox" ${toggleChecked} ${toggleDisabled}
+                            onchange="toggleProvider('${provider.name}', this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div class="provider-types">Data: ${dataTypes}</div>
+                <div class="provider-status-text">${statusText}</div>
+            </div>
+        `;
+    }
+    html += '</div>';
+    container.innerHTML = html;
+}
+
+async function toggleProvider(providerName, enabled) {
+    try {
+        const response = await fetch('/api/providers/toggle', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({provider: providerName, enabled: enabled})
+        });
+
+        const result = await response.json();
+        if (result.status === 'ok') {
+            showNotification(result.message, 'success');
+            // Refresh the provider config
+            await loadProviderSettings();
+        } else {
+            showNotification('Failed: ' + result.message, 'error');
+            // Revert the checkbox
+            await loadProviderSettings();
+        }
+    } catch (error) {
+        showNotification('Error: ' + error.message, 'error');
+        await loadProviderSettings();
+    }
+}
+
+function renderProviderOrder() {
+    renderProviderOrderList('price', providerConfig.price_providers, 'price-provider-order');
+    renderProviderOrderList('eps', providerConfig.eps_providers, 'eps-provider-order');
+    renderProviderOrderList('dividend', providerConfig.dividend_providers, 'dividend-provider-order');
+}
+
+function renderProviderOrderList(dataType, providers, elementId) {
+    const container = document.getElementById(elementId);
+    if (!container) return;
+
+    // Get all providers that support this data type
+    const availableForType = providerConfig.available_providers
+        .filter(p => p.data_types.includes(dataType))
+        .map(p => p.name);
+
+    // Add any configured providers not in available list
+    const allProviders = [...new Set([...providers, ...availableForType])];
+
+    let html = '';
+    for (const providerName of allProviders) {
+        const provider = providerConfig.available_providers.find(p => p.name === providerName);
+        const displayName = provider ? provider.display_name : providerName;
+        const isAvailable = provider && provider.available;
+        const statusClass = isAvailable ? '' : 'provider-unavailable';
+        const priority = providers.indexOf(providerName) + 1;
+
+        html += `
+            <li class="provider-order-item ${statusClass}" data-provider="${providerName}" draggable="true">
+                <span class="drag-handle">☰</span>
+                <span class="provider-priority">${priority > 0 ? priority : '-'}</span>
+                <span class="provider-name">${displayName}</span>
+                ${!isAvailable ? '<span class="provider-note">(not configured)</span>' : ''}
+            </li>
+        `;
+    }
+    container.innerHTML = html;
+
+    // Add drag-and-drop event listeners
+    const items = container.querySelectorAll('.provider-order-item');
+    items.forEach(item => {
+        item.addEventListener('dragstart', handleDragStart);
+        item.addEventListener('dragover', handleDragOver);
+        item.addEventListener('drop', handleDrop);
+        item.addEventListener('dragend', handleDragEnd);
+    });
+}
+
+let draggedItem = null;
+
+function handleDragStart(e) {
+    draggedItem = this;
+    this.classList.add('dragging');
+}
+
+function handleDragOver(e) {
+    e.preventDefault();
+    const target = e.target.closest('.provider-order-item');
+    if (target && target !== draggedItem) {
+        const parent = target.parentNode;
+        const children = Array.from(parent.children);
+        const draggedIndex = children.indexOf(draggedItem);
+        const targetIndex = children.indexOf(target);
+
+        if (draggedIndex < targetIndex) {
+            parent.insertBefore(draggedItem, target.nextSibling);
+        } else {
+            parent.insertBefore(draggedItem, target);
+        }
+    }
+}
+
+function handleDrop(e) {
+    e.preventDefault();
+}
+
+function handleDragEnd() {
+    this.classList.remove('dragging');
+    draggedItem = null;
+    updateProviderPriorities();
+}
+
+function updateProviderPriorities() {
+    // Update priority numbers after drag
+    document.querySelectorAll('.provider-order-list').forEach(list => {
+        const items = list.querySelectorAll('.provider-order-item');
+        items.forEach((item, index) => {
+            item.querySelector('.provider-priority').textContent = index + 1;
+        });
+    });
+}
+
+
+// ============================================
+// Index Settings Functions
+// ============================================
+
+let indexSettings = [];  // Cache of index settings
+
+async function loadIndexSettings() {
+    try {
+        const response = await fetch('/api/indexes/settings');
+        indexSettings = await response.json();
+        renderIndexToggles();
+    } catch (error) {
+        console.error('Error loading index settings:', error);
+        document.getElementById('index-toggles').innerHTML =
+            '<span class="error">Error loading indexes</span>';
+    }
+}
+
+function renderIndexToggles() {
+    const container = document.getElementById('index-toggles');
+    if (!container) return;
+
+    // Filter out 'all' since it's a virtual index
+    const indexes = indexSettings.filter(idx => idx.name !== 'all');
+
+    if (indexes.length === 0) {
+        container.innerHTML = '<span class="no-data">No indexes configured</span>';
+        return;
+    }
+
+    container.innerHTML = indexes.map(idx => `
+        <label class="index-toggle-item">
+            <input type="checkbox"
+                   data-index="${idx.name}"
+                   ${idx.enabled ? 'checked' : ''}
+                   onchange="onIndexToggle('${idx.name}', this.checked)">
+            <span class="index-toggle-name">${idx.display_name || idx.name}</span>
+            <span class="index-toggle-short">(${idx.short_name || idx.name})</span>
+        </label>
+    `).join('');
+}
+
+function onIndexToggle(indexName, enabled) {
+    // Update local cache
+    const idx = indexSettings.find(i => i.name === indexName);
+    if (idx) idx.enabled = enabled ? 1 : 0;
+}
+
+function selectAllIndexes(enabled) {
+    const checkboxes = document.querySelectorAll('#index-toggles input[type="checkbox"]');
+    checkboxes.forEach(cb => {
+        cb.checked = enabled;
+        const indexName = cb.dataset.index;
+        onIndexToggle(indexName, enabled);
+    });
+}
+
+async function saveIndexSettings() {
+    // Build settings object from current state
+    const settings = {};
+    indexSettings.filter(idx => idx.name !== 'all').forEach(idx => {
+        settings[idx.name] = idx.enabled === 1;
+    });
+
+    try {
+        const response = await fetch('/api/indexes/settings', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(settings)
+        });
+
+        const result = await response.json();
+        if (result.success) {
+            // Build message with ticker stats
+            let message = 'Index settings saved.';
+            if (result.tickers_disabled > 0) {
+                message += ` ${result.tickers_disabled} tickers disabled.`;
+            }
+            if (result.tickers_enabled > 0) {
+                message += ` ${result.tickers_enabled} tickers enabled.`;
+            }
+            showNotification(message, 'success');
+            // Reload index dropdowns to reflect changes
+            loadIndices();
+            // Update All Prices button count
+            updateAllPricesCount();
+        } else {
+            showNotification('Failed to save: ' + result.error, 'error');
+        }
+    } catch (error) {
+        showNotification('Error saving index settings: ' + error.message, 'error');
+    }
+}
+
+// Update the All Prices button with actual enabled ticker count
+async function updateAllPricesCount() {
+    const countEl = document.getElementById('all-prices-count');
+    if (!countEl) return;
+
+    try {
+        const response = await fetch('/api/indexes/enabled-ticker-count');
+        const data = await response.json();
+        countEl.textContent = `(${data.count.toLocaleString()})`;
+        // Update tooltip with index info
+        const btn = document.getElementById('all-prices-btn');
+        if (btn && data.enabled_indexes) {
+            btn.title = `Update prices for ${data.enabled_indexes.length} enabled indexes (${data.count.toLocaleString()} tickers)`;
+        }
+    } catch (error) {
+        console.error('Error fetching enabled ticker count:', error);
+        countEl.textContent = '(?)';
+    }
+}
+
+
+async function saveProviderOrder() {
+    const priceOrder = getProviderOrder('price-provider-order');
+    const epsOrder = getProviderOrder('eps-provider-order');
+    const dividendOrder = getProviderOrder('dividend-provider-order');
+
+    try {
+        const response = await fetch('/api/providers/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                price_providers: priceOrder,
+                eps_providers: epsOrder,
+                dividend_providers: dividendOrder
+            })
+        });
+
+        const result = await response.json();
+        if (result.status === 'ok') {
+            showNotification('Provider order saved successfully', 'success');
+        } else {
+            showNotification('Failed to save: ' + result.message, 'error');
+        }
+    } catch (error) {
+        showNotification('Error saving provider order: ' + error.message, 'error');
+    }
+}
+
+function getProviderOrder(elementId) {
+    const container = document.getElementById(elementId);
+    const items = container.querySelectorAll('.provider-order-item');
+    return Array.from(items).map(item => item.dataset.provider);
+}
+
+function renderApiKeyStatus() {
+    const fmpStatus = document.getElementById('fmp-key-status');
+    const alpacaStatus = document.getElementById('alpaca-key-status');
+    const alpacaEndpointInput = document.getElementById('alpaca-api-endpoint');
+
+    if (fmpStatus) {
+        fmpStatus.textContent = providerConfig.has_fmp_key ? '✓ Configured' : '✗ Not configured';
+        fmpStatus.className = 'api-key-status ' + (providerConfig.has_fmp_key ? 'status-ok' : 'status-missing');
+    }
+
+    if (alpacaStatus) {
+        let statusText = providerConfig.has_alpaca_key ? '✓ Configured' : '✗ Not configured';
+        if (providerConfig.has_alpaca_key && providerConfig.alpaca_endpoint) {
+            statusText += ' (custom endpoint)';
+        }
+        alpacaStatus.textContent = statusText;
+        alpacaStatus.className = 'api-key-status ' + (providerConfig.has_alpaca_key ? 'status-ok' : 'status-missing');
+    }
+
+    // Populate the endpoint field with current value
+    if (alpacaEndpointInput && providerConfig.alpaca_endpoint) {
+        alpacaEndpointInput.value = providerConfig.alpaca_endpoint;
+    }
+}
+
+async function saveFmpApiKey() {
+    const apiKey = document.getElementById('fmp-api-key').value.trim();
+    if (!apiKey) {
+        showNotification('Please enter an API key', 'error');
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/providers/api-key', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                provider: 'fmp',
+                api_key: apiKey
+            })
+        });
+
+        const result = await response.json();
+        if (result.status === 'ok') {
+            showNotification(result.message, 'success');
+            document.getElementById('fmp-api-key').value = '';
+            loadProviderSettings();  // Refresh status
+        } else {
+            showNotification('Failed: ' + result.message, 'error');
+        }
+    } catch (error) {
+        showNotification('Error: ' + error.message, 'error');
+    }
+}
+
+async function saveAlpacaCredentials() {
+    const apiKey = document.getElementById('alpaca-api-key').value.trim();
+    const apiSecret = document.getElementById('alpaca-api-secret').value.trim();
+    const apiEndpoint = document.getElementById('alpaca-api-endpoint').value.trim();
+
+    if (!apiKey || !apiSecret) {
+        showNotification('Please enter both API key and secret', 'error');
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/providers/api-key', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                provider: 'alpaca',
+                api_key: apiKey,
+                api_secret: apiSecret,
+                api_endpoint: apiEndpoint || null
+            })
+        });
+
+        const result = await response.json();
+        if (result.status === 'ok') {
+            showNotification(result.message, 'success');
+            document.getElementById('alpaca-api-key').value = '';
+            document.getElementById('alpaca-api-secret').value = '';
+            // Don't clear endpoint - keep showing it
+            loadProviderSettings();  // Refresh status
+        } else {
+            showNotification('Failed: ' + result.message, 'error');
+        }
+    } catch (error) {
+        showNotification('Error: ' + error.message, 'error');
+    }
+}
+
+async function testProvider(providerName) {
+    showNotification(`Testing ${providerName}...`, 'info');
+
+    try {
+        const response = await fetch(`/api/providers/test/${providerName}`);
+        const result = await response.json();
+
+        if (result.status === 'ok') {
+            showNotification(result.message, 'success');
+        } else {
+            showNotification('Test failed: ' + result.message, 'error');
+        }
+    } catch (error) {
+        showNotification('Error testing provider: ' + error.message, 'error');
+    }
+}
+
+function renderCacheSettings() {
+    const priceCacheInput = document.getElementById('price-cache-seconds');
+    const preferBatchInput = document.getElementById('prefer-batch');
+
+    if (priceCacheInput && providerConfig) {
+        priceCacheInput.value = providerConfig.price_cache_seconds || 300;
+    }
+
+    if (preferBatchInput && providerConfig) {
+        preferBatchInput.checked = providerConfig.prefer_batch !== false;
+    }
+}
+
+async function saveCacheSettings() {
+    const priceCacheSeconds = parseInt(document.getElementById('price-cache-seconds').value);
+    const preferBatch = document.getElementById('prefer-batch').checked;
+
+    try {
+        const response = await fetch('/api/providers/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                price_cache_seconds: priceCacheSeconds,
+                prefer_batch: preferBatch
+            })
+        });
+
+        const result = await response.json();
+        if (result.status === 'ok') {
+            showNotification('Cache settings saved', 'success');
+        } else {
+            showNotification('Failed: ' + result.message, 'error');
+        }
+    } catch (error) {
+        showNotification('Error: ' + error.message, 'error');
+    }
+}
+
+async function clearProviderCache() {
+    if (!confirm('Are you sure you want to clear all cached data?')) {
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/providers/cache/clear', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({})
+        });
+
+        const result = await response.json();
+        if (result.status === 'ok') {
+            showNotification('Cache cleared', 'success');
+            loadCacheStats();
+        } else {
+            showNotification('Failed: ' + result.message, 'error');
+        }
+    } catch (error) {
+        showNotification('Error: ' + error.message, 'error');
+    }
+}
+
+async function loadCacheStats() {
+    const container = document.getElementById('cache-stats-content');
+
+    try {
+        const response = await fetch('/api/providers/cache/stats');
+        const stats = await response.json();
+
+        let html = `
+            <div class="cache-stat-row">
+                <span class="cache-stat-label">Total Entries:</span>
+                <span class="cache-stat-value">${stats.total_entries}</span>
+            </div>
+        `;
+
+        // By type
+        for (const [type, count] of Object.entries(stats.by_type || {})) {
+            html += `
+                <div class="cache-stat-row">
+                    <span class="cache-stat-label">${type}:</span>
+                    <span class="cache-stat-value">${count}</span>
+                </div>
+            `;
+        }
+
+        // By source
+        if (Object.keys(stats.sources || {}).length > 0) {
+            html += '<div class="cache-stat-header">By Source:</div>';
+            for (const [source, count] of Object.entries(stats.sources)) {
+                html += `
+                    <div class="cache-stat-row">
+                        <span class="cache-stat-label">${source}:</span>
+                        <span class="cache-stat-value">${count}</span>
+                    </div>
+                `;
+            }
+        }
+
+        container.innerHTML = html;
+    } catch (error) {
+        container.innerHTML = '<span class="error">Failed to load cache stats</span>';
+    }
+}
+
+function showNotification(message, type = 'info') {
+    // Check if there's an existing notification system
+    const existingNotify = document.querySelector('.notification');
+    if (existingNotify) {
+        existingNotify.remove();
+    }
+
+    const notification = document.createElement('div');
+    notification.className = `notification notification-${type}`;
+    notification.textContent = message;
+    notification.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        padding: 12px 20px;
+        border-radius: 4px;
+        z-index: 1000;
+        animation: fadeIn 0.3s ease;
+        ${type === 'success' ? 'background: #10b981; color: white;' : ''}
+        ${type === 'error' ? 'background: #ef4444; color: white;' : ''}
+        ${type === 'info' ? 'background: #3b82f6; color: white;' : ''}
+    `;
+
+    document.body.appendChild(notification);
+
+    setTimeout(() => {
+        notification.style.animation = 'fadeOut 0.3s ease';
+        setTimeout(() => notification.remove(), 300);
+    }, 3000);
 }

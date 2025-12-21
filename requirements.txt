@@ -1,3 +1,9 @@
 flask==3.0.0
 yfinance
 python-dateutil
+alpaca-py
+requests
+defeatbeta-api
+
+# Optional: Interactive Brokers support (requires TWS or IB Gateway running)
+# ib_async

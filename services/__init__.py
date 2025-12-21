@@ -4,12 +4,10 @@ Services module for the Finance App.
 Contains business logic extracted from app.py for better modularity and testability.
 """
 
-from .yahoo_finance import (
+from .stock_utils import (
     fetch_stock_price,
     fetch_multiple_prices,
-    get_stock_info,
-    calculate_selloff_metrics,
-    extract_yf_eps
+    get_stock_info
 )
 
 from .holdings import (

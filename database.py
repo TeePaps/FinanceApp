@@ -35,15 +35,8 @@ BASE_DIR = os.path.dirname(__file__)
 PRIVATE_DB_PATH = os.path.join(BASE_DIR, 'data_private', 'private.db')
 PUBLIC_DB_PATH = os.path.join(BASE_DIR, 'data_public', 'public.db')
 
-# Valid indexes
-VALID_INDICES = ['sp500', 'nasdaq100', 'dow30', 'sp600', 'russell2000']
-INDEX_NAMES = {
-    'sp500': ('S&P 500', 'S&P 500'),
-    'nasdaq100': ('NASDAQ 100', 'NASDAQ'),
-    'dow30': ('Dow Jones Industrial Average', 'DJIA'),
-    'sp600': ('S&P SmallCap 600', 'S&P 600'),
-    'russell2000': ('Russell 2000', 'Russell 2000')
-}
+# Import index definitions from central registry
+from services.index_registry import VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES
 
 
 def _get_connection(db_path: str) -> sqlite3.Connection:
@@ -107,7 +100,8 @@ def _init_public_database():
             CREATE TABLE IF NOT EXISTS indexes (
                 name TEXT PRIMARY KEY,
                 display_name TEXT,
-                short_name TEXT
+                short_name TEXT,
+                enabled INTEGER DEFAULT 1
             )
         ''')
 
@@ -120,7 +114,9 @@ def _init_public_database():
                 sec_checked TEXT,
                 valuation_updated TEXT,
                 updated TEXT,
-                cik TEXT
+                cik TEXT,
+                delisted INTEGER DEFAULT 0,
+                enabled INTEGER DEFAULT 1
             )
         ''')
 
@@ -129,6 +125,7 @@ def _init_public_database():
             CREATE TABLE IF NOT EXISTS ticker_indexes (
                 ticker TEXT,
                 index_name TEXT,
+                active INTEGER DEFAULT 1,
                 PRIMARY KEY (ticker, index_name),
                 FOREIGN KEY (ticker) REFERENCES tickers(ticker) ON DELETE CASCADE,
                 FOREIGN KEY (index_name) REFERENCES indexes(name) ON DELETE CASCADE
@@ -141,6 +138,7 @@ def _init_public_database():
                 ticker TEXT PRIMARY KEY,
                 company_name TEXT,
                 current_price REAL,
+                price_source TEXT,
                 eps_avg REAL,
                 eps_years INTEGER,
                 eps_source TEXT,
@@ -235,6 +233,36 @@ def _init_public_database():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_eps_history_ticker ON eps_history(ticker)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuations_price_vs_value ON valuations(price_vs_value)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sec_filings_ticker ON sec_filings(ticker)')
+
+        # Migrations - add columns if they don't exist
+        cursor.execute('PRAGMA table_info(valuations)')
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if 'price_source' not in existing_columns:
+            cursor.execute('ALTER TABLE valuations ADD COLUMN price_source TEXT')
+
+        # Add delisted column to tickers if it doesn't exist
+        cursor.execute('PRAGMA table_info(tickers)')
+        ticker_columns = {row[1] for row in cursor.fetchall()}
+        if 'delisted' not in ticker_columns:
+            cursor.execute('ALTER TABLE tickers ADD COLUMN delisted INTEGER DEFAULT 0')
+
+        # Add enabled column to tickers if it doesn't exist
+        cursor.execute('PRAGMA table_info(tickers)')
+        ticker_columns = {row[1] for row in cursor.fetchall()}
+        if 'enabled' not in ticker_columns:
+            cursor.execute('ALTER TABLE tickers ADD COLUMN enabled INTEGER DEFAULT 1')
+
+        # Add active column to ticker_indexes if it doesn't exist
+        cursor.execute('PRAGMA table_info(ticker_indexes)')
+        ticker_index_columns = {row[1] for row in cursor.fetchall()}
+        if 'active' not in ticker_index_columns:
+            cursor.execute('ALTER TABLE ticker_indexes ADD COLUMN active INTEGER DEFAULT 1')
+
+        # Add enabled column to indexes if it doesn't exist
+        cursor.execute('PRAGMA table_info(indexes)')
+        index_columns = {row[1] for row in cursor.fetchall()}
+        if 'enabled' not in index_columns:
+            cursor.execute('ALTER TABLE indexes ADD COLUMN enabled INTEGER DEFAULT 1')
 
         # Insert default indexes
         for name, (display_name, short_name) in INDEX_NAMES.items():
@@ -424,6 +452,51 @@ def get_index_tickers(index_name: str) -> List[str]:
         return [row['ticker'] for row in cursor.fetchall()]
 
 
+def get_all_indexes() -> List[Dict]:
+    """Get all indexes with their enabled state."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT name, display_name, short_name, COALESCE(enabled, 1) as enabled
+            FROM indexes
+            ORDER BY name
+        ''')
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_enabled_indexes() -> List[str]:
+    """Get list of enabled index names."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT name FROM indexes WHERE COALESCE(enabled, 1) = 1
+        ''')
+        return [row['name'] for row in cursor.fetchall()]
+
+
+def set_index_enabled(index_name: str, enabled: bool) -> bool:
+    """Enable or disable an index. Returns True if successful."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE indexes SET enabled = ? WHERE name = ?
+        ''', (1 if enabled else 0, index_name))
+        return cursor.rowcount > 0
+
+
+def set_indexes_enabled(index_states: Dict[str, bool]) -> int:
+    """Bulk update index enabled states. Returns count of updated indexes."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        updated = 0
+        for index_name, enabled in index_states.items():
+            cursor.execute('''
+                UPDATE indexes SET enabled = ? WHERE name = ?
+            ''', (1 if enabled else 0, index_name))
+            updated += cursor.rowcount
+        return updated
+
+
 def sync_index_membership(index_name: str, tickers: List[str]):
     """Sync index membership for a list of tickers."""
     now = datetime.now().isoformat()
@@ -445,6 +518,56 @@ def sync_index_membership(index_name: str, tickers: List[str]):
                 INSERT OR IGNORE INTO ticker_indexes (ticker, index_name)
                 VALUES (?, ?)
             ''', (ticker, index_name))
+
+
+def refresh_index_membership(index_name: str, current_tickers: List[str]) -> Dict:
+    """
+    Refresh index membership from authoritative source.
+    - Adds new tickers (active=1)
+    - Marks removed tickers (active=0)
+    - Does NOT affect tickers.delisted (that's for truly delisted companies)
+
+    Returns dict with 'added', 'removed', 'total' counts.
+    """
+    current_set = set(t.upper() for t in current_tickers)
+    now = datetime.now().isoformat()
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get existing tickers for this index (both active and inactive)
+        cursor.execute('SELECT ticker FROM ticker_indexes WHERE index_name = ?', (index_name,))
+        existing = set(row['ticker'] for row in cursor.fetchall())
+
+        # Mark removed tickers as inactive in this index
+        removed = existing - current_set
+        for ticker in removed:
+            cursor.execute('''
+                UPDATE ticker_indexes SET active = 0
+                WHERE ticker = ? AND index_name = ?
+            ''', (ticker, index_name))
+
+        # Add/reactivate current tickers
+        added = 0
+        for ticker in current_set:
+            ticker = ticker.upper()
+            # Ensure ticker exists in tickers table
+            cursor.execute('''
+                INSERT OR IGNORE INTO tickers (ticker, sec_status, updated)
+                VALUES (?, 'unknown', ?)
+            ''', (ticker, now))
+
+            # Add or update index membership (set active=1)
+            cursor.execute('''
+                INSERT INTO ticker_indexes (ticker, index_name, active)
+                VALUES (?, ?, 1)
+                ON CONFLICT(ticker, index_name) DO UPDATE SET active = 1
+            ''', (ticker, index_name))
+
+            if ticker not in existing:
+                added += 1
+
+        return {'added': added, 'removed': len(removed), 'total': len(current_set)}
 
 
 # =============================================================================
@@ -473,14 +596,15 @@ def update_valuation(ticker: str, valuation: Dict):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO valuations (ticker, company_name, current_price, eps_avg, eps_years,
+            INSERT INTO valuations (ticker, company_name, current_price, price_source, eps_avg, eps_years,
                                    eps_source, annual_dividend, estimated_value, price_vs_value,
                                    fifty_two_week_high, fifty_two_week_low, off_high_pct,
                                    price_change_1m, price_change_3m, in_selloff, selloff_severity, updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ticker) DO UPDATE SET
                 company_name = excluded.company_name,
                 current_price = excluded.current_price,
+                price_source = excluded.price_source,
                 eps_avg = excluded.eps_avg,
                 eps_years = excluded.eps_years,
                 eps_source = excluded.eps_source,
@@ -499,6 +623,7 @@ def update_valuation(ticker: str, valuation: Dict):
             ticker,
             valuation.get('company_name'),
             valuation.get('current_price'),
+            valuation.get('price_source'),
             valuation.get('eps_avg'),
             valuation.get('eps_years'),
             valuation.get('eps_source'),
@@ -529,14 +654,15 @@ def bulk_update_valuations(valuations: Dict[str, Dict]):
             valuation['updated'] = now
 
             cursor.execute('''
-                INSERT INTO valuations (ticker, company_name, current_price, eps_avg, eps_years,
+                INSERT INTO valuations (ticker, company_name, current_price, price_source, eps_avg, eps_years,
                                        eps_source, annual_dividend, estimated_value, price_vs_value,
                                        fifty_two_week_high, fifty_two_week_low, off_high_pct,
                                        price_change_1m, price_change_3m, in_selloff, selloff_severity, updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     company_name = excluded.company_name,
                     current_price = excluded.current_price,
+                    price_source = excluded.price_source,
                     eps_avg = excluded.eps_avg,
                     eps_years = excluded.eps_years,
                     eps_source = excluded.eps_source,
@@ -555,6 +681,7 @@ def bulk_update_valuations(valuations: Dict[str, Dict]):
                 ticker,
                 valuation.get('company_name'),
                 valuation.get('current_price'),
+                valuation.get('price_source'),
                 valuation.get('eps_avg'),
                 valuation.get('eps_years'),
                 valuation.get('eps_source'),
@@ -617,6 +744,94 @@ def get_undervalued_tickers(threshold: float = -20.0) -> List[Dict]:
             result['in_selloff'] = bool(result['in_selloff'])
             results.append(result)
         return results
+
+
+def get_orphan_tickers() -> List[str]:
+    """
+    Get tickers that have valuations but are not active members of any index.
+
+    An orphan is a ticker with a valuation record where:
+    - It has no entries in ticker_indexes at all, OR
+    - All its ticker_indexes entries have active=0
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT v.ticker FROM valuations v
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ticker_indexes ti
+                WHERE ti.ticker = v.ticker AND ti.active = 1
+            )
+            ORDER BY v.ticker
+        ''')
+        return [row['ticker'] for row in cursor.fetchall()]
+
+
+def remove_orphan_valuations() -> Dict:
+    """
+    Remove valuations for tickers that are not active members of any index.
+
+    Also removes related data:
+    - eps_history entries
+    - sec_companies entries
+    - ticker_indexes entries (inactive ones)
+    - tickers entries (if no other references)
+
+    Returns dict with counts of removed records.
+    """
+    orphans = get_orphan_tickers()
+    if not orphans:
+        return {'orphans_found': 0, 'valuations_removed': 0, 'eps_removed': 0,
+                'sec_companies_removed': 0, 'ticker_indexes_removed': 0, 'tickers_removed': 0}
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Count before deletion for reporting
+        valuations_count = len(orphans)
+
+        # Delete EPS history for orphans
+        cursor.execute(f'''
+            DELETE FROM eps_history WHERE ticker IN ({','.join('?' * len(orphans))})
+        ''', orphans)
+        eps_count = cursor.rowcount
+
+        # Delete SEC companies for orphans
+        cursor.execute(f'''
+            DELETE FROM sec_companies WHERE ticker IN ({','.join('?' * len(orphans))})
+        ''', orphans)
+        sec_count = cursor.rowcount
+
+        # Delete valuations for orphans
+        cursor.execute(f'''
+            DELETE FROM valuations WHERE ticker IN ({','.join('?' * len(orphans))})
+        ''', orphans)
+
+        # Delete inactive ticker_indexes entries for orphans
+        cursor.execute(f'''
+            DELETE FROM ticker_indexes WHERE ticker IN ({','.join('?' * len(orphans))})
+            AND (active = 0 OR active IS NULL)
+        ''', orphans)
+        ti_count = cursor.rowcount
+
+        # Delete tickers that have no remaining references
+        # (not in any active index, no valuations, no holdings)
+        cursor.execute(f'''
+            DELETE FROM tickers WHERE ticker IN ({','.join('?' * len(orphans))})
+            AND NOT EXISTS (
+                SELECT 1 FROM ticker_indexes ti WHERE ti.ticker = tickers.ticker
+            )
+        ''', orphans)
+        tickers_count = cursor.rowcount
+
+        return {
+            'orphans_found': len(orphans),
+            'valuations_removed': valuations_count,
+            'eps_removed': eps_count,
+            'sec_companies_removed': sec_count,
+            'ticker_indexes_removed': ti_count,
+            'tickers_removed': tickers_count
+        }
 
 
 # =============================================================================
@@ -917,6 +1132,164 @@ def get_excluded_tickers(threshold: int = 3) -> List[str]:
             SELECT ticker FROM ticker_failures WHERE failure_count >= ?
         ''', (threshold,))
         return [row['ticker'] for row in cursor.fetchall()]
+
+
+def mark_ticker_delisted(ticker: str, delisted: bool = True):
+    """Mark a ticker as delisted (or not)."""
+    ticker = ticker.upper()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        # Ensure ticker exists in tickers table first
+        cursor.execute('''
+            INSERT OR IGNORE INTO tickers (ticker, delisted) VALUES (?, ?)
+        ''', (ticker, 1 if delisted else 0))
+        cursor.execute('''
+            UPDATE tickers SET delisted = ? WHERE ticker = ?
+        ''', (1 if delisted else 0, ticker))
+
+
+def mark_tickers_delisted(tickers: List[str], delisted: bool = True):
+    """Mark multiple tickers as delisted (or not)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        for ticker in tickers:
+            ticker = ticker.upper()
+            cursor.execute('''
+                INSERT OR IGNORE INTO tickers (ticker, delisted) VALUES (?, ?)
+            ''', (ticker, 1 if delisted else 0))
+            cursor.execute('''
+                UPDATE tickers SET delisted = ? WHERE ticker = ?
+            ''', (1 if delisted else 0, ticker))
+
+
+def is_ticker_delisted(ticker: str) -> bool:
+    """Check if a ticker is marked as delisted."""
+    ticker = ticker.upper()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT delisted FROM tickers WHERE ticker = ?', (ticker,))
+        row = cursor.fetchone()
+        return bool(row and row['delisted'])
+
+
+def get_delisted_tickers() -> List[str]:
+    """Get all tickers marked as delisted."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT ticker FROM tickers WHERE delisted = 1')
+        return [row['ticker'] for row in cursor.fetchall()]
+
+
+def get_active_index_tickers(index_name: str) -> List[str]:
+    """Get tickers for an index, excluding delisted and disabled ones."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ti.ticker FROM ticker_indexes ti
+            LEFT JOIN tickers t ON ti.ticker = t.ticker
+            WHERE ti.index_name = ?
+              AND (ti.active IS NULL OR ti.active = 1)
+              AND (t.delisted IS NULL OR t.delisted = 0)
+              AND (t.enabled IS NULL OR t.enabled = 1)
+            ORDER BY ti.ticker
+        ''', (index_name,))
+        return [row['ticker'] for row in cursor.fetchall()]
+
+
+# =============================================================================
+# Ticker Enabled/Disabled Operations
+# =============================================================================
+
+def get_enabled_tickers() -> List[str]:
+    """Get list of ticker symbols that are enabled."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ticker FROM tickers
+            WHERE (enabled IS NULL OR enabled = 1)
+              AND (delisted IS NULL OR delisted = 0)
+            ORDER BY ticker
+        ''')
+        return [row['ticker'] for row in cursor.fetchall()]
+
+
+def get_disabled_ticker_count() -> int:
+    """Get count of disabled tickers."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) as count FROM tickers WHERE enabled = 0')
+        return cursor.fetchone()['count']
+
+
+def is_ticker_enabled(symbol: str) -> bool:
+    """Check if a specific ticker is enabled."""
+    symbol = symbol.upper()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT enabled FROM tickers WHERE ticker = ?
+        ''', (symbol,))
+        row = cursor.fetchone()
+        # If ticker not found or enabled is NULL, assume enabled
+        if not row or row['enabled'] is None:
+            return True
+        return bool(row['enabled'])
+
+
+def recalculate_ticker_enabled_states() -> Dict[str, int]:
+    """
+    Recalculate enabled state for all tickers based on their index membership.
+
+    A ticker is enabled if:
+    - It belongs to at least one ENABLED index (with active membership), OR
+    - It doesn't belong to any index (manually added stocks)
+
+    A ticker is disabled if:
+    - It ONLY belongs to DISABLED indexes
+
+    Returns dict with 'enabled' and 'disabled' counts.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # First, get all enabled index names
+        cursor.execute('SELECT name FROM indexes WHERE COALESCE(enabled, 1) = 1')
+        enabled_indexes = {row['name'] for row in cursor.fetchall()}
+
+        # Get all tickers and their active index memberships
+        cursor.execute('''
+            SELECT t.ticker,
+                   GROUP_CONCAT(ti.index_name) as indexes
+            FROM tickers t
+            LEFT JOIN ticker_indexes ti ON t.ticker = ti.ticker
+                AND (ti.active IS NULL OR ti.active = 1)
+            GROUP BY t.ticker
+        ''')
+
+        enabled_count = 0
+        disabled_count = 0
+
+        for row in cursor.fetchall():
+            ticker = row['ticker']
+            indexes_str = row['indexes']
+
+            if not indexes_str:
+                # Ticker not in any index - keep enabled (manually added)
+                cursor.execute('UPDATE tickers SET enabled = 1 WHERE ticker = ?', (ticker,))
+                enabled_count += 1
+            else:
+                # Check if any of the ticker's indexes are enabled
+                ticker_indexes = set(indexes_str.split(','))
+                has_enabled_index = bool(ticker_indexes & enabled_indexes)
+
+                if has_enabled_index:
+                    cursor.execute('UPDATE tickers SET enabled = 1 WHERE ticker = ?', (ticker,))
+                    enabled_count += 1
+                else:
+                    cursor.execute('UPDATE tickers SET enabled = 0 WHERE ticker = ?', (ticker,))
+                    disabled_count += 1
+
+        return {'enabled': enabled_count, 'disabled': disabled_count}
 
 
 # =============================================================================
