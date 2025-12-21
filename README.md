@@ -1,125 +1,146 @@
 # Stock Portfolio Tracker
 
-A Flask-based web application for tracking stock portfolios, analyzing market valuations, and finding investment opportunities.
+A Flask-based web application for tracking stock portfolios, analyzing market valuations, and finding undervalued investment opportunities.
 
 ## Features
 
-- **Portfolio Management**: Track your stock holdings, transactions, and realized profits using FIFO cost basis
+- **Portfolio Management**: Track holdings, transactions, and realized profits using FIFO cost basis
 - **Market Analysis**: Screen stocks across major indices (S&P 500, NASDAQ 100, Dow 30, S&P 600, Russell 2000)
 - **Valuation Engine**: Calculate fair values based on historical EPS data from SEC filings
 - **Recommendations**: AI-scored stock recommendations based on undervaluation, dividend yield, and selloff pressure
-- **Company Lookup**: Research individual stocks with detailed valuation metrics and direct links to SEC 10-K filings
-- **Profit Timeline**: Visualize your trading performance over time
+- **Company Lookup**: Research individual stocks with detailed valuation metrics and SEC 10-K filing links
+- **Profit Timeline**: Visualize trading performance over time
+- **Multi-Provider Data**: Pluggable data sources with automatic fallback chains
+
+## Quick Start
+
+```bash
+# Clone the repository
+git clone <repo-url>
+cd FinanceApp
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the app
+python app.py
+```
+
+Open http://localhost:8080 in your browser. Databases are created automatically on first run.
 
 ## Tech Stack
 
 - **Backend**: Python/Flask
-- **Frontend**: Vanilla JavaScript, HTML, CSS
-- **Data Sources**: Yahoo Finance (yfinance), SEC EDGAR API
-- **Storage**: SQLite databases (separate public/private data)
+- **Frontend**: Vanilla JavaScript SPA
+- **Storage**: SQLite (separate public/private databases)
+- **Data Providers**: yfinance, SEC EDGAR, Alpaca, FMP, DefeatBeta
 
-## Data Architecture
-
-The app uses two separate SQLite databases for data isolation:
-
-```
-data_private/private.db    # Personal data (holdings, transactions)
-data_public/public.db      # Market data (valuations, SEC data, indexes)
-```
-
-This separation ensures your personal holdings data stays private while market data can be easily regenerated.
-
-## Setup
-
-1. Clone the repository
-
-2. Create a virtual environment:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Run the app:
-   ```bash
-   python app.py
-   ```
-
-5. Open http://localhost:8080 in your browser
-
-The app will automatically create the database directories and initialize the schema on first run.
-
-## File Structure
+## Project Structure
 
 ```
 FinanceApp/
-├── app.py              # Main Flask application
-├── config.py           # Configuration constants
-├── database.py         # SQLite database operations
-├── data_manager.py     # Data persistence layer
-├── sec_data.py         # SEC EDGAR API integration
-├── logger.py           # Logging utilities
-├── routes/             # Flask blueprints (modular routes)
-├── services/           # Business logic services
+├── app.py                 # Flask app with 40+ REST API routes
+├── database.py            # SQLite CRUD operations
+├── config.py              # Configuration constants
+├── sec_data.py            # SEC EDGAR API integration
+├── data_manager.py        # High-level data operations
+│
+├── services/
+│   ├── providers/         # Multi-source data provider system
+│   │   ├── base.py        # Provider interfaces
+│   │   ├── registry.py    # DataOrchestrator - coordinates fetching
+│   │   ├── circuit_breaker.py  # Fault tolerance
+│   │   ├── yfinance_provider.py
+│   │   ├── alpaca_provider.py
+│   │   ├── fmp_provider.py
+│   │   ├── sec_provider.py
+│   │   └── defeatbeta_provider.py
+│   │
+│   ├── screener.py        # Background batch processing
+│   ├── valuation.py       # Fair value calculations
+│   ├── recommendations.py # Scoring algorithm
+│   └── holdings.py        # FIFO cost basis
+│
 ├── static/
-│   ├── app.js          # Main frontend JavaScript
-│   └── css/            # Modular CSS files
-├── templates/
-│   └── index.html      # Single-page app template
-├── data_public/        # Public market data (tracked in git)
-│   └── public.db       # Market valuations, SEC data, indexes
-└── data_private/       # Personal data (not in git)
-    └── private.db      # Holdings, transactions
+│   ├── app.js             # Main frontend SPA
+│   └── css/               # Stylesheets
+│
+├── data_public/           # Market data (can be rebuilt)
+│   └── public.db
+└── data_private/          # User data (backup this!)
+    └── private.db
 ```
 
-## Database Schema
+## Databases
 
-### Private Database (data_private/private.db)
-- `stocks` - Stock registry (ticker, name, type)
-- `transactions` - Transaction history (buys, sells, dates, prices)
+The app uses two SQLite databases for data isolation:
 
-### Public Database (data_public/public.db)
-- `indexes` - Index definitions (S&P 500, NASDAQ 100, etc.)
-- `tickers` - Ticker metadata and SEC status
-- `ticker_indexes` - Index membership mapping
-- `valuations` - Calculated fair values and metrics
-- `sec_companies` - SEC company data and CIK mappings
-- `eps_history` - Historical EPS from 10-K filings
-- `sec_filings` - Direct URLs to SEC 10-K documents
-- `cik_mapping` - Ticker to CIK lookup cache
-- `metadata` - System metadata and cache timestamps
+**private.db** - Personal data (protect this):
+- `stocks` - User's tracked stocks
+- `transactions` - Buy/sell history with FIFO tracking
 
-## Key Features Explained
+**public.db** - Market data (rebuildable):
+- `tickers` - Company info and SEC status
+- `valuations` - Prices, EPS averages, fair values
+- `eps_history` - Annual EPS from SEC filings
+- `indexes`, `ticker_indexes` - Index membership
 
-### Valuation Model
-Fair value is calculated as: `(Average EPS + Annual Dividend) x 10`
+## Valuation Model
 
-EPS data is sourced from SEC 10-K filings when available, with fallback to Yahoo Finance.
+Fair value is calculated as:
 
-### Recommendation Scoring
-Stocks are scored based on:
-- **Undervaluation** (1.0x weight): Distance below fair value
-- **Dividend Yield** (1.5x weight): Higher yields preferred
-- **Selloff Pressure** (0.8x weight): Stocks down from 52-week highs
+```
+Fair Value = (8-year Average EPS + Annual Dividend) × 10
+```
 
-### Data Updates
-- **Quick Update**: Refreshes prices only (fast)
+EPS data is sourced from SEC 10-K filings when available, with fallback to other providers.
+
+## Provider System
+
+The app uses a pluggable provider architecture with automatic failover:
+
+| Data Type | Primary Provider | Fallbacks |
+|-----------|-----------------|-----------|
+| Prices | Alpaca, yfinance | FMP, DefeatBeta |
+| EPS | SEC EDGAR | yfinance, DefeatBeta |
+| Dividends | yfinance | - |
+
+Features:
+- **Circuit Breaker**: Skip failing providers temporarily (3 failures → 2 min cooldown)
+- **Timeouts**: 10s per provider call prevents hanging
+- **Rate Limiting**: Respects API limits (SEC: 10 req/sec, etc.)
+
+## Recommendation Scoring
+
+Stocks are scored based on weighted factors:
+
+| Factor | Weight | Description |
+|--------|--------|-------------|
+| Undervaluation | 1.0× | Distance below fair value |
+| Dividend Yield | 1.5× | Higher yields preferred |
+| Selloff Pressure | 0.8× | Stocks down from 52-week highs |
+
+## Data Updates
+
+- **Quick Update**: Refreshes prices only
 - **Smart Update**: Updates missing valuations + prices
 - **Full Update**: Re-fetches all SEC data and valuations
 
-### SEC Integration
-- Fetches EPS data from SEC EDGAR XBRL API
-- Stores direct links to 10-K filing documents
-- Caches CIK mappings for fast ticker lookups
-- Rate-limited to respect SEC guidelines (10 req/sec)
+## API Keys (Optional)
 
-## Adding Holdings
+For enhanced data access, add API keys to `data_private/api_keys.json`:
 
-Use the Holdings page to add your stocks and transactions through the web interface, or import via the API.
+```json
+{
+  "alpaca_key": "your-key",
+  "alpaca_secret": "your-secret",
+  "fmp_api_key": "your-key"
+}
+```
 
 ## License
 
