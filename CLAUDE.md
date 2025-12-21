@@ -22,7 +22,7 @@ FinanceApp/
 ├── data_manager.py        # High-level data operations
 │
 ├── services/
-│   ├── providers/         # *** PROVIDER SYSTEM ***
+│   ├── providers/         # *** MARKET DATA PROVIDER SYSTEM ***
 │   │   ├── base.py        # Interfaces: PriceProvider, EPSProvider, etc.
 │   │   ├── registry.py    # DataOrchestrator - coordinates fetching
 │   │   ├── config.py      # Provider ordering, timeouts, circuit breaker
@@ -34,10 +34,14 @@ FinanceApp/
 │   │   ├── sec_provider.py
 │   │   └── defeatbeta_provider.py
 │   │
-│   ├── screener.py        # Background batch processing
+│   ├── indexes/           # *** INDEX PROVIDER SYSTEM ***
+│   │   ├── providers.py   # Index constituent providers (Wikipedia, iShares, etc.)
+│   │   └── registry.py    # Index definitions and central registry
+│   │
+│   ├── screener.py        # Background batch processing (partial refactor)
 │   ├── valuation.py       # Fair value calculations
 │   ├── recommendations.py # Scoring algorithm
-│   ├── holdings.py        # FIFO cost basis
+│   ├── holdings.py        # FIFO cost basis calculations
 │   └── stock_utils.py     # Misc utilities (some legacy yfinance)
 │
 ├── routes/                # Flask blueprints (NOT CURRENTLY USED)
@@ -115,6 +119,19 @@ Request → Check Cache → Get Ordered Providers → For Each:
 1. `services/providers/config.py` - Settings
 2. `services/providers/circuit_breaker.py` - Logic
 3. `services/providers/registry.py` - Usage in fetch methods
+
+### Index System (services/indexes/)
+The index system follows the same provider pattern as market data:
+- `services/indexes/providers.py` - Index constituent providers (Wikipedia, Slickcharts, iShares, GitHub)
+- `services/indexes/registry.py` - Index definitions and IndexRegistry class
+
+Usage:
+```python
+from services.indexes import VALID_INDICES, INDEX_NAMES, fetch_index_tickers
+
+# Get list of tickers in an index
+tickers = fetch_index_tickers('sp500')
+```
 
 ## Legacy Code (Needs Migration)
 

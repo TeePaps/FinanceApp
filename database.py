@@ -36,7 +36,7 @@ PRIVATE_DB_PATH = os.path.join(BASE_DIR, 'data_private', 'private.db')
 PUBLIC_DB_PATH = os.path.join(BASE_DIR, 'data_public', 'public.db')
 
 # Import index definitions from central registry
-from services.index_registry import VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES
+from services.indexes import VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES
 
 
 def _get_connection(db_path: str) -> sqlite3.Connection:

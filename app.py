@@ -21,6 +21,8 @@ from services.providers import (
     disconnect_ibkr
 )
 from services.valuation import get_validated_eps
+from services.holdings import calculate_holdings, calculate_fifo_cost_basis, get_transactions, get_stocks
+from services.recommendations import get_top_recommendations
 from config import (
     DATA_DIR, USER_DATA_DIR, EXCLUDED_TICKERS_FILE, TICKER_FAILURES_FILE,
     STOCKS_FILE, TRANSACTIONS_FILE,
@@ -32,7 +34,7 @@ from config import (
     SELLOFF_VOLUME_SEVERE, SELLOFF_VOLUME_HIGH, SELLOFF_VOLUME_MODERATE,
     SCORING_WEIGHTS, RECOMMENDATION_MIN_EPS_YEARS
 )
-from services.index_registry import (
+from services.indexes import (
     VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES,
     fetch_index_tickers, IndexRegistry
 )
@@ -257,121 +259,10 @@ def fetch_multiple_prices(tickers):
 
     return prices
 
-def get_stocks():
-    """Read stocks from database"""
-    return db.get_stocks()
-
-def get_transactions():
-    """Read transactions from database"""
-    return db.get_transactions()
-
-def calculate_fifo_cost_basis(ticker, transactions):
-    """
-    Calculate FIFO cost basis for sells.
-    Returns a dict mapping transaction id to cost basis info for sells.
-    """
-    # Build list of lots (buys) in order
-    lots = []  # Each lot: {'shares': n, 'price': p, 'remaining': n}
-    sell_basis = {}  # txn_id -> {'cost_basis': total_cost, 'shares': n, 'avg_cost_per_share': p}
-
-    for txn in transactions:
-        if txn['ticker'] != ticker:
-            continue
-
-        shares = int(txn['shares']) if txn['shares'] else 0
-        price = float(txn['price']) if txn['price'] else 0
-
-        if txn['action'] == 'buy':
-            lots.append({'shares': shares, 'price': price, 'remaining': shares})
-        elif txn['action'] == 'sell':
-            # Use FIFO to determine cost basis
-            shares_to_sell = shares
-            total_cost = 0
-            lots_used = []
-
-            for lot in lots:
-                if shares_to_sell <= 0:
-                    break
-                if lot['remaining'] <= 0:
-                    continue
-
-                take = min(lot['remaining'], shares_to_sell)
-                total_cost += take * lot['price']
-                lot['remaining'] -= take
-                shares_to_sell -= take
-                lots_used.append({'shares': take, 'price': lot['price']})
-
-            avg_cost = total_cost / shares if shares > 0 else 0
-            sell_basis[txn['id']] = {
-                'cost_basis': total_cost,
-                'shares': shares,
-                'avg_cost_per_share': avg_cost,
-                'lots_used': lots_used
-            }
-
-    return sell_basis, lots
-
-
-# get_validated_eps now imported from services.valuation
+# Holdings functions (get_stocks, get_transactions, calculate_fifo_cost_basis, calculate_holdings)
+# now imported from services.holdings
+# get_validated_eps imported from services.valuation
 # calculate_selloff_metrics now handled by orchestrator.fetch_selloff()
-
-
-def calculate_holdings(confirmed_only=False):
-    """Calculate current holdings from transactions with FIFO lot tracking
-
-    Args:
-        confirmed_only: If True, only include buys with status='done'
-    """
-    stocks = {s['ticker']: s for s in get_stocks()}
-    transactions = get_transactions()
-
-    # Group transactions by ticker, optionally filtering buys by status
-    by_ticker = {}
-    for txn in transactions:
-        # If confirmed_only, skip buy transactions that aren't 'done'
-        if confirmed_only and txn['action'] == 'buy':
-            status = (txn.get('status') or '').lower()
-            if status != 'done':
-                continue
-
-        ticker = txn['ticker']
-        if ticker not in by_ticker:
-            by_ticker[ticker] = []
-        by_ticker[ticker].append(txn)
-
-    holdings = {}
-    for ticker, ticker_txns in by_ticker.items():
-        # Calculate FIFO cost basis for this ticker
-        sell_basis, remaining_lots = calculate_fifo_cost_basis(ticker, ticker_txns)
-
-        # Calculate remaining shares and cost basis
-        total_shares = sum(lot['remaining'] for lot in remaining_lots)
-        total_cost = sum(lot['remaining'] * lot['price'] for lot in remaining_lots)
-
-        holdings[ticker] = {
-            'ticker': ticker,
-            'name': stocks.get(ticker, {}).get('name', ticker),
-            'type': stocks.get(ticker, {}).get('type', 'stock'),
-            'shares': total_shares,
-            'total_cost': total_cost,
-            'avg_cost': total_cost / total_shares if total_shares > 0 else 0,
-            'remaining_lots': [{'shares': l['remaining'], 'price': l['price']} for l in remaining_lots if l['remaining'] > 0],
-            'transactions': []
-        }
-
-        # Add transactions with computed gain percentages for sells
-        for txn in ticker_txns:
-            txn_copy = dict(txn)
-            if txn['action'] == 'sell' and txn['id'] in sell_basis:
-                basis = sell_basis[txn['id']]
-                sell_price = float(txn['price']) if txn['price'] else 0
-                if basis['avg_cost_per_share'] > 0:
-                    gain_pct = ((sell_price - basis['avg_cost_per_share']) / basis['avg_cost_per_share']) * 100
-                    txn_copy['computed_gain_pct'] = round(gain_pct, 1)
-                    txn_copy['fifo_cost_basis'] = round(basis['avg_cost_per_share'], 2)
-            holdings[ticker]['transactions'].append(txn_copy)
-
-    return holdings
 
 @app.route('/')
 def index():
@@ -611,7 +502,7 @@ def api_prices():
         'cache_duration': CACHE_DURATION
     })
 
-# VALID_INDICES, INDEX_NAMES, INDIVIDUAL_INDICES imported from services.index_registry
+# VALID_INDICES, INDEX_NAMES, INDIVIDUAL_INDICES imported from services.indexes
 
 def sanitize_for_json(obj):
     """Replace NaN and Inf values with None for JSON compatibility"""
@@ -2320,143 +2211,16 @@ def api_recommendations():
     # Get ticker-to-index mapping
     ticker_indexes = get_all_ticker_indexes()
 
-    scored_stocks = []
+    # Use centralized recommendations service with index filtering and bonus
+    result = get_top_recommendations(
+        all_valuations,
+        ticker_indexes=ticker_indexes,
+        limit=10,
+        filter_by_index=True,
+        include_index_bonus=True
+    )
 
-    for ticker, val in all_valuations.items():
-        # Skip stocks not in any enabled index
-        if ticker not in ticker_indexes:
-            continue
-
-        # Skip stocks without key metrics
-        if not val.get('current_price') or val.get('current_price', 0) <= 0:
-            continue
-        if val.get('price_vs_value') is None:
-            continue
-
-        current_price = val.get('current_price', 0)
-        price_vs_value = val.get('price_vs_value') or 0
-        annual_dividend = val.get('annual_dividend') or 0
-        off_high_pct = val.get('off_high_pct') or 0
-        in_selloff = val.get('in_selloff', False)
-        selloff_severity = val.get('selloff_severity', 'none')
-        eps_years = val.get('eps_years', 0)
-
-        # Calculate dividend yield
-        dividend_yield = (annual_dividend / current_price * 100) if current_price > 0 else 0
-
-        # Skip stocks with very low data quality
-        if eps_years < RECOMMENDATION_MIN_EPS_YEARS:
-            continue
-
-        # Calculate composite score (higher = better recommendation)
-        # 1. Undervaluation score: more negative price_vs_value = better
-        #    -50% undervalued gets 50 points, 0% gets 0, +50% overvalued gets -50
-        undervalue_score = -price_vs_value  # Flip sign so undervalued = positive
-
-        # 2. Dividend score: dividend is important!
-        #    - No dividend: penalty (from config)
-        #    - 0-6% yield mapped to 0-max points (from config)
-        if dividend_yield <= 0:
-            dividend_score = DIVIDEND_NO_DIVIDEND_PENALTY
-        else:
-            dividend_score = min(dividend_yield * DIVIDEND_POINTS_PER_PERCENT, DIVIDEND_MAX_POINTS)
-
-        # 3. Selloff score: based on how far off the high
-        #    -50% off high = 50 points, -20% = 20 points, 0% = 0 points
-        selloff_score = -off_high_pct if off_high_pct < 0 else 0
-
-        # Bonus for being in active selloff
-        if in_selloff:
-            if selloff_severity == 'severe':
-                selloff_score += SELLOFF_SEVERE_BONUS
-            elif selloff_severity in ('moderate', 'high'):
-                selloff_score += SELLOFF_MODERATE_BONUS
-            elif selloff_severity == 'recent':
-                selloff_score += SELLOFF_RECENT_BONUS
-
-        # Total score with weights from config
-        total_score = (undervalue_score * SCORING_WEIGHTS['undervaluation']) + \
-                      (dividend_score * SCORING_WEIGHTS['dividend']) + \
-                      (selloff_score * SCORING_WEIGHTS['selloff'])
-
-        # 4. Major index bonus: slight preference for blue-chip stocks
-        stock_indexes = ticker_indexes.get(ticker, [])
-        index_bonus = 0
-        index_names_lower = [idx.lower().replace(' ', '').replace('&', '') for idx in stock_indexes]
-
-        if any('dow' in idx or 'djia' in idx for idx in index_names_lower):
-            index_bonus = 10  # Dow 30 - most prestigious blue chips
-        elif any('sp500' in idx for idx in index_names_lower):
-            index_bonus = 8   # S&P 500 - large cap, stable
-        elif any('nasdaq' in idx for idx in index_names_lower):
-            index_bonus = 6   # NASDAQ 100 - large cap tech
-
-        total_score += index_bonus
-
-        # Build reasoning
-        reasons = []
-
-        # Undervaluation reason
-        if price_vs_value <= -30:
-            reasons.append(f"Significantly undervalued at {price_vs_value:.0f}% below estimated value")
-        elif price_vs_value <= -15:
-            reasons.append(f"Undervalued at {price_vs_value:.0f}% below estimated value")
-        elif price_vs_value <= 0:
-            reasons.append(f"Slightly undervalued at {price_vs_value:.0f}% below estimated value")
-
-        # Dividend reason
-        if dividend_yield >= 4:
-            reasons.append(f"High dividend yield of {dividend_yield:.1f}%")
-        elif dividend_yield >= 2:
-            reasons.append(f"Solid dividend yield of {dividend_yield:.1f}%")
-        elif dividend_yield >= 1:
-            reasons.append(f"Moderate dividend yield of {dividend_yield:.1f}%")
-
-        # Selloff reason
-        if off_high_pct <= -40:
-            reasons.append(f"Down {-off_high_pct:.0f}% from 52-week high - severe selloff")
-        elif off_high_pct <= -25:
-            reasons.append(f"Down {-off_high_pct:.0f}% from 52-week high - significant pullback")
-        elif off_high_pct <= -15:
-            reasons.append(f"Down {-off_high_pct:.0f}% from 52-week high - moderate pullback")
-
-        # Data quality note
-        if eps_years >= 10:
-            reasons.append(f"Strong {eps_years}-year earnings history")
-        elif eps_years >= 8:
-            reasons.append(f"Good {eps_years}-year earnings history")
-
-        scored_stocks.append({
-            'ticker': ticker,
-            'company_name': val.get('company_name', ticker),
-            'current_price': current_price,
-            'estimated_value': val.get('estimated_value'),
-            'price_vs_value': price_vs_value,
-            'annual_dividend': annual_dividend,
-            'dividend_yield': round(dividend_yield, 2),
-            'off_high_pct': off_high_pct,
-            'in_selloff': in_selloff,
-            'selloff_severity': selloff_severity,
-            'eps_years': eps_years,
-            'score': round(total_score, 1),
-            'reasons': reasons,
-            'indexes': ticker_indexes.get(ticker, []),
-            'updated': val.get('updated')
-        })
-
-    # Sort by score descending and take top 10
-    scored_stocks.sort(key=lambda x: x['score'], reverse=True)
-    top_10 = scored_stocks[:10]
-
-    return jsonify({
-        'recommendations': top_10,
-        'total_analyzed': len(scored_stocks),
-        'criteria': {
-            'undervaluation': 'Stocks trading below estimated value (based on 10x average EPS)',
-            'dividend': 'Higher dividend yield preferred',
-            'selloff': 'Stocks that have pulled back from highs (potential buying opportunity)'
-        }
-    })
+    return jsonify(result)
 
 @app.route('/api/screener/update-dividends', methods=['POST'])
 def api_screener_update_dividends():

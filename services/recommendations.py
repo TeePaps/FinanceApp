@@ -131,7 +131,8 @@ def explain_score(valuation_data):
     return reasons
 
 
-def get_top_recommendations(valuations, ticker_indexes=None, limit=10):
+def get_top_recommendations(valuations, ticker_indexes=None, limit=10,
+                            filter_by_index=False, include_index_bonus=False):
     """
     Get top N stock recommendations.
 
@@ -139,6 +140,8 @@ def get_top_recommendations(valuations, ticker_indexes=None, limit=10):
         valuations: Dict mapping ticker to valuation data
         ticker_indexes: Optional dict mapping ticker to list of indexes
         limit: Number of recommendations to return
+        filter_by_index: If True, only include stocks that are in ticker_indexes
+        include_index_bonus: If True, add bonus points for major index membership
 
     Returns:
         Dict with recommendations list and metadata
@@ -150,6 +153,10 @@ def get_top_recommendations(valuations, ticker_indexes=None, limit=10):
     scored_stocks = []
 
     for ticker, val in valuations.items():
+        # Skip stocks not in any enabled index (if filtering enabled)
+        if filter_by_index and ticker not in ticker_indexes:
+            continue
+
         # Skip stocks without key metrics
         if not val.get('current_price') or val.get('current_price', 0) <= 0:
             continue
@@ -170,6 +177,18 @@ def get_top_recommendations(valuations, ticker_indexes=None, limit=10):
 
         # Calculate score
         total_score = score_stock(val)
+
+        # Add index bonus if requested
+        if include_index_bonus and ticker in ticker_indexes:
+            stock_indexes = ticker_indexes.get(ticker, [])
+            index_names_lower = [idx.lower().replace(' ', '').replace('&', '') for idx in stock_indexes]
+
+            if any('dow' in idx or 'djia' in idx for idx in index_names_lower):
+                total_score += 10  # Dow 30 - most prestigious blue chips
+            elif any('sp500' in idx for idx in index_names_lower):
+                total_score += 8   # S&P 500 - large cap, stable
+            elif any('nasdaq' in idx for idx in index_names_lower):
+                total_score += 6   # NASDAQ 100 - large cap tech
 
         # Build reasoning
         reasons = explain_score(val)

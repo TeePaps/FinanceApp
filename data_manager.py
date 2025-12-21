@@ -16,8 +16,8 @@ from typing import Dict, List, Optional, Set
 # Import database module for all operations
 import database as db
 
-# Import index registry for index definitions
-from services.index_registry import VALID_INDICES, INDEX_NAMES, INDIVIDUAL_INDICES
+# Import index definitions from central registry
+from services.indexes import VALID_INDICES, INDEX_NAMES, INDIVIDUAL_INDICES
 
 
 def ensure_data_dir():
