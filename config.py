@@ -124,14 +124,5 @@ YAHOO_SINGLE_DELAY = 0.3      # Seconds between single ticker requests
 # ============================================================================
 # Valid Indices
 # ============================================================================
-# Note: Also defined in data_manager.py - these should stay in sync
-VALID_INDICES = ['all', 'sp500', 'nasdaq100', 'dow30', 'sp600', 'russell2000']
-
-INDEX_DISPLAY_NAMES = {
-    'all': ('All Indexes', 'All'),
-    'sp500': ('S&P 500', 'S&P 500'),
-    'nasdaq100': ('NASDAQ 100', 'NASDAQ'),
-    'dow30': ('Dow Jones Industrial Average', 'DJIA'),
-    'sp600': ('S&P SmallCap 600', 'S&P 600'),
-    'russell2000': ('Russell 2000', 'Russell 2000')
-}
+# Index definitions moved to services/index_registry.py for single source of truth
+from services.index_registry import VALID_INDICES, INDEX_NAMES as INDEX_DISPLAY_NAMES

@@ -152,6 +152,78 @@
     display: block;
 }
 
+/* Tab Dropdown */
+.tab-dropdown {
+    position: relative;
+    display: inline-block;
+}
+
+.tab-dropdown-btn {
+    background: var(--bg-hover);
+}
+
+.tab-dropdown-btn.active {
+    background: #007bff;
+    color: white;
+}
+
+.tab-dropdown-menu {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    z-index: 100;
+    min-width: 160px;
+    margin-top: 4px;
+}
+
+.tab-dropdown-menu.show {
+    display: block;
+}
+
+.tab-dropdown-item {
+    display: block;
+    width: 100%;
+    padding: 10px 16px;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    color: var(--text-primary);
+    font-size: 0.95em;
+}
+
+.tab-dropdown-item:hover {
+    background: var(--bg-hover);
+}
+
+.tab-dropdown-item:first-child {
+    border-radius: 6px 6px 0 0;
+}
+
+.tab-dropdown-item:last-child {
+    border-radius: 0 0 6px 6px;
+}
+
+/* Settings Button */
+.settings-btn {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 1.2em;
+    transition: background 0.2s;
+}
+
+.settings-btn:hover {
+    background: var(--bg-hover);
+}
+
 /* Grid Layouts */
 .grid-2 {
     display: grid;

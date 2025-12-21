@@ -151,7 +151,9 @@ def api_screener_stop():
 def api_screener_progress():
     """Get screener progress."""
     app = _get_app_module()
-    return jsonify(app.screener_progress)
+    progress_data = app.screener_progress.copy()
+    progress_data['provider_logs'] = app.get_provider_logs()
+    return jsonify(progress_data)
 
 
 @screener_bp.route('/refresh', methods=['POST'])

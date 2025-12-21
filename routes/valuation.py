@@ -8,12 +8,10 @@ Handles:
 """
 
 import threading
-import yfinance as yf
 from flask import Blueprint, jsonify
 import data_manager
 import sec_data
 from services.valuation import calculate_valuation, get_validated_eps
-from services.yahoo_finance import calculate_selloff_metrics
 from config import PE_RATIO_MULTIPLIER, RECOMMENDED_EPS_YEARS
 from datetime import datetime, timedelta
 
@@ -45,16 +43,33 @@ def api_valuation_refresh(ticker):
     ticker = ticker.upper()
 
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        company_name = info.get('shortName', ticker)
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice', 0)
+        # Use provider system for price
+        from services.providers import get_orchestrator
+        try:
+            from app import log_provider_activity
+        except ImportError:
+            log_provider_activity = lambda x: None
 
-        # Fetch income_stmt for validation
-        income_stmt = stock.income_stmt
+        orchestrator = get_orchestrator()
+        log_provider_activity(f"Refreshing {ticker}...")
+        price_result = orchestrator.fetch_price(ticker, skip_cache=True)
+        current_price = price_result.data if price_result.success else 0
+        price_source = price_result.source if price_result.success else None
 
-        # Get validated EPS data
-        eps_data, eps_source, validation_info = get_validated_eps(ticker, stock, income_stmt)
+        # Get company info and 52-week high/low
+        info_result = orchestrator.fetch_stock_info(ticker)
+        if info_result.success and info_result.data:
+            info_data = info_result.data
+            company_name = info_data.company_name
+            fifty_two_week_high = info_data.fifty_two_week_high
+            fifty_two_week_low = info_data.fifty_two_week_low
+        else:
+            company_name = ticker
+            fifty_two_week_high = None
+            fifty_two_week_low = None
+
+        # Get validated EPS data using orchestrator
+        eps_data, eps_source, validation_info = get_validated_eps(ticker)
 
         # Use SEC company name if available
         if eps_source.startswith('sec'):
@@ -62,21 +77,22 @@ def api_valuation_refresh(ticker):
             if sec_eps and sec_eps.get('company_name'):
                 company_name = sec_eps['company_name']
 
-        # Get 52-week high/low
-        fifty_two_week_high = info.get('fiftyTwoWeekHigh')
-        fifty_two_week_low = info.get('fiftyTwoWeekLow')
-
-        # Get selloff metrics
-        selloff_metrics = calculate_selloff_metrics(stock)
-
-        # Get dividend info
-        dividends = stock.dividends
+        # Get dividend info using orchestrator
+        dividend_result = orchestrator.fetch_dividends(ticker)
         annual_dividend = 0
 
-        if dividends is not None and len(dividends) > 0:
-            one_year_ago = datetime.now() - timedelta(days=365)
-            recent_dividends = dividends[dividends.index >= one_year_ago.strftime('%Y-%m-%d')]
-            annual_dividend = sum(float(d) for d in recent_dividends)
+        if dividend_result.success and dividend_result.data:
+            annual_dividend = dividend_result.data.annual_dividend
+
+        # Get selloff metrics via orchestrator
+        selloff_metrics = None
+        selloff_result = orchestrator.fetch_selloff(ticker)
+        if selloff_result.success and selloff_result.data:
+            sd = selloff_result.data
+            selloff_metrics = {
+                'day': sd.day, 'week': sd.week, 'month': sd.month,
+                'avg_volume': sd.avg_volume, 'severity': sd.severity
+            }
 
         # Calculate valuation
         eps_avg = None
@@ -99,6 +115,7 @@ def api_valuation_refresh(ticker):
             'ticker': ticker,
             'company_name': company_name,
             'current_price': round(current_price, 2) if current_price else None,
+            'price_source': price_source,
             'eps_avg': round(eps_avg, 2) if eps_avg else None,
             'eps_years': len(eps_data),
             'eps_source': eps_source,

@@ -16,9 +16,8 @@ from typing import Dict, List, Optional, Set
 # Import database module for all operations
 import database as db
 
-# Re-export valid indices and names for backward compatibility
-VALID_INDICES = db.VALID_INDICES
-INDEX_NAMES = db.INDEX_NAMES
+# Import index registry for index definitions
+from services.index_registry import VALID_INDICES, INDEX_NAMES, INDIVIDUAL_INDICES
 
 
 def ensure_data_dir():
@@ -210,9 +209,11 @@ def migrate_from_old_structure():
 
 # --- Index Management ---
 
-def get_index_tickers(index_name: str) -> List[str]:
-    """Get list of tickers for an index."""
-    return db.get_index_tickers(index_name)
+def get_index_tickers(index_name: str, include_delisted: bool = False) -> List[str]:
+    """Get list of tickers for an index, optionally excluding delisted."""
+    if include_delisted:
+        return db.get_index_tickers(index_name)
+    return db.get_active_index_tickers(index_name)
 
 
 def sync_index_membership(index_name: str, tickers: List[str]):
@@ -221,3 +222,12 @@ def sync_index_membership(index_name: str, tickers: List[str]):
     Adds index to tickers that should have it, creates new ticker entries as needed.
     """
     db.sync_index_membership(index_name, tickers)
+
+
+def refresh_index_membership(index_name: str, current_tickers: List[str]) -> Dict:
+    """
+    Refresh index membership from authoritative source.
+    Marks removed tickers as inactive, adds new ones.
+    Returns dict with 'added', 'removed', 'total' counts.
+    """
+    return db.refresh_index_membership(index_name, current_tickers)

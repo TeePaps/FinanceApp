@@ -1,0 +1,1 @@
+Restart the Flask development server by running the restart-server.sh script in the project root. After restarting, wait a few seconds and verify the server is running by checking http://localhost:8080.

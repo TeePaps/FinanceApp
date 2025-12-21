@@ -11,11 +11,10 @@ Provides:
 
 import threading
 import time
-import yfinance as yf
-import numpy as np
 from datetime import datetime
-from config import YAHOO_BATCH_SIZE, PE_RATIO_MULTIPLIER
+from config import PE_RATIO_MULTIPLIER
 import data_manager
+from services.index_registry import INDEX_NAMES
 
 # Module-level state for background tasks
 _running = False
@@ -26,7 +25,7 @@ _progress = {
     'status': 'idle',
     'phase': '',
     'index': 'all',
-    'index_name': 'All Indexes'
+    'index_name': 'All'  # Updated dynamically from INDEX_NAMES
 }
 
 
@@ -49,118 +48,71 @@ def stop_screener():
 
 def _download_prices_in_batches(tickers, progress_callback=None):
     """
-    Download prices for tickers in batches.
+    Download prices for tickers using orchestrator.
 
     Args:
         tickers: List of ticker symbols
         progress_callback: Optional callback for progress updates
 
     Returns:
-        Combined DataFrame with price data, or None if failed
-    """
-    all_price_data = []
-    total_batches = (len(tickers) + YAHOO_BATCH_SIZE - 1) // YAHOO_BATCH_SIZE
-
-    for batch_idx in range(0, len(tickers), YAHOO_BATCH_SIZE):
-        if not _running:
-            return None
-
-        batch = tickers[batch_idx:batch_idx + YAHOO_BATCH_SIZE]
-        batch_num = batch_idx // YAHOO_BATCH_SIZE + 1
-
-        if progress_callback:
-            progress_callback(batch_idx, f'Downloading batch {batch_num}/{total_batches}...')
-
-        # Try up to 3 times with increasing delays
-        for attempt in range(3):
-            try:
-                batch_data = yf.download(batch, period='3mo', progress=False, threads=True)
-                if batch_data is not None and not batch_data.empty:
-                    all_price_data.append(batch_data)
-                    print(f"[Screener] Batch {batch_num}/{total_batches}: {len(batch)} tickers OK")
-                    break
-            except Exception as e:
-                if 'Rate' in str(e) and attempt < 2:
-                    wait_time = (attempt + 1) * 5
-                    print(f"[Screener] Batch {batch_num} rate limited, waiting {wait_time}s...")
-                    if progress_callback:
-                        progress_callback(batch_idx, f'Rate limited, waiting {wait_time}s...')
-                    time.sleep(wait_time)
-                else:
-                    print(f"[Screener] Batch {batch_num} error: {e}")
-                    break
-
-        # Delay between batches to avoid rate limiting
-        if batch_idx + YAHOO_BATCH_SIZE < len(tickers):
-            time.sleep(2)
-
-    if not all_price_data:
-        return None
-
-    # Combine all batch data
-    try:
-        import pandas as pd
-        combined = pd.concat(all_price_data, axis=1)
-        # Remove duplicate columns
-        combined = combined.loc[:, ~combined.columns.duplicated()]
-        return combined
-    except Exception as e:
-        print(f"[Screener] Error combining batch data: {e}")
-        return all_price_data[0] if all_price_data else None
-
-
-def _calculate_price_changes(combined_data, tickers):
-    """
-    Calculate price changes from combined price data.
-
-    Args:
-        combined_data: Combined DataFrame from batch downloads
-        tickers: List of ticker symbols
-
-    Returns:
         Dict mapping ticker to price change data
     """
-    results = {}
+    if not _running:
+        return None
+
+    if progress_callback:
+        progress_callback(0, 'Downloading price history...')
 
     try:
-        # Get current prices and historical prices
-        if len(tickers) == 1:
-            ticker = tickers[0]
-            if 'Close' in combined_data.columns:
-                current_prices = combined_data['Close'].iloc[-1]
-                prices_3m_ago = combined_data['Close'].iloc[0]
-                prices_1m_ago = combined_data['Close'].iloc[len(combined_data)//3] if len(combined_data) > 3 else prices_3m_ago
+        # Log provider activity
+        try:
+            from app import log_provider_activity
+            log_provider_activity(f"Fetching 3mo history for {len(tickers)} tickers...")
+        except ImportError:
+            pass
 
+        # Use orchestrator to fetch historical prices
+        from services.providers import get_orchestrator
+        orchestrator = get_orchestrator()
+        history_results = orchestrator.fetch_price_history_batch(tickers, period='3mo')
+
+        try:
+            from app import log_provider_activity
+            log_provider_activity(f"✓ 3mo history: {len(history_results)} tickers downloaded")
+        except ImportError:
+            pass
+
+        print(f"[Screener] Downloaded price history for {len(history_results)} tickers")
+
+        if progress_callback:
+            progress_callback(len(tickers), 'Processing price data...')
+
+        # Extract price change data from HistoricalPriceData objects
+        results = {}
+        for ticker, result in history_results.items():
+            if result.success and result.data:
+                hist_data = result.data
                 results[ticker] = {
-                    'current_price': float(current_prices),
-                    'price_3m_ago': float(prices_3m_ago),
-                    'price_1m_ago': float(prices_1m_ago),
-                    'price_change_3m': ((current_prices - prices_3m_ago) / prices_3m_ago * 100) if prices_3m_ago else 0,
-                    'price_change_1m': ((current_prices - prices_1m_ago) / prices_1m_ago * 100) if prices_1m_ago else 0
+                    'current_price': hist_data.current_price,
+                    'price_source': result.source,
+                    'price_3m_ago': hist_data.price_3m_ago,
+                    'price_1m_ago': hist_data.price_1m_ago,
+                    'price_change_3m': hist_data.change_3m_pct,
+                    'price_change_1m': hist_data.change_1m_pct
                 }
-        else:
-            for ticker in tickers:
-                try:
-                    if ('Close', ticker) in combined_data.columns:
-                        ticker_data = combined_data[('Close', ticker)]
-                        current_price = ticker_data.iloc[-1]
-                        price_3m_ago = ticker_data.iloc[0]
-                        price_1m_ago = ticker_data.iloc[len(ticker_data)//3] if len(ticker_data) > 3 else price_3m_ago
 
-                        if current_price and not np.isnan(current_price):
-                            results[ticker] = {
-                                'current_price': float(current_price),
-                                'price_3m_ago': float(price_3m_ago) if not np.isnan(price_3m_ago) else None,
-                                'price_1m_ago': float(price_1m_ago) if not np.isnan(price_1m_ago) else None,
-                                'price_change_3m': float((current_price - price_3m_ago) / price_3m_ago * 100) if price_3m_ago and not np.isnan(price_3m_ago) else None,
-                                'price_change_1m': float((current_price - price_1m_ago) / price_1m_ago * 100) if price_1m_ago and not np.isnan(price_1m_ago) else None
-                            }
-                except Exception:
-                    pass
+        return results
+
     except Exception as e:
-        print(f"[Screener] Error calculating price changes: {e}")
+        try:
+            from app import log_provider_activity
+            log_provider_activity(f"✗ 3mo history fetch failed: {str(e)[:50]}")
+        except ImportError:
+            pass
+        print(f"[Screener] Error fetching price history: {e}")
+        return None
 
-    return results
+
 
 
 class ScreenerService:
@@ -203,13 +155,22 @@ class ScreenerService:
         _running = True
 
         # Get tickers for the index
+        # Use registry for display name lookup
+        index_info = INDEX_NAMES.get(index_name, (index_name.upper(), index_name.upper()))
+        index_display_name = index_info[1] if len(index_info) > 1 else index_info[0]
+
+        # Import database to filter enabled tickers
+        import database as db
+
         if index_name == 'all':
-            tickers = list(data_manager.load_valuations().get('valuations', {}).keys())
-            index_display_name = 'All Indexes'
+            # Get all valuations but filter to only enabled tickers
+            all_valuations = data_manager.load_valuations().get('valuations', {})
+            enabled_tickers = set(db.get_enabled_tickers())
+            tickers = [t for t in all_valuations.keys() if t in enabled_tickers]
         else:
+            # get_index_tickers already filters disabled tickers via get_active_index_tickers
             index_tickers = data_manager.get_index_tickers(index_name)
             tickers = list(index_tickers) if index_tickers else []
-            index_display_name = index_name.upper()
 
         if not tickers:
             print(f"[Quick Update] No tickers found for {index_name}")
@@ -231,24 +192,29 @@ class ScreenerService:
             _progress['current'] = current
             _progress['ticker'] = message
 
-        # Download prices in batches
-        combined_data = _download_prices_in_batches(tickers, progress_callback)
+        # Download prices using orchestrator
+        price_results = _download_prices_in_batches(tickers, progress_callback)
 
         if not _running:
             _progress['status'] = 'cancelled'
             return
 
-        if combined_data is None:
-            print("[Quick Update] No price data returned from any batch")
+        if price_results is None:
+            print("[Quick Update] No price data returned")
             _progress['status'] = 'complete'
             _running = False
             return
 
-        # Calculate price changes
-        _progress['phase'] = 'calculating'
-        _progress['ticker'] = 'Calculating price changes...'
+        # Mark tickers that failed across all providers as delisted
+        failed_tickers = [t for t in tickers if t not in price_results]
+        if failed_tickers:
+            import database as db
+            db.mark_tickers_delisted(failed_tickers)
+            print(f"[Quick Update] Marked {len(failed_tickers)} tickers as delisted")
 
-        price_results = _calculate_price_changes(combined_data, tickers)
+        # Price changes already calculated by orchestrator
+        _progress['phase'] = 'calculating'
+        _progress['ticker'] = 'Processing price changes...'
 
         # Update valuations with new prices
         _progress['phase'] = 'saving'
@@ -275,6 +241,7 @@ class ScreenerService:
                 updates[ticker] = {
                     **current_val,
                     'current_price': round(current_price, 2),
+                    'price_source': price_data.get('price_source'),
                     'price_change_1m': round(price_data.get('price_change_1m', 0) or 0, 2),
                     'price_change_3m': round(price_data.get('price_change_3m', 0) or 0, 2),
                     'estimated_value': round(estimated_value, 2) if estimated_value else None,
