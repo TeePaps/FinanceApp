@@ -200,12 +200,39 @@ def fetch_company_eps(ticker, cik):
             if not all_eps_data:
                 return None
 
+            # Sanity check and correction for EPS values
+            # Some companies (e.g., HAL) have XBRL filing errors where EPS is 1,000,000x too high
+            MAX_REASONABLE_EPS = 1000  # Berkshire A shares can have high EPS
+            LIKELY_SCALE_ERROR_MIN = 100000  # Values above this are likely scale errors
+
+            def correct_eps_value(eps_val):
+                """Attempt to correct obviously wrong EPS values"""
+                if abs(eps_val) >= LIKELY_SCALE_ERROR_MIN:
+                    # Check if dividing by 1M gives a reasonable value
+                    corrected = eps_val / 1000000
+                    if abs(corrected) <= MAX_REASONABLE_EPS:
+                        return corrected, True
+                return eps_val, False
+
             # For each year, take the lower (more conservative) EPS value
             annual_eps = {}
             for fy, eps_list in all_eps_data.items():
+                # Try to correct scale errors first
+                corrected_eps = []
+                for e in eps_list:
+                    new_val, was_corrected = correct_eps_value(e['eps'])
+                    if was_corrected:
+                        print(f"[SEC] Corrected {ticker} FY{fy} EPS: {e['eps']:,.0f} -> {new_val:.2f} (likely 1M scale error)")
+                    corrected_eps.append({**e, 'eps': new_val})
+
+                # Filter out still-unreasonable EPS values
+                valid_eps = [e for e in corrected_eps if abs(e['eps']) <= MAX_REASONABLE_EPS]
+                if not valid_eps:
+                    print(f"[SEC] Warning: All EPS values for {ticker} FY{fy} exceed sanity check (values: {[e['eps'] for e in eps_list]})")
+                    continue
                 # Sort by EPS value (ascending) and take the lowest
-                eps_list.sort(key=lambda x: x['eps'])
-                annual_eps[fy] = eps_list[0]
+                valid_eps.sort(key=lambda x: x['eps'])
+                annual_eps[fy] = valid_eps[0]
 
             # Sort by year descending
             sorted_eps = sorted(annual_eps.values(), key=lambda x: x['year'], reverse=True)

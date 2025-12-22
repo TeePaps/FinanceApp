@@ -145,3 +145,56 @@ def get_annual_dividend(ticker):
         return 0, []
 
 
+def get_company_name(ticker):
+    """
+    Get the company name for a ticker, trying multiple sources.
+
+    Args:
+        ticker: Stock ticker symbol
+
+    Returns:
+        Company name string, falls back to ticker if not found
+    """
+    # Lazy imports to avoid circular dependencies
+    import database as db
+    import sec_data
+
+    ticker_upper = ticker.upper()
+
+    # 1. Try database valuations table first
+    try:
+        valuation = db.get_valuation(ticker_upper)
+        if valuation and valuation.get('company_name'):
+            company_name = valuation['company_name']
+            # Only use if it's different from ticker
+            if company_name != ticker_upper:
+                return company_name
+    except Exception:
+        pass
+
+    # 2. Try yfinance provider via orchestrator
+    if _HAS_PROVIDERS:
+        try:
+            orchestrator = get_orchestrator()
+            result = orchestrator.fetch_stock_info(ticker_upper)
+            if result.success and result.data and result.data.company_name:
+                company_name = result.data.company_name
+                if company_name != ticker_upper:
+                    return company_name
+        except Exception:
+            pass
+
+    # 3. Try SEC data
+    try:
+        sec_result = sec_data.get_sec_eps(ticker_upper)
+        if sec_result and sec_result.get('company_name'):
+            company_name = sec_result['company_name']
+            if company_name != ticker_upper:
+                return company_name
+    except Exception:
+        pass
+
+    # 4. Fall back to ticker
+    return ticker_upper
+
+

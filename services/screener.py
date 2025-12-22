@@ -246,6 +246,12 @@ def calculate_valuation(ticker):
             fifty_two_week_high = 0
             fifty_two_week_low = 0
 
+        # If company_name equals ticker or is empty, it's a fallback - try SEC data
+        if not company_name or company_name == ticker:
+            sec_eps = sec_data.get_sec_eps(ticker)
+            if sec_eps and sec_eps.get('company_name'):
+                company_name = sec_eps['company_name']
+
         price_result = orchestrator.fetch_price(ticker)
         current_price = price_result.data if price_result.success else 0
         price_source = price_result.source if price_result.success else 'none'
@@ -264,7 +270,8 @@ def calculate_valuation(ticker):
 
         eps_data, eps_source, validation_info = get_validated_eps(ticker)
 
-        if eps_source.startswith('sec'):
+        # If we still don't have a proper company name and we have SEC EPS data, try again
+        if (not company_name or company_name == ticker) and eps_source.startswith('sec'):
             sec_eps = sec_data.get_sec_eps(ticker)
             if sec_eps and sec_eps.get('company_name'):
                 company_name = sec_eps['company_name']
@@ -768,6 +775,17 @@ def run_quick_price_update(index_name='all'):
                 annual_dividend = existing.get('annual_dividend', 0)
                 fifty_two_week_high = existing.get('fifty_two_week_high')
                 company_name = existing.get('company_name', ticker)
+
+                # Try to refresh bad company names (where company_name == ticker)
+                if company_name == ticker:
+                    try:
+                        info_result = orchestrator.fetch_stock_info(ticker)
+                        if info_result.success and info_result.data:
+                            fetched_name = info_result.data.company_name
+                            if fetched_name and fetched_name != ticker:
+                                company_name = fetched_name
+                    except Exception:
+                        pass
 
                 off_high_pct = None
                 if fifty_two_week_high and fifty_two_week_high > 0:
