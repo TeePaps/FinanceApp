@@ -9,117 +9,147 @@ Handles:
 - POST /api/screener/update-dividends - Update dividend data
 """
 
-import os
 import json
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Blueprint, jsonify, request
 import database as db
 import data_manager
 import sec_data
-from config import (
-    DATA_DIR, EXCLUDED_TICKERS_FILE, TICKER_FAILURES_FILE,
-    FAILURE_THRESHOLD, VALID_INDICES
-)
+from config import FAILURE_THRESHOLD, VALID_INDICES, DIVIDEND_FETCH_DELAY
+from services.indexes import INDEX_NAMES
 from services.providers import get_orchestrator
+from services import screener as screener_service
+from services.screener import get_index_data
 
 data_bp = Blueprint('data', __name__, url_prefix='/api')
 
 
-def load_excluded_tickers():
-    """Load excluded tickers from cache file."""
-    if os.path.exists(EXCLUDED_TICKERS_FILE):
-        try:
-            with open(EXCLUDED_TICKERS_FILE, 'r') as f:
-                data = json.load(f)
-                return set(data.get('tickers', []))
-        except Exception:
-            pass
-    return set()
-
-
 def get_excluded_tickers_info():
-    """Get info about excluded tickers."""
-    result = {'tickers': [], 'count': 0, 'reason': 'none', 'updated': None, 'pending_failures': 0}
-    if os.path.exists(EXCLUDED_TICKERS_FILE):
-        try:
-            with open(EXCLUDED_TICKERS_FILE, 'r') as f:
-                data = json.load(f)
-                result.update(data)
-        except Exception:
-            pass
+    """Get info about excluded tickers from database."""
+    excluded = db.get_excluded_tickers(threshold=FAILURE_THRESHOLD)
 
-    # Also report pending failures
-    if os.path.exists(TICKER_FAILURES_FILE):
-        try:
-            with open(TICKER_FAILURES_FILE, 'r') as f:
-                failures = json.load(f)
-                pending = sum(1 for t, c in failures.items() if c < FAILURE_THRESHOLD)
-                result['pending_failures'] = pending
-        except Exception:
-            pass
+    # Count pending failures (tickers with some failures but not yet excluded)
+    pending_count = 0
+    with db.get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) FROM ticker_failures
+            WHERE failure_count > 0 AND failure_count < ?
+        ''', (FAILURE_THRESHOLD,))
+        result = cursor.fetchone()
+        if result:
+            pending_count = result[0]
 
-    return result
+    return {
+        'tickers': excluded,
+        'count': len(excluded),
+        'pending_failures': pending_count
+    }
 
 
 def clear_excluded_tickers():
-    """Clear the excluded tickers list and failure counts."""
-    if os.path.exists(EXCLUDED_TICKERS_FILE):
-        os.remove(EXCLUDED_TICKERS_FILE)
-    if os.path.exists(TICKER_FAILURES_FILE):
-        os.remove(TICKER_FAILURES_FILE)
+    """Clear the excluded tickers list and failure counts in database."""
+    with db.get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM ticker_failures')
 
 
 @data_bp.route('/data-status')
 def api_data_status():
-    """Get comprehensive data status report."""
-    valuations_data = data_manager.load_valuations()
-    all_valuations = valuations_data.get('valuations', {})
-    last_updated = valuations_data.get('last_updated')
+    """Get comprehensive data status for all datasets."""
+    # Get consolidated stats from data manager
+    dm_stats = data_manager.get_data_stats()
 
-    # Get SEC cache status
+    # SEC data status (from sec_data module for CIK info)
     sec_status = sec_data.get_cache_status()
+
+    # Index data status - use consolidated data
+    indices = []
+    for index_name in VALID_INDICES:
+        try:
+            # Get tickers for this index from status
+            index_tickers = data_manager.get_index_tickers(index_name)
+            total_tickers = len(index_tickers) if index_tickers else 0
+
+            # If no tickers in status, fall back to old index file
+            if total_tickers == 0:
+                data = get_index_data(index_name)
+                total_tickers = len(data.get('tickers', []))
+                index_tickers = data.get('tickers', [])
+
+            # Get valuations from consolidated storage
+            valuations = data_manager.get_valuations_for_index(index_name, index_tickers)
+            valuations_count = len(valuations)
+
+            # Count by EPS source
+            sec_source_count = sum(1 for v in valuations if v.get('eps_source') == 'sec')
+            yf_source_count = sum(1 for v in valuations if v.get('eps_source') == 'yfinance')
+
+            # Average EPS years
+            eps_years = [v.get('eps_years', 0) for v in valuations if v.get('eps_years')]
+            avg_eps_years = sum(eps_years) / len(eps_years) if eps_years else 0
+
+            # Get last updated from consolidated data
+            last_updated = None
+            if valuations:
+                updates = [v.get('updated') for v in valuations if v.get('updated')]
+                if updates:
+                    last_updated = max(updates)
+
+            indices.append({
+                'id': index_name,
+                'name': INDEX_NAMES.get(index_name, (index_name, index_name))[0],
+                'short_name': INDEX_NAMES.get(index_name, (index_name, index_name))[1],
+                'total_tickers': total_tickers,
+                'valuations_count': valuations_count,
+                'coverage_pct': round((valuations_count / total_tickers * 100) if total_tickers > 0 else 0, 1),
+                'sec_source_count': sec_source_count,
+                'yf_source_count': yf_source_count,
+                'avg_eps_years': round(avg_eps_years, 1),
+                'last_updated': last_updated
+            })
+        except Exception as e:
+            print(f"[DataStatus] Error loading {index_name}: {e}")
+
+    # Current refresh status
+    refresh_status = {
+        'running': screener_service.is_running(),
+        'progress': screener_service.get_progress()
+    }
+
+    # Load refresh summary from database
+    refresh_summary = None
+    try:
+        summary_str = db.get_metadata('refresh_summary')
+        if summary_str:
+            refresh_summary = json.loads(summary_str)
+    except Exception:
+        pass
 
     # Get excluded tickers info
     excluded_info = get_excluded_tickers_info()
 
-    # Calculate stats per index
-    index_stats = {}
-    for index_name in VALID_INDICES:
-        if index_name == 'all':
-            continue
-
-        tickers = data_manager.get_index_tickers(index_name)
-        if not tickers:
-            continue
-
-        total_tickers = len(tickers)
-        valuations_count = sum(1 for t in tickers if t in all_valuations)
-        with_eps = sum(1 for t in tickers if t in all_valuations and all_valuations[t].get('eps_avg'))
-        with_sec = sum(1 for t in tickers if t in all_valuations and all_valuations[t].get('eps_source', '').startswith('sec'))
-
-        index_stats[index_name] = {
-            'total_tickers': total_tickers,
-            'valuations_count': valuations_count,
-            'coverage_pct': round((valuations_count / total_tickers * 100) if total_tickers > 0 else 0, 1),
-            'with_eps': with_eps,
-            'with_sec_data': with_sec
-        }
-
-    # Overall stats
-    total_valuations = len(all_valuations)
-    with_eps = sum(1 for v in all_valuations.values() if v.get('eps_avg'))
-    with_sec = sum(1 for v in all_valuations.values() if v.get('eps_source', '').startswith('sec'))
-
     return jsonify({
-        'last_updated': last_updated,
-        'total_valuations': total_valuations,
-        'with_eps': with_eps,
-        'with_sec_data': with_sec,
-        'sec_cache': sec_status,
-        'excluded_tickers': excluded_info,
-        'index_stats': index_stats
+        'sec': {
+            'companies_cached': dm_stats['sec_available'],
+            'sec_unavailable': dm_stats['sec_unavailable'],
+            'sec_unknown': dm_stats['sec_unknown'],
+            'cik_mappings': sec_status.get('cik_mapping', {}).get('count', 0),
+            'cik_updated': sec_status.get('cik_mapping', {}).get('updated'),
+            'last_full_update': dm_stats.get('status_last_updated')
+        },
+        'indices': indices,
+        'consolidated': {
+            'total_tickers': dm_stats['total_tickers'],
+            'with_valuation': dm_stats['with_valuation'],
+            'status_updated': dm_stats['status_last_updated'],
+            'valuations_updated': dm_stats['valuations_last_updated']
+        },
+        'refresh': refresh_status,
+        'refresh_summary': refresh_summary,
+        'excluded_tickers': excluded_info
     })
 
 
@@ -163,12 +193,7 @@ def api_refresh_summary():
 @data_bp.route('/screener/update-dividends', methods=['POST'])
 def api_screener_update_dividends():
     """Quick update of just dividend data for cached stocks."""
-    # Import app module for screener state
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-    import app as app_module
-
-    if app_module.screener_running:
+    if screener_service.is_running():
         return jsonify({'error': 'Screener already running'}), 400
 
     req_data = request.get_json() or {}
@@ -177,7 +202,13 @@ def api_screener_update_dividends():
         index_name = 'all'
 
     def update_dividends(idx):
-        app_module.screener_running = True
+        # Use screener service state
+        screener_service._running = True
+        screener_service._progress.update({
+            'current': 0, 'total': 0,
+            'ticker': '', 'status': 'running',
+            'phase': 'dividends', 'index': idx
+        })
 
         if idx == 'all':
             valuations = data_manager.load_valuations().get('valuations', {})
@@ -185,19 +216,16 @@ def api_screener_update_dividends():
         else:
             tickers = list(data_manager.get_index_tickers(idx) or [])
 
-        app_module.screener_progress = {
-            'current': 0, 'total': len(tickers),
-            'ticker': '', 'status': 'running', 'index': idx
-        }
+        screener_service._progress['total'] = len(tickers)
 
         updates = {}
         for i, ticker in enumerate(tickers):
-            if not app_module.screener_running:
-                app_module.screener_progress['status'] = 'cancelled'
+            if not screener_service._running:
+                screener_service._progress['status'] = 'cancelled'
                 break
 
-            app_module.screener_progress['current'] = i + 1
-            app_module.screener_progress['ticker'] = ticker
+            screener_service._progress['current'] = i + 1
+            screener_service._progress['ticker'] = ticker
 
             try:
                 orchestrator = get_orchestrator()
@@ -207,7 +235,6 @@ def api_screener_update_dividends():
                     dividend_data_obj = result.data
                     annual_dividend = dividend_data_obj.annual_dividend
 
-                    # Get existing valuation to update
                     existing = data_manager.load_valuations().get('valuations', {}).get(ticker, {})
                     if existing:
                         eps_avg = existing.get('eps_avg', 0)
@@ -220,13 +247,13 @@ def api_screener_update_dividends():
             except Exception as e:
                 print(f"Error updating dividend for {ticker}: {e}")
 
-            time.sleep(0.3)
+            time.sleep(DIVIDEND_FETCH_DELAY)
 
         if updates:
             data_manager.bulk_update_valuations(updates)
 
-        app_module.screener_progress['status'] = 'complete'
-        app_module.screener_running = False
+        screener_service._progress['status'] = 'complete'
+        screener_service._running = False
 
     thread = threading.Thread(target=update_dividends, args=(index_name,))
     thread.daemon = True

@@ -16,16 +16,17 @@ import threading
 
 # Import database module for all operations
 import database as db
+from config import (
+    SEC_RATE_LIMIT, SEC_REQUEST_TIMEOUT,
+    SEC_CIK_CACHE_DAYS, SEC_EPS_CACHE_DAYS
+)
 
 # SEC requires User-Agent with contact info
 SEC_HEADERS = {'User-Agent': 'FinanceApp contact@example.com'}
 
-# Rate limiting: SEC allows 10 requests/second
-SEC_RATE_LIMIT = 0.12  # seconds between requests
-
-# Cache durations
-CIK_CACHE_DAYS = 7  # Refresh ticker->CIK mapping weekly
-EPS_CACHE_DAYS = 1  # Check for new filings daily
+# Use config values (aliased for backward compatibility)
+CIK_CACHE_DAYS = SEC_CIK_CACHE_DAYS
+EPS_CACHE_DAYS = SEC_EPS_CACHE_DAYS
 
 # Module state
 sec_update_running = False
@@ -79,7 +80,7 @@ def update_cik_mapping():
     try:
         rate_limit()
         url = "https://www.sec.gov/files/company_tickers.json"
-        response = requests.get(url, headers=SEC_HEADERS, timeout=30)
+        response = requests.get(url, headers=SEC_HEADERS, timeout=SEC_REQUEST_TIMEOUT)
 
         if response.status_code == 200:
             raw_data = response.json()
@@ -145,7 +146,7 @@ def fetch_company_eps(ticker, cik):
     try:
         rate_limit()
         url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        response = requests.get(url, headers=SEC_HEADERS, timeout=30)
+        response = requests.get(url, headers=SEC_HEADERS, timeout=SEC_REQUEST_TIMEOUT)
 
         if response.status_code == 200:
             data = response.json()
@@ -231,7 +232,7 @@ def fetch_company_metrics(ticker, cik):
     try:
         rate_limit()
         url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        response = requests.get(url, headers=SEC_HEADERS, timeout=30)
+        response = requests.get(url, headers=SEC_HEADERS, timeout=SEC_REQUEST_TIMEOUT)
 
         if response.status_code == 200:
             data = response.json()
@@ -764,7 +765,7 @@ def fetch_10k_filings(ticker, cik):
     try:
         rate_limit()
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        response = requests.get(url, headers=SEC_HEADERS, timeout=30)
+        response = requests.get(url, headers=SEC_HEADERS, timeout=SEC_REQUEST_TIMEOUT)
 
         if response.status_code != 200:
             print(f"[SEC] Failed to fetch submissions for {ticker}: {response.status_code}")

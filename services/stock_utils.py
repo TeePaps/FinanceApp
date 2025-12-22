@@ -1,21 +1,13 @@
 """
-Stock utilities and yfinance helpers.
+Stock utilities for data fetching.
 
 Provides:
 - Stock info fetching (PE ratio, market cap, sector, etc.)
-- Selloff metrics calculation (volume-based analysis)
-- EPS extraction from income statements
 - Dividend fetching
 - Price fetching (delegates to provider orchestrator)
 
-Price fetching uses the pluggable provider system (see services/providers/).
-Other utilities use yfinance directly for data not available through providers.
+All data fetching uses the pluggable provider system (see services/providers/).
 """
-
-import time
-import math
-from datetime import datetime, timedelta
-from config import PRICE_CACHE_DURATION
 
 # Import provider system (for orchestrator usage)
 try:
@@ -24,54 +16,13 @@ try:
 except ImportError:
     _HAS_PROVIDERS = False
 
-# Module-level price cache: {ticker: {'price': float, 'timestamp': float}}
-_price_cache = {}
-
 # Track persistent failures to avoid repeated API calls
 _persistent_failures = set()
-
-# Whether to use the provider orchestrator for price fetching
-USE_ORCHESTRATOR = True  # Set to False to use legacy behavior
-
-
-def _fetch_price_with_retries(ticker, max_retries=3):
-    """
-    Fetch price for a single ticker with multiple fallback methods.
-
-    Tries in order:
-    1. yfinance fast_info
-    2. yfinance history
-    3. Financial Modeling Prep (if API key configured)
-
-    Args:
-        ticker: Stock ticker symbol
-        max_retries: Number of retry attempts per method
-
-    Returns:
-        Tuple of (price, source) or (None, None) if all methods fail
-    """
-    # Use the provider orchestrator which handles fallbacks and logging
-    try:
-        from services.providers import get_orchestrator
-        orchestrator = get_orchestrator()
-        result = orchestrator.fetch_price(ticker, skip_cache=True)
-        if result.success and result.data and result.data > 0:
-            return float(result.data), result.source
-    except Exception:
-        pass
-
-    return None, None
 
 
 def fetch_stock_price(ticker):
     """
-    Fetch current stock price with caching and fallback sources.
-
-    If USE_ORCHESTRATOR is True, uses the provider system for data fetching.
-    Otherwise uses legacy behavior:
-    1. yfinance fast_info (fastest)
-    2. yfinance history (more reliable)
-    3. Financial Modeling Prep (if API key configured)
+    Fetch current stock price using the provider orchestrator.
 
     Args:
         ticker: Stock ticker symbol
@@ -79,43 +30,17 @@ def fetch_stock_price(ticker):
     Returns:
         Current price as float, or None if not available
     """
-    global _price_cache
-
-    # Use provider orchestrator if available
-    if USE_ORCHESTRATOR and _HAS_PROVIDERS:
-        try:
-            orchestrator = get_orchestrator()
-            result = orchestrator.fetch_price(ticker)
-            if result.success:
-                return result.data
-            return None
-        except Exception:
-            pass  # Fall through to legacy behavior
-
-    # Legacy behavior below
-
-    # Check cache first
-    if ticker in _price_cache:
-        cached = _price_cache[ticker]
-        if time.time() - cached['timestamp'] < PRICE_CACHE_DURATION:
-            return cached['price']
-
-    # Skip known persistent failures (delisted stocks, etc.)
-    if ticker in _persistent_failures:
+    if not _HAS_PROVIDERS:
         return None
 
-    # Use enhanced retry logic with fallbacks
-    price, source = _fetch_price_with_retries(ticker, max_retries=2)
-
-    if price:
-        _price_cache[ticker] = {
-            'price': price,
-            'timestamp': time.time(),
-            'source': source
-        }
-        return price
-
-    return None
+    try:
+        orchestrator = get_orchestrator()
+        result = orchestrator.fetch_price(ticker)
+        if result.success:
+            return result.data
+        return None
+    except Exception:
+        return None
 
 
 def mark_ticker_failed(ticker):
@@ -135,13 +60,7 @@ def get_failed_tickers():
 
 def fetch_multiple_prices(tickers):
     """
-    Fetch prices for multiple tickers with fallback sources.
-
-    If USE_ORCHESTRATOR is True, uses the provider system for data fetching.
-    Otherwise uses legacy behavior:
-    1. yfinance batch download (primary)
-    2. yfinance individual ticker (fast_info, then history)
-    3. Financial Modeling Prep API (if configured)
+    Fetch prices for multiple tickers using the provider orchestrator.
 
     Args:
         tickers: List of ticker symbols
@@ -149,31 +68,14 @@ def fetch_multiple_prices(tickers):
     Returns:
         Dict mapping ticker to price
     """
-    # Use provider orchestrator if available
-    if USE_ORCHESTRATOR and _HAS_PROVIDERS:
-        try:
-            orchestrator = get_orchestrator()
-            return orchestrator.fetch_prices(tickers)
-        except Exception:
-            pass  # Fall through to legacy behavior
+    if not _HAS_PROVIDERS:
+        return {}
 
-    # Legacy behavior - use orchestrator for individual tickers with local caching
-    global _price_cache
-    now = time.time()
-    cached_prices = {}
-
-    # Check cache and fetch remaining via orchestrator individually
-    for ticker in tickers:
-        if ticker in _price_cache and now - _price_cache[ticker]['timestamp'] < PRICE_CACHE_DURATION:
-            cached_prices[ticker] = _price_cache[ticker]['price']
-        elif ticker not in _persistent_failures:
-            # Use orchestrator for individual fetch (handles all provider fallbacks)
-            price, source = _fetch_price_with_retries(ticker, max_retries=2)
-            if price and price > 0:
-                _price_cache[ticker] = {'price': float(price), 'timestamp': now, 'source': source}
-                cached_prices[ticker] = float(price)
-
-    return cached_prices
+    try:
+        orchestrator = get_orchestrator()
+        return orchestrator.fetch_prices(tickers)
+    except Exception:
+        return {}
 
 
 def get_stock_info(ticker):
@@ -243,19 +145,3 @@ def get_annual_dividend(ticker):
         return 0, []
 
 
-def clear_price_cache():
-    """Clear the price cache."""
-    global _price_cache
-    _price_cache = {}
-
-
-def get_cache_stats():
-    """Get statistics about the price cache."""
-    now = time.time()
-    valid_entries = sum(1 for v in _price_cache.values()
-                       if now - v['timestamp'] < PRICE_CACHE_DURATION)
-    return {
-        'total_entries': len(_price_cache),
-        'valid_entries': valid_entries,
-        'expired_entries': len(_price_cache) - valid_entries
-    }

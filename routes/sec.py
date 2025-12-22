@@ -21,9 +21,13 @@ sec_bp = Blueprint('sec', __name__, url_prefix='/api')
 
 @sec_bp.route('/sec/status')
 def api_sec_status():
-    """Get SEC cache status."""
+    """Get SEC data cache status."""
     status = sec_data.get_cache_status()
-    return jsonify(status)
+    progress = sec_data.get_update_progress()
+    return jsonify({
+        'cache': status,
+        'update': progress
+    })
 
 
 @sec_bp.route('/sec/update', methods=['POST'])

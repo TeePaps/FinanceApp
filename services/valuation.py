@@ -91,7 +91,7 @@ def get_validated_eps(ticker):
     return [], 'none', validation_info
 
 
-def calculate_valuation(ticker, stock=None):
+def calculate_valuation(ticker):
     """
     Calculate stock valuation using EPS and dividend formula.
 
@@ -99,7 +99,6 @@ def calculate_valuation(ticker, stock=None):
 
     Args:
         ticker: Stock ticker symbol
-        stock: Optional yfinance Ticker object (will be fetched if not provided)
 
     Returns:
         Dict with valuation data

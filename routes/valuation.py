@@ -45,10 +45,7 @@ def api_valuation_refresh(ticker):
     try:
         # Use provider system for price
         from services.providers import get_orchestrator
-        try:
-            from app import log_provider_activity
-        except ImportError:
-            log_provider_activity = lambda x: None
+        from services.screener import log_provider_activity
 
         orchestrator = get_orchestrator()
         log_provider_activity(f"Refreshing {ticker}...")
@@ -143,4 +140,4 @@ def api_valuation_refresh(ticker):
         })
 
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'error': str(e), 'ticker': ticker}), 500

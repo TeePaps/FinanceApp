@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 
 import yfinance as yf
 
+import config
+
 from .base import (
     PriceProvider, EPSProvider, DividendProvider, HistoricalPriceProvider, StockInfoProvider, SelloffProvider,
     ProviderResult, DataType, PriceData, EPSData, DividendData, HistoricalPriceData, StockInfoData, SelloffData
@@ -117,7 +119,7 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
             try:
                 # Add delay between chunks to avoid rate limiting
                 if i > 0:
-                    time.sleep(1.5)
+                    time.sleep(config.YAHOO_CHUNK_DELAY)
 
                 chunk_data = yf.download(chunk, period='1d', progress=False, threads=True)
 
@@ -330,7 +332,7 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
             try:
                 # Add delay between chunks to avoid rate limiting
                 if i > 0:
-                    time.sleep(0.5)
+                    time.sleep(config.YAHOO_HISTORY_BATCH_DELAY)
 
                 chunk_data = yf.download(chunk, period=period, progress=False, threads=True)
 

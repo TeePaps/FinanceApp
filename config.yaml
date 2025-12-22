@@ -1,0 +1,168 @@
+# ============================================================================
+# Finance App Configuration
+# ============================================================================
+# All configurable values in one place. Edit this file to tune the app.
+# The config.py module loads these values and exposes them as Python constants.
+
+# ============================================================================
+# Cache Settings
+# ============================================================================
+cache:
+  price_cache_duration: 300      # Seconds - how long to cache stock prices (5 min)
+  stale_data_hours: 24           # Hours before valuation data is considered stale
+
+# ============================================================================
+# Ticker Health / Exclusion
+# ============================================================================
+ticker_health:
+  failure_threshold: 3           # Consecutive failures before excluding a ticker
+
+# ============================================================================
+# Valuation Settings
+# ============================================================================
+valuation:
+  pe_ratio_multiplier: 10        # Fair value = (Avg EPS + Annual Dividend) * this
+  min_eps_years: 3               # Minimum years of EPS data required
+  recommended_eps_years: 8       # Recommended years for reliable valuation
+
+# ============================================================================
+# Recommendation Scoring
+# ============================================================================
+scoring:
+  weights:
+    undervaluation: 1.0          # Weight for undervaluation score
+    dividend: 1.5                # Weight for dividend score
+    selloff: 0.8                 # Weight for selloff/pullback score
+
+  dividend:
+    no_dividend_penalty: -30     # Penalty for stocks with no dividend
+    points_per_percent: 5        # Points per 1% dividend yield
+    max_points: 30               # Maximum dividend score
+
+  selloff_bonuses:
+    severe: 15
+    moderate: 10                 # Also used for 'high' severity
+    recent: 5
+
+  min_eps_years: 5               # Minimum EPS years to qualify for recommendations
+
+# ============================================================================
+# Sell Candidate Thresholds
+# ============================================================================
+sell_thresholds:
+  overvalued_percent: 10         # % above fair value to consider selling
+  gain_percent: 30               # % gain from cost basis to consider selling
+
+# ============================================================================
+# Selloff Detection Thresholds
+# ============================================================================
+selloff_detection:
+  # Severe selloff thresholds (price change %)
+  severe:
+    one_month: -15
+    three_month: -25
+
+  # Moderate selloff thresholds
+  moderate:
+    one_month: -10
+    three_month: -15
+
+  # Recent/mild selloff thresholds
+  recent:
+    one_month: -5
+    three_month: -8
+
+  # Volume-based severity (multiplier of normal volume)
+  volume:
+    severe: 3.0                  # 3x+ normal volume on down days
+    high: 2.0                    # 2x-3x normal volume
+    moderate: 1.5                # 1.5x-2x normal volume
+
+# ============================================================================
+# Rate Limiting & Delays (seconds)
+# ============================================================================
+rate_limits:
+  # Yahoo Finance
+  yahoo:
+    batch_size: 100              # Tickers per batch
+    batch_delay: 0.5             # Seconds between batches
+    single_delay: 0.3            # Seconds between single ticker requests
+    chunk_delay: 1.5             # Delay between 50-ticker chunks
+    history_batch_delay: 0.5     # Delay for price history batches
+
+  # Financial Modeling Prep (FMP)
+  fmp:
+    rate_limit: 0.2              # Default delay between requests
+    rate_limit_backoff: 5        # Wait time after 429 rate limit error
+    batch_interval: 0.2          # Delay between batch requests
+
+  # SEC EDGAR
+  sec:
+    rate_limit: 0.12             # Minimum seconds between requests (10 req/sec limit)
+    request_timeout: 30          # Timeout for SEC requests
+    cik_cache_days: 7            # Days to cache CIK lookups
+    eps_cache_days: 1            # Days to cache EPS data
+
+  # Interactive Brokers
+  ibkr:
+    poll_interval: 0.1           # Market data polling interval
+    snapshot_wait: 2             # Wait time for snapshot data
+
+  # Screener
+  screener:
+    dividend_backoff: 0.3        # Delay between dividend fetches
+    ticker_pause: 0.5            # Pause between ticker processing
+    price_delay: 0.2             # Delay between price fetches
+
+  # General
+  dividend_fetch_delay: 0.3      # Delay for dividend batch processing
+  eps_backoff_base: 2            # Base for exponential backoff (2^retry)
+
+# ============================================================================
+# Provider Settings
+# ============================================================================
+providers:
+  # Provider priority order (first = highest priority)
+  price_providers:
+    - ibkr
+    - yfinance
+    - alpaca
+    - fmp
+    - defeatbeta
+  eps_providers:
+    - sec_edgar
+    - yfinance
+    - defeatbeta
+  dividend_providers:
+    - yfinance
+  disabled_providers:
+    - fmp
+    - alpaca
+    - defeatbeta
+    - ibkr
+  price_cache_seconds: 3600      # 1 hour
+  eps_cache_days: 1
+  dividend_cache_days: 1
+
+  # Rate limiting
+  default_rate_limit: 0.2        # Seconds between requests
+
+  # Batch settings
+  batch_size: 100                # Max tickers per batch request
+  prefer_batch: true             # Prefer batch-capable providers
+
+  # Timeout settings
+  provider_timeout_seconds: 10   # Max time per provider call
+
+  # Circuit breaker
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 3         # Failures before opening circuit
+    failure_window_seconds: 300  # Window to count failures (5 min)
+    cooldown_seconds: 120        # Wait before retry (2 min)
+
+# ============================================================================
+# Index Provider Settings
+# ============================================================================
+index_providers:
+  request_timeout: 30            # Timeout for index provider requests

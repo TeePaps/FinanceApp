@@ -42,7 +42,7 @@ FinanceApp/
 │   ├── valuation.py       # Fair value calculations
 │   ├── recommendations.py # Scoring algorithm
 │   ├── holdings.py        # FIFO cost basis calculations
-│   └── stock_utils.py     # Misc utilities (some legacy yfinance)
+│   └── stock_utils.py     # Stock data utilities (uses provider system)
 │
 ├── routes/                # Flask blueprints (NOT CURRENTLY USED)
 │   └── *.py               # Prepared but disabled in app.py
@@ -132,19 +132,6 @@ from services.indexes import VALID_INDICES, INDEX_NAMES, fetch_index_tickers
 # Get list of tickers in an index
 tickers = fetch_index_tickers('sp500')
 ```
-
-## Legacy Code (Needs Migration)
-
-Direct `yfinance` calls still exist in these files:
-```
-app.py              # Multiple yf.Ticker() calls
-services/valuation.py
-routes/data.py
-routes/sec.py
-routes/valuation.py
-```
-
-These should eventually go through the provider system. When touching these files, consider migrating to use `get_orchestrator()`.
 
 ## Common Patterns
 

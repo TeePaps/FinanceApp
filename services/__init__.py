@@ -30,6 +30,16 @@ from .recommendations import (
 
 from .screener import (
     ScreenerService,
-    get_screener_progress,
-    is_screener_running
+    get_progress as get_screener_progress,  # Alias for backward compatibility
+    is_running as is_screener_running,  # Alias for backward compatibility
+    is_running,
+    get_progress,
+    stop,
+    get_provider_logs,
+    log_provider_activity,
+    run_screener,
+    run_quick_price_update,
+    run_smart_update,
+    run_global_refresh,
+    get_all_ticker_indexes
 )
