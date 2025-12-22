@@ -44,8 +44,8 @@ FinanceApp/
 │   ├── holdings.py        # FIFO cost basis calculations
 │   └── stock_utils.py     # Stock data utilities (uses provider system)
 │
-├── routes/                # Flask blueprints (NOT CURRENTLY USED)
-│   └── *.py               # Prepared but disabled in app.py
+├── routes/                # Flask blueprints (registered via register_blueprints())
+│   └── *.py               # API route handlers
 │
 ├── data_public/           # Market data (public.db, can be rebuilt)
 ├── data_private/          # User data (private.db, API keys, BACKUP THIS)
@@ -196,7 +196,7 @@ db.bulk_update_valuations({"AAPL": {...}, "GOOGL": {...}})
 
 1. **app.py is huge** - 2000+ lines, routes should move to blueprints
 2. **Two config files** - `config.py` (app) vs `services/providers/config.py` (providers)
-3. **Blueprints disabled** - Routes in `routes/` exist but aren't registered
+3. **Blueprints active** - Routes in `routes/` are registered via `register_blueprints()`
 4. **No tests** - Manual testing only
 5. **yfinance is fragile** - Often changes API, breaks things
 6. **SEC rate limit** - 10 req/sec, be careful with batch operations

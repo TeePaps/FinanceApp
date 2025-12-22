@@ -173,5 +173,5 @@ def api_recommendations():
     # Get ticker-to-index mapping from service
     ticker_indexes = screener_service.get_all_ticker_indexes()
 
-    result = get_top_recommendations(all_valuations, ticker_indexes, limit=10)
+    result = get_top_recommendations(all_valuations, ticker_indexes, limit=10, filter_by_index=True)
     return jsonify(result)
