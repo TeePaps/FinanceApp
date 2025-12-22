@@ -64,7 +64,7 @@ logs/
 # Node.js (playwright-mcp)
 # =============================================================================
 node_modules/
-playwright-mcp/node_modules/
+playwright-mcp/
 .playwright-mcp/
 
 # =============================================================================
