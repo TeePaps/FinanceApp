@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 from datetime import datetime
 from threading import Lock
 
+import config
 from .base import PriceProvider, ProviderResult, PriceData, DataType
 from .secrets import get_secret
 
@@ -25,6 +26,8 @@ DEFAULT_PORT = 7497  # TWS default; use 4001 for IB Gateway
 DEFAULT_CLIENT_ID = 10  # Use a unique client ID to avoid conflicts
 MARKET_DATA_TIMEOUT = 5  # Seconds to wait for market data
 IBKR_BATCH_SIZE = 50  # Max tickers per batch - IB has limits on concurrent requests
+IBKR_POLL_INTERVAL = config.IBKR_POLL_INTERVAL  # Interval for polling market data
+IBKR_SNAPSHOT_WAIT = config.IBKR_SNAPSHOT_WAIT  # Wait time for snapshot data
 
 
 def _get_ib_module():
@@ -281,7 +284,7 @@ class IBKRPriceProvider(PriceProvider):
                 return float((ticker.bid + ticker.ask) / 2)
 
             # Wait a bit and let IB process events
-            ib.sleep(0.1)
+            ib.sleep(IBKR_POLL_INTERVAL)
 
         return None
 
@@ -386,7 +389,7 @@ class IBKRPriceProvider(PriceProvider):
             pending = set(ticker_data.keys())
 
             while pending and (time.time() - start) < MARKET_DATA_TIMEOUT:
-                ib.sleep(0.1)
+                ib.sleep(IBKR_POLL_INTERVAL)
 
                 for symbol in list(pending):
                     ticker_obj, contract = ticker_data[symbol]
@@ -471,7 +474,7 @@ def validate_ibkr_connection(host: str = None, port: int = None, client_id: int 
                 ib.reqMarketDataType(3)  # Delayed data
                 # Use snapshot mode (True) for auto-cancel after receiving data
                 ticker = ib.reqMktData(contract, '', True, False)
-                ib.sleep(2)  # Wait for data
+                ib.sleep(IBKR_SNAPSHOT_WAIT)  # Wait for data
 
                 if ticker.last or ticker.close or (ticker.bid and ticker.ask):
                     # Snapshot auto-cancels, but call anyway for safety

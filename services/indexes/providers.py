@@ -14,6 +14,8 @@ import pandas as pd
 import requests
 from io import StringIO
 
+from config import INDEX_PROVIDER_TIMEOUT
+
 
 # =============================================================================
 # Data Classes
@@ -147,7 +149,7 @@ class WikipediaIndexProvider(IndexProvider):
         url, table_idx, col_name = self.INDEX_CONFIG[index_id]
 
         try:
-            resp = requests.get(url, headers=self.HEADERS, timeout=30)
+            resp = requests.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
             resp.raise_for_status()
 
             tables = pd.read_html(StringIO(resp.text))
@@ -236,7 +238,7 @@ class SlickchartsIndexProvider(IndexProvider):
         url, col_name = self.INDEX_CONFIG[index_id]
 
         try:
-            resp = requests.get(url, headers=self.HEADERS, timeout=30)
+            resp = requests.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
             resp.raise_for_status()
 
             tables = pd.read_html(StringIO(resp.text))
@@ -328,7 +330,7 @@ class iSharesIndexProvider(IndexProvider):
         url, ticker_col = self.ETF_CONFIG[index_id]
 
         try:
-            resp = requests.get(url, headers=self.HEADERS, timeout=30)
+            resp = requests.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
             resp.raise_for_status()
 
             # iShares CSV has metadata rows at the top
@@ -434,7 +436,7 @@ class GitHubIndexProvider(IndexProvider):
         url, col_name, last_update = self.INDEX_CONFIG[index_id]
 
         try:
-            resp = requests.get(url, headers=self.HEADERS, timeout=30)
+            resp = requests.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
             resp.raise_for_status()
 
             df = pd.read_csv(StringIO(resp.text))

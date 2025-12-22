@@ -9,6 +9,7 @@ import time
 import requests
 from typing import Dict, List
 
+import config
 from .base import PriceProvider, ProviderResult
 from .secrets import get_fmp_api_key
 
@@ -205,8 +206,8 @@ class FMPPriceProvider(PriceProvider):
 
                 if response.status_code == 429:
                     # Rate limit - wait and retry
-                    print("[FMP] Rate limit hit, waiting 5s...")
-                    time.sleep(5)
+                    print(f"[FMP] Rate limit hit, waiting {config.FMP_RATE_LIMIT_BACKOFF}s...")
+                    time.sleep(config.FMP_RATE_LIMIT_BACKOFF)
                     continue
 
                 if response.status_code != 200:
@@ -266,7 +267,7 @@ class FMPPriceProvider(PriceProvider):
 
                 # Rate limiting between batches
                 if i + FMP_BATCH_SIZE < len(tickers):
-                    time.sleep(0.2)
+                    time.sleep(config.FMP_BATCH_INTERVAL)
 
             # Mark any remaining tickers as failed
             for ticker in tickers:

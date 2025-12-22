@@ -75,17 +75,6 @@ def load_ticker_status() -> Dict:
         }
 
 
-def save_ticker_status(data: Dict):
-    """
-    Save ticker status data.
-
-    For backward compatibility - updates database from dict structure.
-    """
-    tickers = data.get('tickers', {})
-    if tickers:
-        db.bulk_update_ticker_status(tickers)
-
-
 def get_ticker_info(ticker: str) -> Optional[Dict]:
     """Get status info for a single ticker."""
     return db.get_ticker_info(ticker)
@@ -147,17 +136,6 @@ def load_valuations() -> Dict:
         'last_updated': latest,
         'version': 1
     }
-
-
-def save_valuations(data: Dict):
-    """
-    Save consolidated valuations.
-
-    For backward compatibility - updates database from dict structure.
-    """
-    valuations = data.get('valuations', {})
-    if valuations:
-        db.bulk_update_valuations(valuations)
 
 
 def get_valuation(ticker: str) -> Optional[Dict]:

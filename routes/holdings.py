@@ -102,8 +102,8 @@ def api_holdings_analysis():
             'price_vs_value': price_vs_value,
             'avg_cost': round(avg_cost, 2) if avg_cost else None,
             'gain_pct': round(gain_pct, 1) if gain_pct else None,
-            'annual_dividend': val.get('annual_dividend', 0),
-            'dividend_yield': round((val.get('annual_dividend', 0) / current_price * 100), 2) if current_price and current_price > 0 else 0,
+            'annual_dividend': val.get('annual_dividend') or 0,
+            'dividend_yield': round(((val.get('annual_dividend') or 0) / current_price * 100), 2) if current_price and current_price > 0 else 0,
             'updated': val.get('updated')
         }
         enriched_holdings[ticker] = enriched
