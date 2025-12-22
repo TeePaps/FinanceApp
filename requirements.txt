@@ -1,9 +1,19 @@
-flask==3.0.0
-yfinance
-python-dateutil
-alpaca-py
-requests
-defeatbeta-api
+# Core dependencies
+flask>=3.0.0
+yfinance>=0.2.0
+requests>=2.28.0
+python-dateutil>=2.8.0
+ruamel.yaml>=0.18.0
+
+# Required for index provider HTML parsing (pd.read_html)
+pandas>=2.0.0
+lxml>=4.9.0
+
+# Optional: Alpaca Markets provider (requires API key)
+# alpaca-py>=0.10.0
+
+# Optional: DefeatBeta provider (no API key required)
+# defeatbeta-api>=0.0.20
 
 # Optional: Interactive Brokers support (requires TWS or IB Gateway running)
-# ib_async
+# ib_async>=2.0.0
