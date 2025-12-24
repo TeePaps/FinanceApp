@@ -42,6 +42,8 @@ class ProviderRegistry:
             DataType.DIVIDEND: [],
             DataType.STOCK_INFO: [],
             DataType.SELLOFF: [],
+            DataType.SEC_METRICS: [],
+            DataType.FILINGS: [],
         }
 
     def register(self, provider: BaseProvider):
@@ -370,8 +372,8 @@ class DataOrchestrator:
             try:
                 # Log provider attempt
                 try:
-                    from app import log_provider_activity
-                    log_provider_activity(f"Trying {provider.name} for {ticker}...")
+                    from services.activity_log import activity_log
+                    activity_log.log("info", provider.name, f"Trying {ticker}...")
                 except Exception:
                     pass
 
@@ -388,8 +390,8 @@ class DataOrchestrator:
 
                     # Log success
                     try:
-                        from app import log_provider_activity
-                        log_provider_activity(f"✓ {provider.name}: {ticker} = ${result.data:.2f}")
+                        from services.activity_log import activity_log
+                        activity_log.log("success", provider.name, f"{ticker} = ${result.data:.2f}")
                     except ImportError:
                         pass
 
@@ -402,8 +404,8 @@ class DataOrchestrator:
 
                     # Log failure
                     try:
-                        from app import log_provider_activity
-                        log_provider_activity(f"✗ {provider.name}: {ticker} failed")
+                        from services.activity_log import activity_log
+                        activity_log.log("warning", provider.name, f"{ticker} failed")
                     except ImportError:
                         pass
 
@@ -413,8 +415,8 @@ class DataOrchestrator:
                 # Timeout - record as failure
                 self._record_provider_failure(provider)
                 try:
-                    from app import log_provider_activity
-                    log_provider_activity(f"✗ {provider.name}: {ticker} timeout")
+                    from services.activity_log import activity_log
+                    activity_log.log("error", provider.name, f"{ticker} timeout")
                 except ImportError:
                     pass
                 errors.append(f"{provider.name}: {str(e)}")
@@ -423,8 +425,8 @@ class DataOrchestrator:
                 # Other exception - record as failure
                 self._record_provider_failure(provider)
                 try:
-                    from app import log_provider_activity
-                    log_provider_activity(f"✗ {provider.name}: {ticker} error")
+                    from services.activity_log import activity_log
+                    activity_log.log("error", provider.name, f"{ticker} error")
                 except ImportError:
                     pass
                 errors.append(f"{provider.name}: {str(e)}")
@@ -490,12 +492,14 @@ class DataOrchestrator:
                 self._rate_limit(provider)
 
                 if provider.supports_batch:
-                    # Batch fetch with timeout
-                    try:
-                        from app import log_provider_activity
-                        log_provider_activity(f"Trying {provider.name} for {len(remaining)} tickers...")
-                    except ImportError:
-                        pass
+                    # Batch fetch with timeout - only log for large batches (screener)
+                    # Small fetches (1-5 tickers) are usually UI lookups, log them more quietly
+                    if len(remaining) > 5:
+                        try:
+                            from services.activity_log import activity_log
+                            activity_log.log("info", provider.name, f"Fetching prices for {len(remaining)} tickers...")
+                        except ImportError:
+                            pass
 
                     # Use longer timeout for batch (scales with ticker count)
                     batch_timeout = self.config.provider_timeout_seconds * max(1, len(remaining) // 50)
@@ -514,15 +518,16 @@ class DataOrchestrator:
                                 remaining.remove(ticker)
                             success_count += 1
 
-                    # Log batch results
-                    try:
-                        from app import log_provider_activity
-                        if success_count > 0:
-                            log_provider_activity(f"✓ {provider.name}: {success_count} prices fetched")
-                        else:
-                            log_provider_activity(f"✗ {provider.name}: batch returned no data")
-                    except ImportError:
-                        pass
+                    # Log batch results - only log for large batches (screener operations)
+                    if len(tickers) > 5:
+                        try:
+                            from services.activity_log import activity_log
+                            if success_count > 0:
+                                activity_log.log("success", provider.name, f"{success_count} prices fetched")
+                            else:
+                                activity_log.log("warning", provider.name, "batch returned no data")
+                        except ImportError:
+                            pass
 
                     # Record success/failure based on batch results
                     if success_count > 0:
@@ -567,16 +572,16 @@ class DataOrchestrator:
             except TimeoutError as e:
                 self._record_provider_failure(provider)
                 try:
-                    from app import log_provider_activity
-                    log_provider_activity(f"✗ {provider.name}: batch timeout")
+                    from services.activity_log import activity_log
+                    activity_log.log("error", provider.name, "batch timeout")
                 except ImportError:
                     pass
 
             except Exception as e:
                 self._record_provider_failure(provider)
                 try:
-                    from app import log_provider_activity
-                    log_provider_activity(f"✗ {provider.name}: error - {str(e)}")
+                    from services.activity_log import activity_log
+                    activity_log.log("error", provider.name, f"error - {str(e)}")
                 except ImportError:
                     pass
 
@@ -870,8 +875,8 @@ class DataOrchestrator:
 
                 # Log provider attempt
                 try:
-                    from app import log_provider_activity
-                    log_provider_activity(f"Trying {provider.name} for {ticker}...")
+                    from services.activity_log import activity_log
+                    activity_log.log("info", provider.name, f"Trying {ticker}...")
                 except ImportError:
                     pass
 
@@ -883,8 +888,8 @@ class DataOrchestrator:
                 if result.success:
                     self._record_provider_success(provider)
                     try:
-                        from app import log_provider_activity
-                        log_provider_activity(f"✓ {provider.name}: {ticker} history OK")
+                        from services.activity_log import activity_log
+                        activity_log.log("success", provider.name, f"{ticker} history OK")
                     except ImportError:
                         pass
                     return result
@@ -892,8 +897,8 @@ class DataOrchestrator:
                     self._record_provider_failure(provider)
                     errors.append(f"{provider.name}: {result.error}")
                     try:
-                        from app import log_provider_activity
-                        log_provider_activity(f"✗ {provider.name}: {ticker} failed")
+                        from services.activity_log import activity_log
+                        activity_log.log("warning", provider.name, f"{ticker} failed")
                     except ImportError:
                         pass
 
@@ -955,13 +960,6 @@ class DataOrchestrator:
             try:
                 self._rate_limit(provider)
 
-                # Log provider attempt
-                try:
-                    from app import log_provider_activity
-                    log_provider_activity(f"Fetching {period} history for {len(remaining)} tickers via {provider.name}...")
-                except ImportError:
-                    pass
-
                 if provider.supports_batch:
                     # Use longer timeout for batch (scales with ticker count)
                     batch_timeout = self.config.provider_timeout_seconds * max(1, len(remaining) // 20)
@@ -980,11 +978,11 @@ class DataOrchestrator:
 
                     # Log result
                     try:
-                        from app import log_provider_activity
+                        from services.activity_log import activity_log
                         if success_count > 0:
-                            log_provider_activity(f"✓ {provider.name}: {success_count} tickers history OK")
+                            activity_log.log("success", provider.name, f"{success_count} tickers history OK")
                         else:
-                            log_provider_activity(f"✗ {provider.name}: no history data returned")
+                            activity_log.log("warning", provider.name, "no history data returned")
                     except ImportError:
                         pass
 
@@ -1027,16 +1025,16 @@ class DataOrchestrator:
             except TimeoutError as e:
                 self._record_provider_failure(provider)
                 try:
-                    from app import log_provider_activity
-                    log_provider_activity(f"✗ {provider.name}: history batch timeout")
+                    from services.activity_log import activity_log
+                    activity_log.log("error", provider.name, "history batch timeout")
                 except ImportError:
                     pass
 
             except Exception as e:
                 self._record_provider_failure(provider)
                 try:
-                    from app import log_provider_activity
-                    log_provider_activity(f"✗ {provider.name}: history error - {str(e)[:30]}")
+                    from services.activity_log import activity_log
+                    activity_log.log("error", provider.name, f"history error - {str(e)[:30]}")
                 except ImportError:
                     pass
 
@@ -1118,6 +1116,83 @@ class DataOrchestrator:
                 stats['sources'][source] = stats['sources'].get(source, 0) + count
 
         return stats
+
+    # SEC-specific methods
+    # These provide access to SEC data through the orchestrator
+
+    def fetch_sec_metrics(self, ticker: str) -> 'ProviderResult':
+        """
+        Fetch SEC metrics (multi-year EPS matrix + dividends) for a ticker.
+
+        Args:
+            ticker: Stock ticker symbol
+
+        Returns:
+            ProviderResult with SECMetricsData
+        """
+        from .sec_provider import SECEPSProvider
+
+        provider = self.registry.get_provider("sec_edgar")
+        if not provider:
+            return ProviderResult(
+                success=False,
+                data=None,
+                source="none",
+                error="SEC provider not available"
+            )
+
+        return provider.fetch_metrics(ticker)
+
+    def fetch_filings(self, ticker: str) -> 'ProviderResult':
+        """
+        Fetch 10-K filing URLs for a ticker.
+
+        Args:
+            ticker: Stock ticker symbol
+
+        Returns:
+            ProviderResult with FilingsData
+        """
+        provider = self.registry.get_provider("sec_edgar")
+        if not provider:
+            return ProviderResult(
+                success=False,
+                data=None,
+                source="none",
+                error="SEC provider not available"
+            )
+
+        return provider.fetch_filings(ticker)
+
+    def get_sec_cache_status(self) -> Dict:
+        """Get SEC data cache statistics."""
+        from .sec_provider import SECEPSProvider
+        return SECEPSProvider.get_cache_status()
+
+    def get_sec_update_progress(self) -> Dict:
+        """Get SEC background update progress."""
+        from .sec_provider import SECEPSProvider
+        return SECEPSProvider.get_update_progress()
+
+    def start_sec_background_update(self, tickers: List[str]) -> bool:
+        """Start SEC background update for tickers."""
+        from .sec_provider import SECEPSProvider
+        return SECEPSProvider.start_background_update(tickers)
+
+    def stop_sec_background_update(self) -> None:
+        """Stop SEC background update."""
+        from .sec_provider import SECEPSProvider
+        SECEPSProvider.stop_background_update()
+
+    def get_eps_update_recommendations(self) -> Dict:
+        """Get recommendations for which tickers need EPS updates."""
+        from .sec_provider import SECEPSProvider
+        return SECEPSProvider.get_eps_update_recommendations()
+
+    def check_sec_startup(self, tickers: List[str]) -> None:
+        """Run SEC startup checks and background updates if needed."""
+        from .sec_provider import SECEPSProvider
+        SECEPSProvider.check_and_update_on_startup(tickers)
 
 
 # Global instances

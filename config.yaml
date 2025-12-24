@@ -124,10 +124,10 @@ rate_limits:
 providers:
   # Provider priority order (first = highest priority)
   price_providers:
+    - fmp
     - ibkr
     - yfinance
     - alpaca
-    - fmp
     - defeatbeta
   eps_providers:
     - sec_edgar
@@ -136,7 +136,6 @@ providers:
   dividend_providers:
     - yfinance
   disabled_providers:
-    - fmp
     - alpaca
     - defeatbeta
     - ibkr

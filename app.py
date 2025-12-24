@@ -5,10 +5,11 @@ import json
 from datetime import datetime, timedelta
 import math
 import threading
-import sec_data
 import data_manager
+from data_manager import get_all_unique_tickers, get_index_data, get_all_ticker_indexes
 import database as db
-from logger import log, log_yahoo_fetch, log_screener_progress, log_error
+from logger import log
+from services.utils import sanitize_for_json
 from services.providers import (
     init_providers, get_orchestrator, get_registry,
     get_config, update_config, get_provider_order, set_provider_order,
@@ -51,9 +52,9 @@ startup_check_done = False
 # These are kept for backward compatibility with any code still referencing them
 from services import screener as screener_service
 from services.screener import (
-    log_provider_activity, get_provider_logs,
     run_screener, run_quick_price_update, run_smart_update, run_global_refresh
 )
+from services.activity_log import activity_log
 
 # Excluded tickers management (delisted/unavailable)
 # Uses failure counting - only excludes after FAILURE_THRESHOLD consecutive failures
@@ -162,35 +163,6 @@ def get_excluded_tickers_info():
     result['pending_failures'] = pending
     return result
 
-def fetch_stock_price(ticker):
-    """Fetch current stock price using the provider system."""
-    orchestrator = get_orchestrator()
-    result = orchestrator.fetch_price(ticker)
-    if result.success:
-        return result.data
-    return None
-
-def fetch_multiple_prices(tickers):
-    """Fetch prices for multiple tickers using the provider system.
-
-    Uses the configured provider priority order with automatic fallbacks.
-    Caching is handled by the orchestrator.
-    """
-    start_time = time.time()
-
-    # Use the provider orchestrator for fetching
-    orchestrator = get_orchestrator()
-    prices = orchestrator.fetch_prices(tickers)
-
-    duration = time.time() - start_time
-    success_count = len(prices)
-    fail_count = len(tickers) - success_count
-
-    if tickers:
-        log.debug(f"fetch_multiple_prices: {len(tickers)} requested, {success_count} succeeded, {fail_count} failed in {duration:.2f}s")
-
-    return prices
-
 # Holdings functions (get_stocks, get_transactions, calculate_fifo_cost_basis, calculate_holdings)
 # now imported from services.holdings
 # get_validated_eps imported from services.valuation
@@ -228,32 +200,10 @@ def index():
 #   - /api/indexes/* (index settings)
 # =============================================================================
 
-def sanitize_for_json(obj):
-    """Replace NaN and Inf values with None for JSON compatibility"""
-    if isinstance(obj, dict):
-        return {k: sanitize_for_json(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [sanitize_for_json(item) for item in obj]
-    elif isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return None
-        return obj
-    return obj
-
 def fetch_index_tickers_from_web(index_name):
     """Fetch fresh index constituents from source (Wikipedia/GitHub)."""
     return fetch_index_tickers(index_name)
 
-
-def get_all_unique_tickers():
-    """Get all unique tickers across all enabled indexes (deduplicated)"""
-    all_tickers = set()
-    enabled_indexes = db.get_enabled_indexes()
-    for index_name in INDIVIDUAL_INDICES:
-        if index_name in enabled_indexes:
-            data = get_index_data(index_name)
-            all_tickers.update(data.get('tickers', []))
-    return sorted(list(all_tickers))
 
 def get_ticker_indexes(ticker):
     """Get list of enabled indexes a ticker belongs to"""
@@ -267,82 +217,6 @@ def get_ticker_indexes(ticker):
                 indexes.append(short_name)
     return indexes
 
-# Cache for ticker-to-index mapping (rebuilt when enabled indexes change)
-_ticker_index_cache = None
-_ticker_index_cache_enabled = None  # Track which indexes were enabled when cache was built
-
-def get_all_ticker_indexes():
-    """Get a mapping of all tickers to their enabled indexes (cached)"""
-    global _ticker_index_cache, _ticker_index_cache_enabled
-    enabled_indexes = db.get_enabled_indexes()
-    # Rebuild cache if enabled indexes changed
-    if _ticker_index_cache is None or _ticker_index_cache_enabled != enabled_indexes:
-        _ticker_index_cache = {}
-        _ticker_index_cache_enabled = enabled_indexes
-        for index_name in INDIVIDUAL_INDICES:
-            if index_name in enabled_indexes:
-                data = get_index_data(index_name)
-                short_name = INDEX_NAMES.get(index_name, (index_name, index_name))[1]
-                for ticker in data.get('tickers', []):
-                    if ticker not in _ticker_index_cache:
-                        _ticker_index_cache[ticker] = []
-                    _ticker_index_cache[ticker].append(short_name)
-    return _ticker_index_cache
-
-
-def get_index_data(index_name='all'):
-    """Load index data from database.
-    Uses centralized valuations from database.
-    Index ticker lists are stored in ticker_indexes table."""
-    if index_name not in VALID_INDICES:
-        index_name = 'all'
-
-    # Always load from centralized valuations storage
-    valuations_data = data_manager.load_valuations()
-    all_valuations = valuations_data.get('valuations', {})
-    last_updated = valuations_data.get('last_updated')
-
-    # Special handling for 'all' - combine all indexes
-    if index_name == 'all':
-        all_tickers = get_all_unique_tickers()
-        return {
-            'name': 'All Indexes',
-            'short_name': 'All',
-            'tickers': all_tickers,
-            'valuations': all_valuations,
-            'last_updated': last_updated
-        }
-
-    # Get tickers from database (excludes inactive/delisted)
-    tickers = db.get_active_index_tickers(index_name)
-
-    # If no tickers in database, fetch from web and store
-    if not tickers:
-        print(f"[Index] No tickers in database for {index_name}, fetching from web...")
-        tickers = fetch_index_tickers_from_web(index_name)
-        if tickers:
-            db.refresh_index_membership(index_name, tickers)
-
-    # Get index display names
-    name, short_name = INDEX_NAMES.get(index_name, (index_name, index_name))
-
-    # Filter centralized valuations to only include this index's tickers
-    index_tickers = set(tickers)
-    filtered_valuations = {
-        ticker: val for ticker, val in all_valuations.items()
-        if ticker in index_tickers
-    }
-
-    # Return with centralized valuations filtered by index
-    result = {
-        'name': name,
-        'short_name': short_name,
-        'tickers': tickers,
-        'valuations': filtered_valuations,
-        'last_updated': last_updated
-    }
-
-    return sanitize_for_json(result)
 
 def save_index_data(index_name, data):
     """Save index tickers to database"""
@@ -359,182 +233,8 @@ def get_sp500_data():
 def save_sp500_data(data):
     save_index_data('sp500', data)
 
-def calculate_valuation(ticker):
-    """Calculate valuation for a single ticker, returns dict or None on error"""
-    try:
-        # Fetch data using orchestrator
-        orchestrator = get_orchestrator()
-
-        # Get stock info (company name, 52-week high/low)
-        info_result = orchestrator.fetch_stock_info(ticker)
-        if info_result.success and info_result.data:
-            info_data = info_result.data
-            company_name = info_data.company_name
-            fifty_two_week_high = info_data.fifty_two_week_high or 0
-            fifty_two_week_low = info_data.fifty_two_week_low or 0
-        else:
-            company_name = ticker
-            fifty_two_week_high = 0
-            fifty_two_week_low = 0
-
-        # Fetch current price from provider system
-        price_result = orchestrator.fetch_price(ticker)
-        current_price = price_result.data if price_result.success else 0
-        price_source = price_result.source if price_result.success else 'none'
-
-        # Calculate % off 52-week high
-        off_high_pct = None
-        if fifty_two_week_high and current_price:
-            off_high_pct = ((current_price - fifty_two_week_high) / fifty_two_week_high) * 100
-
-        # Get recent price history for momentum using orchestrator
-        history_result = orchestrator.fetch_price_history(ticker, period='3mo')
-        price_change_1m = None
-        price_change_3m = None
-
-        if history_result.success and history_result.data:
-            price_data = history_result.data
-            price_change_1m = price_data.change_1m_pct
-            price_change_3m = price_data.change_3m_pct
-
-        # Get validated EPS data using orchestrator
-        eps_data, eps_source, validation_info = get_validated_eps(ticker)
-
-        # Use SEC company name if available and SEC data was used
-        if eps_source.startswith('sec'):
-            sec_eps = sec_data.get_sec_eps(ticker)
-            if sec_eps and sec_eps.get('company_name'):
-                company_name = sec_eps['company_name']
-
-        # Get dividends using orchestrator
-        dividend_result = orchestrator.fetch_dividends(ticker)
-        annual_dividend = 0
-        last_dividend = None
-        last_dividend_date = None
-
-        if dividend_result.success and dividend_result.data:
-            dividend_data = dividend_result.data
-            annual_dividend = dividend_data.annual_dividend
-            if dividend_data.payments and len(dividend_data.payments) > 0:
-                # Get last dividend from payments list
-                last_payment = dividend_data.payments[-1]
-                last_dividend_date = last_payment['date']
-                last_dividend = round(float(last_payment['amount']), 4)
-
-        # Calculate valuation: (Average EPS over up to 8 years + Annual Dividend) × 10
-        min_years_recommended = 8
-        eps_avg = None
-        estimated_value = None
-        price_vs_value = None
-
-        if len(eps_data) > 0 and current_price:
-            eps_avg = sum(e['eps'] for e in eps_data) / len(eps_data)
-            # Formula: (Average EPS + Annual Dividend) × 10
-            estimated_value = (eps_avg + annual_dividend) * 10
-            price_vs_value = ((current_price - estimated_value) / estimated_value) * 100 if estimated_value > 0 else None
-
-        # Determine if stock is in a selloff (>20% off high or >15% drop in 3 months)
-        in_selloff = False
-        selloff_severity = 'none'
-        if off_high_pct and off_high_pct < -30:
-            in_selloff = True
-            selloff_severity = 'severe'
-        elif off_high_pct and off_high_pct < -20:
-            in_selloff = True
-            selloff_severity = 'moderate'
-        elif price_change_3m and price_change_3m < -15:
-            in_selloff = True
-            selloff_severity = 'recent'
-
-        return {
-            'ticker': ticker,
-            'company_name': company_name,
-            'current_price': round(current_price, 2),
-            'eps_avg': round(eps_avg, 2) if eps_avg is not None else None,
-            'eps_years': len(eps_data),
-            'eps_source': eps_source,
-            'has_enough_years': len(eps_data) >= min_years_recommended,
-            'annual_dividend': round(annual_dividend, 2),
-            'last_dividend': last_dividend,
-            'last_dividend_date': last_dividend_date,
-            'estimated_value': round(estimated_value, 2) if estimated_value else None,
-            'price_vs_value': round(price_vs_value, 1) if price_vs_value else None,
-            'fifty_two_week_high': round(fifty_two_week_high, 2) if fifty_two_week_high else None,
-            'fifty_two_week_low': round(fifty_two_week_low, 2) if fifty_two_week_low else None,
-            'off_high_pct': round(off_high_pct, 1) if off_high_pct else None,
-            'price_change_1m': round(price_change_1m, 1) if price_change_1m else None,
-            'price_change_3m': round(price_change_3m, 1) if price_change_3m else None,
-            'in_selloff': in_selloff,
-            'selloff_severity': selloff_severity,
-            'updated': datetime.now().isoformat()
-        }
-    except Exception as e:
-        print(f"Error calculating valuation for {ticker}: {e}")
-
-    return None
-
-def fetch_eps_for_ticker(ticker, existing_valuation=None, retry_count=0):
-    """Fetch EPS and dividend data for a single ticker (used in parallel processing)"""
-    max_retries = 2
-    try:
-        # Get company name from orchestrator
-        orchestrator = get_orchestrator()
-        info_result = orchestrator.fetch_stock_info(ticker)
-        if info_result.success and info_result.data:
-            company_name = info_result.data.company_name
-        else:
-            company_name = ticker
-
-        # Get validated EPS data using orchestrator
-        eps_data, eps_source, validation_info = get_validated_eps(ticker)
-
-        # Get company name (prefer SEC if available)
-        if eps_source.startswith('sec'):
-            sec_eps = sec_data.get_sec_eps(ticker)
-            if sec_eps and sec_eps.get('company_name'):
-                company_name = sec_eps['company_name']
-
-        # Get dividends using orchestrator
-        dividend_result = orchestrator.fetch_dividends(ticker)
-        annual_dividend = 0
-        last_dividend = None
-        last_dividend_date = None
-
-        if dividend_result.success and dividend_result.data:
-            dividend_data = dividend_result.data
-            annual_dividend = dividend_data.annual_dividend
-            if dividend_data.payments and len(dividend_data.payments) > 0:
-                # Get last dividend from payments list
-                last_payment = dividend_data.payments[-1]
-                last_dividend_date = last_payment['date']
-                last_dividend = round(float(last_payment['amount']), 4)
-
-        # Calculate EPS average
-        eps_avg = None
-        if len(eps_data) > 0:
-            eps_avg = sum(e['eps'] for e in eps_data) / len(eps_data)
-
-        return {
-            'ticker': ticker,
-            'company_name': company_name,
-            'eps_avg': round(eps_avg, 2) if eps_avg is not None else None,
-            'eps_years': len(eps_data),
-            'eps_source': eps_source,
-            'has_enough_years': len(eps_data) >= 8,
-            'annual_dividend': round(annual_dividend, 2),
-            'last_dividend': last_dividend,
-            'last_dividend_date': last_dividend_date,
-        }
-    except Exception as e:
-        error_msg = str(e).lower()
-        if 'rate' in error_msg or 'too many' in error_msg or '429' in error_msg:
-            if retry_count < max_retries:
-                time.sleep(2 ** retry_count)
-                return fetch_eps_for_ticker(ticker, existing_valuation, retry_count + 1)
-            return {'error': 'rate_limited', 'ticker': ticker}
-        print(f"Error fetching EPS for {ticker}: {e}")
-        return None
-
+# calculate_valuation() removed - now imported from services.valuation
+# All valuation calculation is centralized in services/valuation.py
 
 @app.route('/api/orphans')
 def api_get_orphans():
@@ -718,8 +418,11 @@ def api_all_tickers():
 @app.route('/api/sec-filings/<ticker>')
 def api_sec_filings(ticker):
     """Get 10-K filing URLs for a specific ticker"""
-    filings = sec_data.get_10k_filings(ticker.upper())
-    return jsonify(filings)
+    orchestrator = get_orchestrator()
+    result = orchestrator.fetch_filings(ticker.upper())
+    if result.success and result.data:
+        return jsonify(result.data.filings)
+    return jsonify([])
 
 
 @app.route('/api/logs')
@@ -1008,8 +711,11 @@ def check_startup_tasks():
             sp500_data = get_sp500_data()
             tickers = sp500_data.get('tickers', [])
             # Run in a separate thread to not block the request
+            def sec_startup_check(ticker_list):
+                orchestrator = get_orchestrator()
+                orchestrator.check_sec_startup(ticker_list)
             thread = threading.Thread(
-                target=sec_data.check_and_update_on_startup,
+                target=sec_startup_check,
                 args=(tickers,)
             )
             thread.daemon = True

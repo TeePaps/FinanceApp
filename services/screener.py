@@ -14,25 +14,26 @@ import os
 import time
 import json
 import threading
-import tempfile
-import fcntl
 import math
 from datetime import datetime, timedelta
 
 import database as db
 import data_manager
-import sec_data
+# Note: get_index_data, get_all_unique_tickers imports are done lazily inside functions
+# to avoid circular imports (database -> services.indexes -> services -> screener -> data_manager)
 from config import (
     PE_RATIO_MULTIPLIER, FAILURE_THRESHOLD,
     SCREENER_DIVIDEND_BACKOFF, SCREENER_TICKER_PAUSE, SCREENER_PRICE_DELAY
 )
 from logger import log, log_error
 from services.providers import get_orchestrator
-from services.valuation import get_validated_eps
+from services.valuation import get_validated_eps, calculate_valuation
 from services.indexes import (
     VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES,
     fetch_index_tickers
 )
+from services.activity_log import activity_log
+from services.utils import sanitize_for_json
 
 # =============================================================================
 # MODULE STATE
@@ -49,10 +50,6 @@ _progress = {
     'index': 'all',
     'index_name': 'All'
 }
-
-# Provider logging - using temp file for cross-process sharing (Flask debug reloader)
-PROVIDER_LOG_FILE = os.path.join(tempfile.gettempdir(), 'finance_provider_logs.txt')
-PROVIDER_LOG_MAX_LINES = 10
 
 
 # =============================================================================
@@ -82,111 +79,8 @@ def get_current_index():
 
 
 # =============================================================================
-# PROVIDER LOGGING
-# =============================================================================
-
-def log_provider_activity(message: str):
-    """Log provider activity for UI display (shared across Flask processes)."""
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    log_entry = f"[{timestamp}] {message}"
-    print(f"[ProviderLog] {log_entry}", flush=True)
-
-    try:
-        with open(PROVIDER_LOG_FILE, 'a+') as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            f.seek(0)
-            lines = f.readlines()
-            lines.append(log_entry + '\n')
-            lines = lines[-PROVIDER_LOG_MAX_LINES:]
-            f.seek(0)
-            f.truncate()
-            f.writelines(lines)
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-    except Exception as e:
-        print(f"[ProviderLog] Error writing to log file: {e}", flush=True)
-
-
-def get_provider_logs():
-    """Read provider logs from shared file."""
-    try:
-        if os.path.exists(PROVIDER_LOG_FILE):
-            with open(PROVIDER_LOG_FILE, 'r') as f:
-                return [line.strip() for line in f.readlines() if line.strip()]
-    except Exception:
-        pass
-    return []
-
-
-# =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
-
-def sanitize_for_json(obj):
-    """Replace NaN and Inf values with None for JSON compatibility."""
-    if isinstance(obj, dict):
-        return {k: sanitize_for_json(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [sanitize_for_json(item) for item in obj]
-    elif isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return None
-        return obj
-    return obj
-
-
-def get_all_unique_tickers():
-    """Get all unique tickers across all enabled indexes (deduplicated)."""
-    all_tickers = set()
-    enabled_indexes = db.get_enabled_indexes()
-    for index_name in INDIVIDUAL_INDICES:
-        if index_name in enabled_indexes:
-            tickers = db.get_active_index_tickers(index_name)
-            all_tickers.update(tickers)
-    return sorted(list(all_tickers))
-
-
-def get_index_data(index_name='all'):
-    """Load index data from database."""
-    if index_name not in VALID_INDICES:
-        index_name = 'all'
-
-    valuations_data = data_manager.load_valuations()
-    all_valuations = valuations_data.get('valuations', {})
-    last_updated = valuations_data.get('last_updated')
-
-    if index_name == 'all':
-        all_tickers = get_all_unique_tickers()
-        return {
-            'name': 'All Indexes',
-            'short_name': 'All',
-            'tickers': all_tickers,
-            'valuations': all_valuations,
-            'last_updated': last_updated
-        }
-
-    tickers = db.get_active_index_tickers(index_name)
-
-    if not tickers:
-        print(f"[Index] No tickers in database for {index_name}, fetching from web...")
-        tickers = fetch_index_tickers(index_name)
-        if tickers:
-            db.refresh_index_membership(index_name, tickers)
-
-    name, short_name = INDEX_NAMES.get(index_name, (index_name, index_name))
-    index_tickers = set(tickers)
-    filtered_valuations = {
-        ticker: val for ticker, val in all_valuations.items()
-        if ticker in index_tickers
-    }
-
-    return sanitize_for_json({
-        'name': name,
-        'short_name': short_name,
-        'tickers': tickers,
-        'valuations': filtered_valuations,
-        'last_updated': last_updated
-    })
-
 
 def save_index_data(index_name, data):
     """Save index tickers to database."""
@@ -215,128 +109,8 @@ def record_ticker_failures(failed_tickers, successful_tickers):
     return newly_excluded
 
 
-def get_all_ticker_indexes():
-    """Get a mapping of all tickers to their enabled indexes."""
-    result = {}
-    enabled_indexes = db.get_enabled_indexes()
-    for index_name in INDIVIDUAL_INDICES:
-        if index_name in enabled_indexes:
-            tickers = db.get_active_index_tickers(index_name)
-            short_name = INDEX_NAMES.get(index_name, (index_name, index_name))[1]
-            for ticker in tickers:
-                if ticker not in result:
-                    result[ticker] = []
-                result[ticker].append(short_name)
-    return result
-
-
-def calculate_valuation(ticker):
-    """Calculate valuation for a single ticker."""
-    try:
-        orchestrator = get_orchestrator()
-
-        info_result = orchestrator.fetch_stock_info(ticker)
-        if info_result.success and info_result.data:
-            info_data = info_result.data
-            company_name = info_data.company_name
-            fifty_two_week_high = info_data.fifty_two_week_high or 0
-            fifty_two_week_low = info_data.fifty_two_week_low or 0
-        else:
-            company_name = ticker
-            fifty_two_week_high = 0
-            fifty_two_week_low = 0
-
-        # If company_name equals ticker or is empty, it's a fallback - try SEC data
-        if not company_name or company_name == ticker:
-            sec_eps = sec_data.get_sec_eps(ticker)
-            if sec_eps and sec_eps.get('company_name'):
-                company_name = sec_eps['company_name']
-
-        price_result = orchestrator.fetch_price(ticker)
-        current_price = price_result.data if price_result.success else 0
-        price_source = price_result.source if price_result.success else 'none'
-
-        off_high_pct = None
-        if fifty_two_week_high and current_price:
-            off_high_pct = ((current_price - fifty_two_week_high) / fifty_two_week_high) * 100
-
-        history_result = orchestrator.fetch_price_history(ticker, period='3mo')
-        price_change_1m = None
-        price_change_3m = None
-        if history_result.success and history_result.data:
-            price_data = history_result.data
-            price_change_1m = price_data.change_1m_pct
-            price_change_3m = price_data.change_3m_pct
-
-        eps_data, eps_source, validation_info = get_validated_eps(ticker)
-
-        # If we still don't have a proper company name and we have SEC EPS data, try again
-        if (not company_name or company_name == ticker) and eps_source.startswith('sec'):
-            sec_eps = sec_data.get_sec_eps(ticker)
-            if sec_eps and sec_eps.get('company_name'):
-                company_name = sec_eps['company_name']
-
-        dividend_result = orchestrator.fetch_dividends(ticker)
-        annual_dividend = 0
-        last_dividend = None
-        last_dividend_date = None
-
-        if dividend_result.success and dividend_result.data:
-            dividend_data_obj = dividend_result.data
-            annual_dividend = dividend_data_obj.annual_dividend
-            if dividend_data_obj.payments and len(dividend_data_obj.payments) > 0:
-                last_payment = dividend_data_obj.payments[-1]
-                last_dividend_date = last_payment['date']
-                last_dividend = round(float(last_payment['amount']), 4)
-
-        eps_avg = None
-        estimated_value = None
-        price_vs_value = None
-
-        if len(eps_data) > 0 and current_price:
-            eps_avg = sum(e['eps'] for e in eps_data) / len(eps_data)
-            estimated_value = (eps_avg + annual_dividend) * 10
-            price_vs_value = ((current_price - estimated_value) / estimated_value) * 100 if estimated_value > 0 else None
-
-        in_selloff = False
-        selloff_severity = 'none'
-        if off_high_pct and off_high_pct < -30:
-            in_selloff = True
-            selloff_severity = 'severe'
-        elif off_high_pct and off_high_pct < -20:
-            in_selloff = True
-            selloff_severity = 'moderate'
-        elif price_change_3m and price_change_3m < -15:
-            in_selloff = True
-            selloff_severity = 'recent'
-
-        return {
-            'ticker': ticker,
-            'company_name': company_name,
-            'current_price': round(current_price, 2),
-            'price_source': price_source,
-            'eps_avg': round(eps_avg, 2) if eps_avg is not None else None,
-            'eps_years': len(eps_data),
-            'eps_source': eps_source,
-            'has_enough_years': len(eps_data) >= 8,
-            'annual_dividend': round(annual_dividend, 2),
-            'last_dividend': last_dividend,
-            'last_dividend_date': last_dividend_date,
-            'estimated_value': round(estimated_value, 2) if estimated_value else None,
-            'price_vs_value': round(price_vs_value, 1) if price_vs_value else None,
-            'fifty_two_week_high': round(fifty_two_week_high, 2) if fifty_two_week_high else None,
-            'fifty_two_week_low': round(fifty_two_week_low, 2) if fifty_two_week_low else None,
-            'off_high_pct': round(off_high_pct, 1) if off_high_pct else None,
-            'price_change_1m': round(price_change_1m, 1) if price_change_1m else None,
-            'price_change_3m': round(price_change_3m, 1) if price_change_3m else None,
-            'in_selloff': in_selloff,
-            'selloff_severity': selloff_severity,
-            'updated': datetime.now().isoformat()
-        }
-    except Exception as e:
-        print(f"Error calculating valuation for {ticker}: {e}")
-    return None
-
+# calculate_valuation() now imported from services.valuation
+# All valuation calculation is centralized in services/valuation.py
 
 # =============================================================================
 # MAIN SCREENER FUNCTIONS
@@ -352,6 +126,7 @@ def run_screener(index_name='all'):
     """
     global _running, _progress, _current_index
     import numpy as np
+    from data_manager import get_index_data  # Lazy import to avoid circular dependency
 
     log.info(f"=== SCREENER STARTED for index '{index_name}' ===")
     start_time = time.time()
@@ -392,26 +167,28 @@ def run_screener(index_name='all'):
 
     # Phase 1: SEC EPS Data
     log.info("Screener Phase 1: Loading SEC EPS data...")
+    activity_log.log("info", "screener", f"Phase 1: Loading SEC EPS data for {len(tickers)} tickers...")
     phase1_start = time.time()
     _progress['phase'] = 'eps'
     _progress['ticker'] = 'Loading SEC EPS data...'
 
     eps_results = {}
     sec_hits = 0
+    orchestrator = get_orchestrator()
 
     for i, t in enumerate(tickers):
         if i % 100 == 0:
             _progress['current'] = i
             _progress['ticker'] = f'Loading SEC EPS... ({sec_hits} found)'
 
-        sec_eps = sec_data.get_sec_eps(t)
-        if sec_eps and sec_eps.get('eps_history'):
-            eps_history = sec_eps['eps_history']
+        sec_result = orchestrator.fetch_eps(t)
+        if sec_result.success and sec_result.data and sec_result.data.eps_history:
+            eps_history = sec_result.data.eps_history
             if len(eps_history) > 0:
                 eps_avg = sum(e['eps'] for e in eps_history) / len(eps_history)
                 eps_results[t] = {
                     'ticker': t,
-                    'company_name': sec_eps.get('company_name', t),
+                    'company_name': sec_result.data.company_name or t,
                     'eps_avg': round(eps_avg, 2),
                     'eps_years': len(eps_history),
                     'eps_source': 'sec',
@@ -427,6 +204,7 @@ def run_screener(index_name='all'):
 
     _progress['current'] = len(tickers)
     log.info(f"Screener Phase 1 complete: {time.time() - phase1_start:.1f}s, SEC EPS: {sec_hits} found")
+    activity_log.log("success", "screener", f"✓ Phase 1: SEC EPS loaded ({sec_hits} found)")
 
     if not _running:
         _progress['status'] = 'cancelled'
@@ -452,6 +230,7 @@ def run_screener(index_name='all'):
 
     if tickers_needing_dividends:
         log.info(f"Screener Phase 2: Fetching dividends for {len(tickers_needing_dividends)} tickers...")
+        activity_log.log("info", "screener", f"Phase 2: Fetching dividends for {len(tickers_needing_dividends)} tickers...")
         _progress['phase'] = 'dividends'
         _progress['total'] = len(tickers_needing_dividends)
         _progress['current'] = 0
@@ -465,6 +244,8 @@ def run_screener(index_name='all'):
             if i % 50 == 0:
                 _progress['current'] = i
                 _progress['ticker'] = f'Fetching dividends... {i}/{len(tickers_needing_dividends)}'
+                if i > 0:  # Don't duplicate the initial "Phase 2" message
+                    activity_log.log("info", "screener", f"Dividends: {i}/{len(tickers_needing_dividends)} ({dividend_count} found so far)")
 
             try:
                 orchestrator = get_orchestrator()
@@ -487,6 +268,7 @@ def run_screener(index_name='all'):
 
         _progress['current'] = len(tickers_needing_dividends)
         log.info(f"Screener Phase 2 complete: found dividends for {dividend_count} tickers")
+        activity_log.log("success", "screener", f"✓ Phase 2: Dividends fetched ({dividend_count} found)")
 
     if not _running:
         _progress['status'] = 'cancelled'
@@ -504,10 +286,10 @@ def run_screener(index_name='all'):
     info_cache = {}
 
     try:
-        log_provider_activity(f"Fetching 3mo history for {len(tickers)} tickers...")
+        activity_log.log("info", "screener", f"Phase 3: Fetching 3mo history for {len(tickers)} tickers...")
         orchestrator = get_orchestrator()
         history_results = orchestrator.fetch_price_history_batch(tickers, period='3mo')
-        log_provider_activity(f"✓ 3mo history: {len(history_results)} tickers downloaded")
+        activity_log.log("success", "screener", f"✓ 3mo history: {len(history_results)} tickers downloaded")
 
         failed_tickers = [t for t in tickers if t not in history_results]
         if failed_tickers:
@@ -535,6 +317,7 @@ def run_screener(index_name='all'):
 
     # Phase 4: Build valuations
     log.info("Screener Phase 4: Building valuations...")
+    activity_log.log("info", "screener", f"Phase 4: Building valuations...")
     _progress['phase'] = 'combining'
     _progress['ticker'] = 'Building valuations...'
 
@@ -673,6 +456,7 @@ def run_screener(index_name='all'):
         save_index_data(index_name, data)
 
     total_duration = time.time() - start_time
+    activity_log.log("success", "screener", f"✓ Complete: {len(valuations_batch)} valuations in {total_duration:.1f}s")
     log.info(f"=== SCREENER COMPLETE for '{index_name}': {len(valuations_batch)} valuations in {total_duration:.1f}s ===")
     _progress['status'] = 'complete'
     _running = False
@@ -683,6 +467,7 @@ def run_quick_price_update(index_name='all'):
     global _running, _progress, _current_index
     import numpy as np
     import pandas as pd
+    from data_manager import get_index_data  # Lazy import to avoid circular dependency
 
     log.info(f"=== QUICK PRICE UPDATE STARTED for '{index_name}' ===")
     start_time = time.time()
@@ -707,11 +492,13 @@ def run_quick_price_update(index_name='all'):
         'index': index_name, 'index_name': index_display_name
     }
 
+    activity_log.log("info", "screener", f"Quick Update: {len(tickers)} tickers ({index_display_name})")
+
     try:
-        log_provider_activity(f"Fetching 3mo history for {len(tickers)} tickers...")
+        activity_log.log("info", "screener", f"Phase 1: Fetching 3mo history...")
         orchestrator = get_orchestrator()
         history_results = orchestrator.fetch_price_history_batch(tickers, period='3mo')
-        log_provider_activity(f"✓ 3mo history: {len(history_results)} tickers downloaded")
+        activity_log.log("success", "screener", f"✓ 3mo history: {len(history_results)} tickers downloaded")
 
         if not history_results:
             _progress['status'] = 'complete'
@@ -743,16 +530,21 @@ def run_quick_price_update(index_name='all'):
         price_change_1m = pd.Series(price_change_1m_dict)
 
         price_sources_dict = {}
+        activity_log.log("info", "screener", f"Phase 2: Fetching real-time prices...")
         try:
             provider_prices, provider_sources = orchestrator.fetch_prices(tickers, skip_cache=True, return_sources=True)
+            realtime_count = 0
             for ticker, price in provider_prices.items():
                 if price and price > 0:
                     current_prices_dict[ticker] = float(price)
                     price_sources_dict[ticker] = provider_sources.get(ticker)
+                    realtime_count += 1
             current_prices = pd.Series(current_prices_dict)
-        except Exception:
-            pass
+            activity_log.log("success", "screener", f"✓ Real-time prices: {realtime_count} tickers updated")
+        except Exception as e:
+            activity_log.log("warning", "screener", f"Real-time prices failed: {str(e)[:50]}")
 
+        activity_log.log("info", "screener", f"Phase 3: Building valuations...")
         valuations_batch = {}
         updated_count = 0
 
@@ -841,6 +633,7 @@ def run_quick_price_update(index_name='all'):
         log_error(f"Quick Update failed", e)
 
     total_duration = time.time() - start_time
+    activity_log.log("success", "screener", f"✓ Complete: {updated_count} valuations updated in {total_duration:.1f}s")
     log.info(f"=== QUICK PRICE UPDATE COMPLETE for '{index_name}': {updated_count} updated in {total_duration:.1f}s ===")
     _progress['status'] = 'complete'
     _running = False
@@ -850,6 +643,7 @@ def run_smart_update(index_name='all'):
     """Smart update - prioritizes missing tickers, then updates prices for existing ones."""
     global _running, _progress, _current_index
     import pandas as pd
+    from data_manager import get_index_data  # Lazy import to avoid circular dependency
 
     log.info(f"=== SMART UPDATE STARTED for '{index_name}' ===")
     start_time = time.time()
@@ -875,7 +669,10 @@ def run_smart_update(index_name='all'):
         'phase': 'missing'
     }
 
+    activity_log.log("info", "screener", f"Smart Update: {len(missing_tickers)} new + {len(existing_tickers)} existing tickers")
+
     # Phase 1: Fetch full valuations for missing tickers
+    activity_log.log("info", "screener", f"Phase 1: Fetching full data for {len(missing_tickers)} new tickers...")
     for i, ticker in enumerate(missing_tickers):
         if not _running:
             _progress['status'] = 'cancelled'
@@ -884,6 +681,10 @@ def run_smart_update(index_name='all'):
         _progress['current'] = i + 1
         _progress['ticker'] = f"[NEW] {ticker}"
         _progress['phase'] = 'missing'
+
+        # Log progress every 25 tickers
+        if i > 0 and i % 25 == 0:
+            activity_log.log("info", "screener", f"New tickers: {i}/{len(missing_tickers)}")
 
         valuation = calculate_valuation(ticker)
         if valuation and valuation.get('current_price', 0) > 0:
@@ -895,16 +696,18 @@ def run_smart_update(index_name='all'):
 
         time.sleep(SCREENER_TICKER_PAUSE)
 
+    activity_log.log("success", "screener", f"✓ Phase 1: New tickers processed")
+
     # Phase 2: Quick price update for existing tickers
     if _running and existing_tickers:
         _progress['phase'] = 'prices'
         _progress['ticker'] = 'Batch downloading prices...'
 
         try:
-            log_provider_activity(f"Fetching 3mo history for {len(existing_tickers)} existing tickers...")
+            activity_log.log("info", "screener", f"Fetching 3mo history for {len(existing_tickers)} existing tickers...")
             orchestrator = get_orchestrator()
             history_results = orchestrator.fetch_price_history_batch(existing_tickers, period='3mo')
-            log_provider_activity(f"✓ 3mo history: {len(history_results)} tickers downloaded")
+            activity_log.log("success", "screener", f"✓ 3mo history: {len(history_results)} tickers downloaded")
 
             failed_tickers = [t for t in existing_tickers if t not in history_results]
             if failed_tickers:
@@ -1001,7 +804,11 @@ def run_smart_update(index_name='all'):
                         continue
 
         except Exception as e:
-            print(f"[Smart Update] Error in price phase: {e}")
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("error", "screener", f"Smart Update price phase error: {str(e)[:50]}")
+            except Exception:
+                pass
 
     if data.get('valuations'):
         data_manager.bulk_update_valuations(data['valuations'])
@@ -1010,6 +817,7 @@ def run_smart_update(index_name='all'):
         save_index_data(index_name, data)
 
     total_duration = time.time() - start_time
+    activity_log.log("success", "screener", f"✓ Smart Update complete in {total_duration:.1f}s")
     log.info(f"=== SMART UPDATE COMPLETE for '{index_name}' in {total_duration:.1f}s ===")
     _progress['status'] = 'complete'
     _running = False
@@ -1019,6 +827,7 @@ def run_global_refresh():
     """Global refresh across all indexes."""
     global _running, _progress
     import numpy as np
+    from data_manager import get_all_unique_tickers, get_index_data  # Lazy import
 
     _running = True
 
@@ -1044,7 +853,7 @@ def run_global_refresh():
         'phase': 'prices'
     }
 
-    print(f"[Refresh] Downloading prices for {total_tickers} tickers...")
+    activity_log.log("info", "screener", f"Downloading prices for {total_tickers} tickers...")
 
     current_prices_dict = {}
     price_change_1m_dict = {}
@@ -1052,10 +861,10 @@ def run_global_refresh():
     price_sources_dict = {}
 
     try:
-        log_provider_activity(f"Fetching 3mo history for {total_tickers} tickers...")
+        activity_log.log("info", "screener", f"Fetching 3mo history for {total_tickers} tickers...")
         orchestrator = get_orchestrator()
         history_results = orchestrator.fetch_price_history_batch(all_tickers, period='3mo')
-        log_provider_activity(f"✓ 3mo history: {len(history_results)} tickers downloaded")
+        activity_log.log("success", "screener", f"✓ 3mo history: {len(history_results)} tickers downloaded")
 
         if not _running:
             _progress['status'] = 'cancelled'
@@ -1083,7 +892,7 @@ def run_global_refresh():
             pass
 
     except Exception as e:
-        print(f"[Refresh] Error fetching price data: {e}")
+        activity_log.log("error", "screener", f"Error fetching price data: {str(e)[:50]}")
 
     # Retry failed tickers
     failed_tickers = [t for t in all_tickers if t not in current_prices_dict or
@@ -1091,6 +900,7 @@ def run_global_refresh():
 
     if failed_tickers:
         _progress['phase'] = 'retrying'
+        activity_log.log("info", "screener", f"Retrying {len(failed_tickers)} failed tickers...")
         retry_count = 0
         orchestrator = get_orchestrator()
         for i, ticker in enumerate(failed_tickers):
@@ -1099,6 +909,8 @@ def run_global_refresh():
             if i % 50 == 0:
                 _progress['current'] = i
                 _progress['ticker'] = f'Retrying... {i}/{len(failed_tickers)}'
+                if i > 0:
+                    activity_log.log("info", "screener", f"Retrying: {i}/{len(failed_tickers)} ({retry_count} recovered)")
 
             try:
                 result = orchestrator.fetch_price(ticker, skip_cache=True)
@@ -1109,12 +921,15 @@ def run_global_refresh():
             except Exception:
                 pass
 
+        activity_log.log("success", "screener", f"✓ Retry complete: {retry_count} recovered")
+
     # Build valuations
     _progress['phase'] = 'valuations'
     ticker_valuations = {}
     now_iso = datetime.now().isoformat()
 
     skip_reasons = {'no_price': [], 'success': [], 'success_no_eps': []}
+    orchestrator = get_orchestrator()
 
     for i, ticker in enumerate(all_tickers):
         if not _running:
@@ -1142,14 +957,14 @@ def run_global_refresh():
         eps_source = 'none'
         company_name = ticker
 
-        sec_eps = sec_data.get_sec_eps(ticker)
-        if sec_eps and sec_eps.get('eps_history'):
-            eps_history = sec_eps['eps_history']
+        sec_result = orchestrator.fetch_eps(ticker)
+        if sec_result.success and sec_result.data and sec_result.data.eps_history:
+            eps_history = sec_result.data.eps_history
             if len(eps_history) > 0:
                 eps_avg = sum(e['eps'] for e in eps_history) / len(eps_history)
                 eps_years = len(eps_history)
                 eps_source = 'sec'
-                company_name = sec_eps.get('company_name', ticker)
+                company_name = sec_result.data.company_name or ticker
 
         existing = existing_valuations.get(ticker, {})
         if eps_avg is None and existing.get('eps_avg'):
@@ -1249,7 +1064,7 @@ def run_global_refresh():
     _progress['status'] = 'complete'
     _progress['ticker'] = f'Done - {len(ticker_valuations)} valuations updated'
     _running = False
-    print(f"[Refresh] Complete - {len(ticker_valuations)} valuations saved")
+    activity_log.log("success", "screener", f"Refresh complete - {len(ticker_valuations)} valuations saved")
 
 
 # =============================================================================

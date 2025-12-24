@@ -129,7 +129,20 @@ class DefeatBetaPriceProvider(PriceProvider):
         tickers = [t.upper() for t in tickers]
         results = {}
 
+        # Log start for larger batches
+        if len(tickers) > 5:
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("info", "defeatbeta", f"Fetching prices for {len(tickers)} tickers...")
+            except Exception:
+                pass
+
         if not self.is_available():
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("error", "defeatbeta", "defeatbeta-api package not installed")
+            except Exception:
+                pass
             for ticker in tickers:
                 results[ticker] = ProviderResult(
                     success=False,
@@ -141,6 +154,18 @@ class DefeatBetaPriceProvider(PriceProvider):
 
         for ticker in tickers:
             results[ticker] = self.fetch_price(ticker)
+
+        # Log results for larger batches
+        if len(tickers) > 5:
+            success_count = sum(1 for r in results.values() if r.success)
+            try:
+                from services.activity_log import activity_log
+                if success_count > 0:
+                    activity_log.log("success", "defeatbeta", f"{success_count} prices fetched")
+                else:
+                    activity_log.log("warning", "defeatbeta", "batch returned no data")
+            except Exception:
+                pass
 
         return results
 
@@ -186,7 +211,18 @@ class DefeatBetaEPSProvider(EPSProvider):
         """
         ticker = ticker.upper()
 
+        try:
+            from services.activity_log import activity_log
+            activity_log.log("info", "defeatbeta", f"Fetching EPS for {ticker}...", ticker=ticker)
+        except Exception:
+            pass
+
         if not self.is_available():
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("error", "defeatbeta", "defeatbeta-api package not installed")
+            except Exception:
+                pass
             return ProviderResult(
                 success=False,
                 data=None,
@@ -327,6 +363,12 @@ class DefeatBetaEPSProvider(EPSProvider):
                 company_name=ticker  # DefeatBeta doesn't easily provide company name
             )
 
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("success", "defeatbeta", f"{ticker} EPS: {len(eps_history)} years", ticker=ticker)
+            except Exception:
+                pass
+
             return ProviderResult(
                 success=True,
                 data=eps_data,
@@ -334,6 +376,11 @@ class DefeatBetaEPSProvider(EPSProvider):
             )
 
         except Exception as e:
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("error", "defeatbeta", f"{ticker} error: {str(e)[:50]}", ticker=ticker)
+            except Exception:
+                pass
             return ProviderResult(
                 success=False,
                 data=None,

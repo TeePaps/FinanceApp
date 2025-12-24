@@ -411,7 +411,7 @@ def main():
     if dry_run:
         print("\n*** DRY RUN COMPLETE - Run without --dry-run to perform migration ***")
     else:
-        print(f"\nMigration complete! Database: {db.DATABASE_PATH}")
+        print(f"\nMigration complete! Database: {db.PUBLIC_DB_PATH}")
         if not skip_archive:
             print(f"Flat files archived to: {ARCHIVE_DIR}")
 

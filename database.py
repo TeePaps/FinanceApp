@@ -746,6 +746,70 @@ def get_undervalued_tickers(threshold: float = -20.0) -> List[Dict]:
         return results
 
 
+def get_valuations_missing_company_name(limit: Optional[int] = None, index_filter: Optional[str] = None) -> List[Dict]:
+    """
+    Get valuations where company_name equals ticker or is NULL.
+
+    Args:
+        limit: Maximum number of records to return
+        index_filter: If provided and not 'all', filter by index name
+
+    Returns:
+        List of dicts with 'ticker' and 'company_name' keys
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        if index_filter and index_filter != 'all':
+            # Get valuations for specific index where company_name = ticker or is NULL
+            query = '''
+                SELECT v.ticker, v.company_name
+                FROM valuations v
+                JOIN ticker_indexes ti ON v.ticker = ti.ticker
+                WHERE (v.company_name = v.ticker OR v.company_name IS NULL)
+                AND ti.index_name = ?
+            '''
+            params = [index_filter]
+            if limit:
+                query += ' LIMIT ?'
+                params.append(limit)
+            cursor.execute(query, params)
+        else:
+            # Get all valuations where company_name = ticker or is NULL
+            query = '''
+                SELECT ticker, company_name
+                FROM valuations
+                WHERE company_name = ticker OR company_name IS NULL
+            '''
+            params = []
+            if limit:
+                query += ' LIMIT ?'
+                params.append(limit)
+            cursor.execute(query, params)
+
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def update_valuation_company_name(ticker: str, company_name: str):
+    """Update company name for a valuation."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE valuations
+            SET company_name = ?
+            WHERE ticker = ?
+        ''', (company_name, ticker.upper()))
+
+
+def get_latest_valuation_timestamp() -> Optional[str]:
+    """Get the most recent valuation update timestamp."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT MAX(updated) as latest FROM valuations')
+        row = cursor.fetchone()
+        return row['latest'] if row else None
+
+
 def get_orphan_tickers() -> List[str]:
     """
     Get tickers that have valuations but are not active members of any index.
@@ -1132,6 +1196,33 @@ def get_excluded_tickers(threshold: int = 3) -> List[str]:
             SELECT ticker FROM ticker_failures WHERE failure_count >= ?
         ''', (threshold,))
         return [row['ticker'] for row in cursor.fetchall()]
+
+
+def get_ticker_failure_count(threshold: Optional[int] = None) -> int:
+    """
+    Get count of tickers with failures below the threshold.
+    If threshold is None, returns count of all tickers with failures.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if threshold is not None:
+            cursor.execute('''
+                SELECT COUNT(*) as count FROM ticker_failures
+                WHERE failure_count > 0 AND failure_count < ?
+            ''', (threshold,))
+        else:
+            cursor.execute('''
+                SELECT COUNT(*) as count FROM ticker_failures
+                WHERE failure_count > 0
+            ''')
+        return cursor.fetchone()['count']
+
+
+def clear_ticker_failures():
+    """Clear all entries from ticker_failures table."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM ticker_failures')
 
 
 def mark_ticker_delisted(ticker: str, delisted: bool = True):

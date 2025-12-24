@@ -163,7 +163,11 @@ class FMPPriceProvider(PriceProvider):
             else:
                 # Batch failed - might be subscription limitation
                 self._batch_available = False
-                print("[FMP] Batch endpoint not available, using individual requests")
+                try:
+                    from services.activity_log import activity_log
+                    activity_log.log("info", "fmp", "Batch endpoint not available, using individual requests")
+                except Exception:
+                    pass
 
         # Fall back to individual requests
         for ticker in tickers:
@@ -206,7 +210,11 @@ class FMPPriceProvider(PriceProvider):
 
                 if response.status_code == 429:
                     # Rate limit - wait and retry
-                    print(f"[FMP] Rate limit hit, waiting {config.FMP_RATE_LIMIT_BACKOFF}s...")
+                    try:
+                        from services.activity_log import activity_log
+                        activity_log.log("warning", "fmp", f"Rate limit hit, waiting {config.FMP_RATE_LIMIT_BACKOFF}s...")
+                    except Exception:
+                        pass
                     time.sleep(config.FMP_RATE_LIMIT_BACKOFF)
                     continue
 
@@ -284,7 +292,11 @@ class FMPPriceProvider(PriceProvider):
         except requests.Timeout:
             return None  # Fall back to individual
         except Exception as e:
-            print(f"[FMP] Batch error: {e}")
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("error", "fmp", f"Batch error: {str(e)[:50]}")
+            except Exception:
+                pass
             return None  # Fall back to individual
 
 

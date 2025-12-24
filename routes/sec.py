@@ -11,7 +11,6 @@ Handles:
 """
 
 from flask import Blueprint, jsonify, request
-import sec_data
 import data_manager
 from config import VALID_INDICES
 from services.providers import get_orchestrator
@@ -22,8 +21,9 @@ sec_bp = Blueprint('sec', __name__, url_prefix='/api')
 @sec_bp.route('/sec/status')
 def api_sec_status():
     """Get SEC data cache status."""
-    status = sec_data.get_cache_status()
-    progress = sec_data.get_update_progress()
+    orchestrator = get_orchestrator()
+    status = orchestrator.get_sec_cache_status()
+    progress = orchestrator.get_sec_update_progress()
     return jsonify({
         'cache': status,
         'update': progress
@@ -43,7 +43,8 @@ def api_sec_update():
     if not tickers:
         return jsonify({'error': 'No tickers to update'}), 400
 
-    success = sec_data.start_background_update(tickers)
+    orchestrator = get_orchestrator()
+    success = orchestrator.start_sec_background_update(tickers)
     if success:
         return jsonify({'status': 'started', 'ticker_count': len(tickers)})
     else:
@@ -53,14 +54,16 @@ def api_sec_update():
 @sec_bp.route('/sec/stop', methods=['POST'])
 def api_sec_stop():
     """Stop SEC data update."""
-    sec_data.stop_update()
+    orchestrator = get_orchestrator()
+    orchestrator.stop_sec_background_update()
     return jsonify({'status': 'stopped'})
 
 
 @sec_bp.route('/sec/progress')
 def api_sec_progress():
     """Get SEC update progress."""
-    progress = sec_data.get_update_progress()
+    orchestrator = get_orchestrator()
+    progress = orchestrator.get_sec_update_progress()
     return jsonify(progress)
 
 
@@ -68,10 +71,18 @@ def api_sec_progress():
 def api_sec_eps(ticker):
     """Get SEC EPS data for a ticker."""
     ticker = ticker.upper()
-    eps_data = sec_data.get_sec_eps(ticker)
+    orchestrator = get_orchestrator()
+    result = orchestrator.fetch_eps(ticker)
 
-    if not eps_data:
+    if not result.success or not result.data:
         return jsonify({'error': f'No SEC EPS data for {ticker}'}), 404
+
+    # Convert EPSData to dict format
+    eps_data = {
+        'ticker': result.data.ticker,
+        'company_name': result.data.company_name,
+        'eps_history': result.data.eps_history
+    }
 
     return jsonify(eps_data)
 
@@ -80,14 +91,20 @@ def api_sec_eps(ticker):
 def api_sec_compare(ticker):
     """Compare SEC vs yfinance EPS data."""
     ticker = ticker.upper()
+    orchestrator = get_orchestrator()
 
-    # Get SEC EPS
-    sec_eps = sec_data.get_sec_eps(ticker)
+    # Get SEC EPS via orchestrator
+    sec_result = orchestrator.fetch_eps(ticker)
+    sec_eps = None
+    if sec_result.success and sec_result.data:
+        sec_eps = {
+            'company_name': sec_result.data.company_name,
+            'eps_history': sec_result.data.eps_history
+        }
 
-    # Get yfinance EPS via orchestrator
+    # Get yfinance EPS via orchestrator (already uses it)
     yf_eps = {}
     try:
-        orchestrator = get_orchestrator()
         result = orchestrator.fetch_eps(ticker)
 
         if result.success and result.data:
