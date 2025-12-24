@@ -7,7 +7,6 @@ Handles:
 
 from flask import Blueprint, request, jsonify
 from services.providers import get_orchestrator
-import sec_data
 import database as db
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/api/admin')
@@ -47,29 +46,7 @@ def api_backfill_company_names():
 
     # Query valuations where company_name equals ticker OR is NULL
     try:
-        with db.get_public_db() as conn:
-            cursor = conn.cursor()
-
-            if index_name == 'all':
-                # Get all valuations where company_name = ticker or is NULL
-                cursor.execute('''
-                    SELECT ticker, company_name
-                    FROM valuations
-                    WHERE company_name = ticker OR company_name IS NULL
-                    LIMIT ?
-                ''', (limit,))
-            else:
-                # Get valuations for specific index where company_name = ticker or is NULL
-                cursor.execute('''
-                    SELECT v.ticker, v.company_name
-                    FROM valuations v
-                    JOIN ticker_indexes ti ON v.ticker = ti.ticker
-                    WHERE (v.company_name = v.ticker OR v.company_name IS NULL)
-                    AND ti.index_name = ?
-                    LIMIT ?
-                ''', (index_name, limit))
-
-            rows = cursor.fetchall()
+        rows = db.get_valuations_missing_company_name(limit=limit, index_filter=index_name)
     except Exception as e:
         return jsonify({'success': False, 'error': f'Database query failed: {str(e)}'}), 500
 
@@ -106,9 +83,9 @@ def api_backfill_company_names():
         # If yfinance failed, try SEC data
         if not company_name or company_name == ticker:
             try:
-                sec_result = sec_data.get_sec_eps(ticker)
-                if sec_result and sec_result.get('company_name'):
-                    company_name = sec_result['company_name']
+                sec_result = orchestrator.fetch_eps(ticker)
+                if sec_result.success and sec_result.data and sec_result.data.company_name:
+                    company_name = sec_result.data.company_name
                     source = 'sec'
             except Exception as e:
                 print(f"[Backfill] SEC failed for {ticker}: {e}")
@@ -117,13 +94,7 @@ def api_backfill_company_names():
         if company_name and company_name != ticker:
             try:
                 # Update just the company_name field
-                with db.get_public_db() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        UPDATE valuations
-                        SET company_name = ?
-                        WHERE ticker = ?
-                    ''', (company_name, ticker))
+                db.update_valuation_company_name(ticker, company_name)
 
                 updated += 1
                 details.append({

@@ -137,7 +137,7 @@ def fetch_index_tickers(index_id: str) -> List[str]:
     if result.success:
         return result.tickers
     else:
-        print(f"[IndexRegistry] Failed to fetch {index_id}: {result.error}")
+        # Error already logged in orchestrator
         return []
 
 

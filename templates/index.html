@@ -63,6 +63,7 @@
             <button class="tab-btn" onclick="showTab('screener')">Market Analysis</button>
             <button class="tab-btn" onclick="showTab('recommendations')">Recommendations</button>
             <button class="tab-btn" onclick="showTab('datasets')">Data Sets</button>
+            <button class="tab-btn" onclick="showTab('logs')">Log View</button>
         </nav>
 
         <div id="summary-tab" class="tab-content active">
@@ -316,10 +317,20 @@
                             <span id="refresh-count"></span>
                         </div>
                     </div>
-                    <!-- Provider activity log -->
-                    <div class="provider-logs" id="provider-logs">
-                        <div class="log-header">Provider Activity</div>
-                        <div class="log-content" id="log-content"></div>
+                    <!-- Activity Log Viewer -->
+                    <div class="activity-viewer" id="activity-viewer">
+                        <div class="activity-header">
+                            <span class="activity-title">Activity Log</span>
+                            <div class="activity-controls">
+                                <button class="activity-btn" onclick="progressManager.toggleAutoScroll()" title="Toggle auto-scroll">
+                                    <span id="autoscroll-icon">⬇️</span>
+                                </button>
+                                <button class="activity-btn" onclick="progressManager.clearLogs()" title="Clear logs">🗑️</button>
+                            </div>
+                        </div>
+                        <div class="activity-content" id="activity-content">
+                            <!-- Log entries will be added here by ProgressManager -->
+                        </div>
                     </div>
                     <button class="stop-btn" onclick="stopRefresh()">Stop Refresh</button>
                 </div>
@@ -428,6 +439,25 @@
                                 <tr><td colspan="9" class="loading">Loading tickers...</td></tr>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <div id="logs-tab" class="tab-content">
+            <section id="logs-section">
+                <div class="activity-viewer-full" id="activity-viewer-full">
+                    <div class="activity-header">
+                        <span class="activity-title">Activity Log</span>
+                        <div class="activity-controls">
+                            <button class="activity-btn" onclick="progressManager.toggleAutoScroll()" title="Toggle auto-scroll">
+                                <span id="autoscroll-icon-full">⬇️</span>
+                            </button>
+                            <button class="activity-btn" onclick="progressManager.clearLogs()" title="Clear logs">🗑️</button>
+                        </div>
+                    </div>
+                    <div class="activity-content-full" id="activity-content-full">
+                        <!-- Log entries will be added here by ProgressManager -->
                     </div>
                 </div>
             </section>

@@ -18,14 +18,12 @@ from .holdings import (
 
 from .valuation import (
     get_validated_eps,
-    calculate_valuation,
-    ValuationService
+    calculate_valuation
 )
 
 from .recommendations import (
     score_stock,
-    get_top_recommendations,
-    RecommendationService
+    get_top_recommendations
 )
 
 from .screener import (
@@ -35,11 +33,10 @@ from .screener import (
     is_running,
     get_progress,
     stop,
-    get_provider_logs,
-    log_provider_activity,
     run_screener,
     run_quick_price_update,
     run_smart_update,
-    run_global_refresh,
-    get_all_ticker_indexes
+    run_global_refresh
 )
+
+from .activity_log import activity_log

@@ -1,5 +1,15 @@
 # Claude Code Guide for FinanceApp
 
+## IMPORTANT: Refactoring Tasks
+
+When asked to refactor, move, or consolidate code:
+1. **ALWAYS grep for all usages** of any module/function before changing imports
+2. **Run the verification checklist** (see "Refactoring Rules" section) after changes
+3. **Test actual functionality**, not just syntax - run the screener smoke test
+
+If using subagents for refactoring, include this in the prompt:
+> "Before removing any import, grep for ALL usages of that module in the file (e.g., `grep -n 'module_name\\.' file.py`). After changes, run the verification checklist from CLAUDE.md."
+
 ## Project Overview
 
 A stock portfolio valuation app that fetches market data from multiple providers, calculates fair values, and recommends undervalued stocks. Two SQLite databases separate public market data from private holdings.
@@ -182,6 +192,52 @@ db.bulk_update_valuations({"AAPL": {...}, "GOOGL": {...}})
    print(result)
    "
    ```
+
+## Refactoring Rules
+
+When moving, consolidating, or removing code:
+
+### Before Removing Any Import
+```bash
+# Find ALL usages of the module, not just the functions being changed
+grep -n "module_name\." file.py
+```
+
+### Before Moving a Function
+1. Find all call sites: `grep -rn "function_name(" --include="*.py"`
+2. Check for module-level usages: `grep -n "module_name\." file.py`
+3. Update ALL import statements, not just the obvious ones
+
+### Circular Import Prevention
+- If A imports B and B needs something from A, use lazy imports inside functions
+- BUT keep module-level `import X` if other parts of the file use `X.other_function()`
+- Only make specific function imports lazy: `from X import func` → move inside function
+
+### Verification Checklist
+After any refactor, run these in order:
+```bash
+# 1. Syntax check all modified files
+./venv/bin/python -m py_compile file1.py file2.py ...
+
+# 2. Import check (catches circular imports)
+./venv/bin/python -c "import app"
+
+# 3. Functional smoke test (catches missing references)
+./venv/bin/python -c "
+from services.screener import run_screener
+from data_manager import get_index_data
+data = get_index_data('sp500')
+print(f'Loaded {len(data.get(\"tickers\", []))} tickers')
+"
+
+# 4. Run the app and test affected features manually
+./venv/bin/python app.py
+```
+
+### Common Mistakes
+- Removing `import module` when only specific `from module import func` should be lazy
+- Not checking for `module.other_function()` calls when making imports lazy
+- Testing only imports, not actual functionality
 
 ## Key Configuration (config.py)
 

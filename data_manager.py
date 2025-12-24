@@ -126,10 +126,7 @@ def load_valuations() -> Dict:
     valuations = db.get_all_valuations()
 
     # Get last updated
-    with db.get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT MAX(updated) as latest FROM valuations')
-        latest = cursor.fetchone()['latest']
+    latest = db.get_latest_valuation_timestamp()
 
     return {
         'valuations': valuations,
@@ -209,3 +206,108 @@ def refresh_index_membership(index_name: str, current_tickers: List[str]) -> Dic
     Returns dict with 'added', 'removed', 'total' counts.
     """
     return db.refresh_index_membership(index_name, current_tickers)
+
+
+# --- Helper Functions for Index Data Access ---
+
+def get_all_unique_tickers() -> List[str]:
+    """Get all unique tickers across all enabled indexes (deduplicated)."""
+    all_tickers = set()
+    enabled_indexes = db.get_enabled_indexes()
+    for index_name in INDIVIDUAL_INDICES:
+        if index_name in enabled_indexes:
+            tickers = db.get_active_index_tickers(index_name)
+            all_tickers.update(tickers)
+    return sorted(list(all_tickers))
+
+
+def get_index_data(index_name: str = 'all') -> Dict:
+    """
+    Load index data from database.
+    Uses centralized valuations from database.
+    Index ticker lists are stored in ticker_indexes table.
+
+    Returns dict with: name, short_name, tickers, valuations, last_updated
+    """
+    from services.utils import sanitize_for_json
+
+    if index_name not in VALID_INDICES:
+        index_name = 'all'
+
+    # Always load from centralized valuations storage
+    valuations_data = load_valuations()
+    all_valuations = valuations_data.get('valuations', {})
+    last_updated = valuations_data.get('last_updated')
+
+    # Special handling for 'all' - combine all indexes
+    if index_name == 'all':
+        all_tickers = get_all_unique_tickers()
+        return {
+            'name': 'All Indexes',
+            'short_name': 'All',
+            'tickers': all_tickers,
+            'valuations': all_valuations,
+            'last_updated': last_updated
+        }
+
+    # Get tickers from database (excludes inactive/delisted)
+    tickers = db.get_active_index_tickers(index_name)
+
+    # If no tickers in database, fetch from web and store
+    if not tickers:
+        print(f"[Index] No tickers in database for {index_name}, fetching from web...")
+        from services.indexes import fetch_index_tickers
+        tickers = fetch_index_tickers(index_name)
+        if tickers:
+            db.refresh_index_membership(index_name, tickers)
+
+    # Get index display names
+    name, short_name = INDEX_NAMES.get(index_name, (index_name, index_name))
+
+    # Filter centralized valuations to only include this index's tickers
+    index_tickers = set(tickers)
+    filtered_valuations = {
+        ticker: val for ticker, val in all_valuations.items()
+        if ticker in index_tickers
+    }
+
+    # Return with centralized valuations filtered by index
+    result = {
+        'name': name,
+        'short_name': short_name,
+        'tickers': tickers,
+        'valuations': filtered_valuations,
+        'last_updated': last_updated
+    }
+
+    return sanitize_for_json(result)
+
+
+# Cache for ticker-to-index mapping (rebuilt when enabled indexes change)
+_ticker_index_cache = None
+_ticker_index_cache_enabled = None  # Track which indexes were enabled when cache was built
+
+
+def get_all_ticker_indexes() -> Dict[str, List[str]]:
+    """
+    Get a mapping of all tickers to their enabled indexes (cached).
+
+    Returns dict mapping ticker -> list of short index names.
+    """
+    global _ticker_index_cache, _ticker_index_cache_enabled
+    enabled_indexes = db.get_enabled_indexes()
+
+    # Rebuild cache if enabled indexes changed
+    if _ticker_index_cache is None or _ticker_index_cache_enabled != enabled_indexes:
+        _ticker_index_cache = {}
+        _ticker_index_cache_enabled = enabled_indexes
+        for index_name in INDIVIDUAL_INDICES:
+            if index_name in enabled_indexes:
+                tickers = db.get_active_index_tickers(index_name)
+                short_name = INDEX_NAMES.get(index_name, (index_name, index_name))[1]
+                for ticker in tickers:
+                    if ticker not in _ticker_index_cache:
+                        _ticker_index_cache[ticker] = []
+                    _ticker_index_cache[ticker].append(short_name)
+
+    return _ticker_index_cache

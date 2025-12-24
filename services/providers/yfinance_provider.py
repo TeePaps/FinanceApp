@@ -103,6 +103,8 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
     def fetch_prices(self, tickers: List[str]) -> Dict[str, ProviderResult]:
         """Batch fetch prices using yf.download() with chunking to avoid rate limits."""
         import time
+        from services.activity_log import activity_log
+
         tickers = [t.upper() for t in tickers]
         results = {}
 
@@ -112,15 +114,20 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
         # Chunk tickers to avoid rate limits (50 at a time with longer delay)
         chunk_size = 50
         all_data = None
+        total_chunks = (len(tickers) + chunk_size - 1) // chunk_size
 
         for i in range(0, len(tickers), chunk_size):
             chunk = tickers[i:i + chunk_size]
+            chunk_num = i // chunk_size + 1
 
             try:
                 # Add delay between chunks to avoid rate limiting
                 if i > 0:
                     time.sleep(config.YAHOO_CHUNK_DELAY)
 
+                # Only log chunk progress for larger batches (screener operations)
+                if len(tickers) > 5:
+                    activity_log.log("info", "yfinance", f"Prices: chunk {chunk_num}/{total_chunks} ({len(chunk)} tickers)...")
                 chunk_data = yf.download(chunk, period='1d', progress=False, threads=True)
 
                 if not chunk_data.empty:
@@ -130,10 +137,14 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                         # Merge chunk data - for MultiIndex columns, concat works
                         import pandas as pd
                         all_data = pd.concat([all_data, chunk_data], axis=1)
+                else:
+                    if len(tickers) > 5:
+                        activity_log.log("warning", "yfinance", f"Chunk {chunk_num}/{total_chunks} returned empty")
 
             except Exception as e:
                 # Log but continue with other chunks
-                print(f"[yfinance] Chunk {i//chunk_size + 1} failed: {e}")
+                if len(tickers) > 5:
+                    activity_log.log("error", "yfinance", f"Chunk {chunk_num}/{total_chunks} failed: {str(e)[:50]}")
                 continue
 
         data = all_data if all_data is not None else None
@@ -316,6 +327,8 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
         """Batch fetch historical prices using yf.download() with chunking to avoid rate limits."""
         import time
         import pandas as pd
+        from services.activity_log import activity_log
+
         tickers = [t.upper() for t in tickers]
         results = {}
 
@@ -325,15 +338,20 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
         # Chunk tickers to avoid rate limits (100 at a time)
         chunk_size = 100
         all_data = None
+        total_chunks = (len(tickers) + chunk_size - 1) // chunk_size
+
+        activity_log.log("info", "yfinance", f"Starting {period} history download: {len(tickers)} tickers in {total_chunks} chunks")
 
         for i in range(0, len(tickers), chunk_size):
             chunk = tickers[i:i + chunk_size]
+            chunk_num = i // chunk_size + 1
 
             try:
                 # Add delay between chunks to avoid rate limiting
                 if i > 0:
                     time.sleep(config.YAHOO_HISTORY_BATCH_DELAY)
 
+                activity_log.log("info", "yfinance", f"History: chunk {chunk_num}/{total_chunks} ({len(chunk)} tickers)...")
                 chunk_data = yf.download(chunk, period=period, progress=False, threads=True)
 
                 if not chunk_data.empty:
@@ -342,9 +360,11 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                     else:
                         # Merge chunk data
                         all_data = pd.concat([all_data, chunk_data], axis=1)
+                else:
+                    activity_log.log("warning", "yfinance", f"History chunk {chunk_num} returned empty")
 
             except Exception as e:
-                print(f"[yfinance] History chunk {i//chunk_size + 1} failed: {e}")
+                activity_log.log("error", "yfinance", f"History chunk {chunk_num}/{total_chunks} failed: {str(e)[:50]}")
                 continue
 
         data = all_data

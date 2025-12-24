@@ -14,11 +14,12 @@ Handles:
 """
 
 import threading
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, Response
 import data_manager
 from config import VALID_INDICES
 from services.recommendations import get_top_recommendations
 from services import screener as screener_service
+from services.activity_log import activity_log
 
 screener_bp = Blueprint('screener', __name__, url_prefix='/api')
 
@@ -49,7 +50,7 @@ def api_screener():
     if index_name not in VALID_INDICES:
         index_name = 'all'
 
-    data = screener_service.get_index_data(index_name)
+    data = data_manager.get_index_data(index_name)
 
     # Filter to undervalued stocks (price_vs_value < -20)
     undervalued = []
@@ -141,12 +142,35 @@ def api_screener_stop():
     return jsonify({'status': 'stopped'})
 
 
+@screener_bp.route('/activity-stream')
+def api_activity_stream():
+    """Stream activity logs via Server-Sent Events."""
+    def generate():
+        for event in activity_log.subscribe():
+            yield event
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'  # Disable nginx buffering
+        }
+    )
+
+
 @screener_bp.route('/screener/progress')
 def api_screener_progress():
     """Get screener progress."""
-    progress_data = screener_service.get_progress()
-    progress_data['provider_logs'] = screener_service.get_provider_logs()
-    return jsonify(progress_data)
+    return jsonify(screener_service.get_progress())
+
+
+@screener_bp.route('/activity-logs')
+def api_activity_logs():
+    """Get recent activity logs."""
+    count = request.args.get('count', 20, type=int)
+    return jsonify(activity_log.get_recent(count))
 
 
 @screener_bp.route('/refresh', methods=['POST'])
@@ -170,8 +194,8 @@ def api_recommendations():
     if not all_valuations:
         return jsonify({'recommendations': [], 'error': 'No valuation data available'})
 
-    # Get ticker-to-index mapping from service
-    ticker_indexes = screener_service.get_all_ticker_indexes()
+    # Get ticker-to-index mapping from data_manager
+    ticker_indexes = data_manager.get_all_ticker_indexes()
 
     result = get_top_recommendations(all_valuations, ticker_indexes, limit=10, filter_by_index=True)
     return jsonify(result)

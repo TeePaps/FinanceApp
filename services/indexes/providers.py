@@ -553,7 +553,18 @@ class IndexOrchestrator:
         """
         providers = self.get_providers_for_index(index_id)
 
+        try:
+            from services.activity_log import activity_log
+            activity_log.log("info", "index", f"Fetching {index_id} constituents...")
+        except Exception:
+            pass
+
         if not providers:
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("error", "index", f"No providers for {index_id}")
+            except Exception:
+                pass
             return IndexResult(
                 success=False,
                 tickers=[],
@@ -574,6 +585,11 @@ class IndexOrchestrator:
                 if result.success and len(result.tickers) > 0:
                     # Reset failure count on success
                     self._failures[provider.name] = 0
+                    try:
+                        from services.activity_log import activity_log
+                        activity_log.log("success", "index", f"{index_id}: {len(result.tickers)} tickers from {provider.name}")
+                    except Exception:
+                        pass
                     return result
                 else:
                     errors.append(f"{provider.name}: {result.error or 'empty result'}")
@@ -583,6 +599,11 @@ class IndexOrchestrator:
                 errors.append(f"{provider.name}: {str(e)}")
                 self._failures[provider.name] = self._failures.get(provider.name, 0) + 1
 
+        try:
+            from services.activity_log import activity_log
+            activity_log.log("error", "index", f"{index_id}: all providers failed")
+        except Exception:
+            pass
         return IndexResult(
             success=False,
             tickers=[],
@@ -639,5 +660,5 @@ def fetch_index_tickers(index_id: str) -> List[str]:
     if result.success:
         return result.tickers
     else:
-        print(f"[IndexProvider] Failed to fetch {index_id}: {result.error}")
+        # Error already logged in orchestrator
         return []

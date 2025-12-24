@@ -21,6 +21,8 @@ class DataType(Enum):
     DIVIDEND = "dividend"
     STOCK_INFO = "stock_info"
     SELLOFF = "selloff"
+    SEC_METRICS = "sec_metrics"  # Multi-year EPS matrix + dividend data from SEC
+    FILINGS = "filings"  # 10-K filing URLs from SEC
 
 
 @dataclass
@@ -35,6 +37,7 @@ class ProviderResult:
         error: Error message if success=False
         cached: Whether this result came from cache
         timestamp: When the data was fetched/cached
+        metadata: Optional dict for provider-specific metadata (e.g., new_years_added)
     """
     success: bool
     data: Any
@@ -42,6 +45,7 @@ class ProviderResult:
     error: Optional[str] = None
     cached: bool = False
     timestamp: Optional[datetime] = None
+    metadata: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.timestamp is None:
@@ -119,6 +123,27 @@ class SelloffData:
     month: Dict  # {'selloff_rate': float, 'down_days': int, 'total_days': int}
     avg_volume: int
     severity: str  # 'none', 'normal', 'moderate', 'high', 'severe'
+
+
+@dataclass
+class SECMetricsData:
+    """SEC metrics data including multi-year EPS matrix and dividends."""
+    ticker: str
+    source: str
+    eps_matrix: List[Dict]  # Multi-year EPS by type from SEC filings
+    dividend_history: List[Dict]  # Annual dividends from SEC
+    company_name: Optional[str] = None
+    cik: Optional[str] = None
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class FilingsData:
+    """SEC 10-K filing URLs."""
+    ticker: str
+    source: str
+    filings: List[Dict]  # [{fiscal_year, form_type, filing_date, document_url, accession_number}]
+    timestamp: datetime = field(default_factory=datetime.now)
 
 
 class BaseProvider(ABC):

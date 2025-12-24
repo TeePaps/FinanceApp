@@ -16,12 +16,12 @@ from datetime import datetime
 from flask import Blueprint, jsonify, request
 import database as db
 import data_manager
-import sec_data
 from config import FAILURE_THRESHOLD, VALID_INDICES, DIVIDEND_FETCH_DELAY
 from services.indexes import INDEX_NAMES
 from services.providers import get_orchestrator
 from services import screener as screener_service
-from services.screener import get_index_data
+from data_manager import get_index_data
+from services.activity_log import activity_log
 
 data_bp = Blueprint('data', __name__, url_prefix='/api')
 
@@ -31,16 +31,7 @@ def get_excluded_tickers_info():
     excluded = db.get_excluded_tickers(threshold=FAILURE_THRESHOLD)
 
     # Count pending failures (tickers with some failures but not yet excluded)
-    pending_count = 0
-    with db.get_public_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT COUNT(*) FROM ticker_failures
-            WHERE failure_count > 0 AND failure_count < ?
-        ''', (FAILURE_THRESHOLD,))
-        result = cursor.fetchone()
-        if result:
-            pending_count = result[0]
+    pending_count = db.get_ticker_failure_count(threshold=FAILURE_THRESHOLD)
 
     return {
         'tickers': excluded,
@@ -51,9 +42,7 @@ def get_excluded_tickers_info():
 
 def clear_excluded_tickers():
     """Clear the excluded tickers list and failure counts in database."""
-    with db.get_public_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM ticker_failures')
+    db.clear_ticker_failures()
 
 
 @data_bp.route('/data-status')
@@ -62,8 +51,9 @@ def api_data_status():
     # Get consolidated stats from data manager
     dm_stats = data_manager.get_data_stats()
 
-    # SEC data status (from sec_data module for CIK info)
-    sec_status = sec_data.get_cache_status()
+    # SEC data status (from orchestrator for CIK info)
+    orchestrator = get_orchestrator()
+    sec_status = orchestrator.get_sec_cache_status()
 
     # Index data status - use consolidated data
     indices = []
@@ -169,7 +159,8 @@ def api_clear_excluded_tickers():
 @data_bp.route('/eps-recommendations')
 def api_eps_recommendations():
     """Get recommendations for which tickers need EPS updates."""
-    recommendations = sec_data.get_eps_update_recommendations()
+    orchestrator = get_orchestrator()
+    recommendations = orchestrator.get_eps_update_recommendations()
     return jsonify(recommendations)
 
 
@@ -217,6 +208,7 @@ def api_screener_update_dividends():
             tickers = list(data_manager.get_index_tickers(idx) or [])
 
         screener_service._progress['total'] = len(tickers)
+        activity_log.log("info", "screener", f"Dividend Update: {len(tickers)} tickers")
 
         updates = {}
         for i, ticker in enumerate(tickers):
@@ -244,6 +236,8 @@ def api_screener_update_dividends():
                             'estimated_value': round((eps_avg + annual_dividend) * 10, 2) if eps_avg else None,
                             'updated': datetime.now().isoformat()
                         }
+                        if (i + 1) % 50 == 0:
+                            activity_log.log("info", "screener", f"Dividends: {i + 1}/{len(tickers)} processed...")
             except Exception as e:
                 print(f"Error updating dividend for {ticker}: {e}")
 
@@ -252,6 +246,7 @@ def api_screener_update_dividends():
         if updates:
             data_manager.bulk_update_valuations(updates)
 
+        activity_log.log("success", "screener", f"✓ Dividend Update complete: {len(updates)} updated")
         screener_service._progress['status'] = 'complete'
         screener_service._running = False
 

@@ -34,6 +34,200 @@ function formatEpsSource(source, short = false) {
     return labels[source] || source;
 }
 
+// =============================================================================
+// PROGRESS MANAGER - Unified progress and activity log handling
+// =============================================================================
+
+class ProgressManager {
+    constructor() {
+        this.eventSource = null;
+        this.progressInterval = null;
+        this.isRunning = false;
+        this.autoScroll = true;
+    }
+
+    start(operationType) {
+        if (this.isRunning) return;
+        this.isRunning = true;
+
+        // Show progress UI
+        const screenerProgress = document.getElementById('screener-progress');
+        const datasetsProgress = document.getElementById('refresh-status');
+        if (screenerProgress) screenerProgress.style.display = 'block';
+        if (datasetsProgress) datasetsProgress.style.display = 'block';
+
+        // Clear previous logs
+        const logContent = document.getElementById('activity-content');
+        if (logContent) logContent.innerHTML = '';
+
+        // Connect to SSE for activity logs
+        this.connectSSE();
+
+        // Start polling for progress updates
+        this.progressInterval = setInterval(() => this.pollProgress(), 1000);
+    }
+
+    stop() {
+        this.isRunning = false;
+
+        if (this.eventSource) {
+            this.eventSource.close();
+            this.eventSource = null;
+        }
+
+        if (this.progressInterval) {
+            clearInterval(this.progressInterval);
+            this.progressInterval = null;
+        }
+    }
+
+    connectSSE() {
+        if (this.eventSource) {
+            this.eventSource.close();
+        }
+
+        this.eventSource = new EventSource('/api/activity-stream');
+
+        this.eventSource.addEventListener('log', (event) => {
+            try {
+                const logEntry = JSON.parse(event.data);
+                this.appendLogEntry(logEntry);
+            } catch (e) {
+                console.error('Error parsing log event:', e);
+            }
+        });
+
+        this.eventSource.addEventListener('heartbeat', (event) => {
+            // Connection is alive, no action needed
+        });
+
+        this.eventSource.onerror = (error) => {
+            console.error('SSE connection error:', error);
+            // Reconnect after 2 seconds if still running
+            if (this.isRunning) {
+                setTimeout(() => this.connectSSE(), 2000);
+            }
+        };
+    }
+
+    appendLogEntry(entry) {
+        const logContent = document.getElementById('activity-content');
+        const logContentFull = document.getElementById('activity-content-full');
+
+        const timestamp = entry.timestamp || '';
+        const ticker = entry.ticker ? `[${entry.ticker}] ` : '';
+        const message = (entry.message || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const html = `<span class="log-time">[${timestamp}]</span> ${ticker}${message}`;
+
+        // Write to inline viewer (Datasets tab)
+        if (logContent) {
+            const logLine = document.createElement('div');
+            logLine.className = `log-line log-${entry.level}`;
+            logLine.innerHTML = html;
+            logContent.appendChild(logLine);
+
+            if (this.autoScroll) {
+                logContent.scrollTop = logContent.scrollHeight;
+            }
+
+            while (logContent.children.length > 100) {
+                logContent.removeChild(logContent.firstChild);
+            }
+        }
+
+        // Write to full viewer (Log View tab) - no limit
+        if (logContentFull) {
+            const logLine = document.createElement('div');
+            logLine.className = `log-line log-${entry.level}`;
+            logLine.innerHTML = html;
+            logContentFull.appendChild(logLine);
+
+            if (this.autoScroll) {
+                logContentFull.scrollTop = logContentFull.scrollHeight;
+            }
+        }
+    }
+
+    async pollProgress() {
+        try {
+            const response = await fetch('/api/screener/progress');
+            const progress = await response.json();
+
+            this.updateProgressUI(progress);
+
+            if (progress.status === 'complete' || progress.status === 'cancelled') {
+                this.stop();
+                this.hideProgressUI();
+                resetRefreshButton();
+                reloadCurrentView();
+            }
+        } catch (error) {
+            console.error('Error polling progress:', error);
+        }
+    }
+
+    updateProgressUI(progress) {
+        const phaseNames = {
+            'eps': 'SEC EPS',
+            'dividends': 'Dividends',
+            'prices': 'Prices',
+            'combining': 'Building',
+            'retrying': 'Retrying',
+            'valuations': 'Valuations',
+            'saving': 'Saving',
+            'calculating': 'Calculating'
+        };
+
+        const phase = phaseNames[progress.phase] || progress.phase || 'Processing';
+        const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+
+        // Update screener tab progress
+        const progressFill = document.getElementById('progress-fill');
+        const progressText = document.getElementById('progress-text');
+        if (progressFill) progressFill.style.width = `${pct}%`;
+        if (progressText) progressText.textContent = `[${phase}] ${progress.ticker} (${progress.current}/${progress.total})`;
+
+        // Update datasets tab progress
+        const refreshBar = document.getElementById('refresh-progress-bar');
+        const refreshPhase = document.getElementById('refresh-phase');
+        const refreshTicker = document.getElementById('refresh-ticker');
+        const refreshCount = document.getElementById('refresh-count');
+        if (refreshBar) refreshBar.style.width = `${pct}%`;
+        if (refreshPhase) refreshPhase.textContent = phase;
+        if (refreshTicker) refreshTicker.textContent = progress.ticker || '';
+        if (refreshCount) refreshCount.textContent = `${progress.current} / ${progress.total} (${pct}%)`;
+    }
+
+    hideProgressUI() {
+        const screenerProgress = document.getElementById('screener-progress');
+        const datasetsProgress = document.getElementById('refresh-status');
+        if (screenerProgress) screenerProgress.style.display = 'none';
+        if (datasetsProgress) datasetsProgress.style.display = 'none';
+    }
+
+    toggleAutoScroll() {
+        this.autoScroll = !this.autoScroll;
+        // Update both auto-scroll icons
+        const icon1 = document.getElementById('autoscroll-icon');
+        const icon2 = document.getElementById('autoscroll-icon-full');
+        const newIcon = this.autoScroll ? '⬇️' : '⏸️';
+        if (icon1) icon1.textContent = newIcon;
+        if (icon2) icon2.textContent = newIcon;
+        return this.autoScroll;
+    }
+
+    clearLogs() {
+        // Clear both log viewers
+        const logContent = document.getElementById('activity-content');
+        const logContentFull = document.getElementById('activity-content-full');
+        if (logContent) logContent.innerHTML = '';
+        if (logContentFull) logContentFull.innerHTML = '';
+    }
+}
+
+// Global instance
+const progressManager = new ProgressManager();
+
 // Collapsible section toggle
 function toggleCollapsible(sectionId) {
     const section = document.getElementById(sectionId);
@@ -399,6 +593,9 @@ function showTab(tabName) {
         loadDatasets();
     } else if (tabName === 'settings') {
         loadProviderSettings();
+    } else if (tabName === 'logs') {
+        // Connect SSE to receive live logs even if no operation is running
+        progressManager.connectSSE();
     }
 }
 
@@ -1633,76 +1830,13 @@ async function runScreenerUpdate(endpoint, updateType, index = 'all') {
                 screenerProgress.style.display = 'block';
             }
 
-            // Poll for progress
-            monitorUpdateProgress(updateType);
+            // Start progress monitoring
+            progressManager.start(updateType);
         }
     } catch (error) {
         console.error('Error starting update:', error);
         resetRefreshButton();
     }
-}
-
-// Monitor update progress
-function monitorUpdateProgress(updateType) {
-    const progressInterval = setInterval(async () => {
-        try {
-            const progressResponse = await fetch('/api/screener/progress');
-            const progress = await progressResponse.json();
-
-            // Map phase names to display names
-            const phaseNames = {
-                'eps': 'SEC EPS',
-                'dividends': 'Dividends',
-                'prices': 'Prices',
-                'combining': 'Building',
-                'retrying': 'Retrying',
-                'valuations': 'Valuations'
-            };
-            const phase = phaseNames[progress.phase] || progress.phase || 'Processing';
-            const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
-            const statusText = `[${phase}] ${progress.ticker} (${progress.current}/${progress.total})`;
-
-            // Update screener tab progress (Market Analysis)
-            const progressFill = document.getElementById('progress-fill');
-            const progressText = document.getElementById('progress-text');
-            if (progressFill) progressFill.style.width = `${pct}%`;
-            if (progressText) progressText.textContent = statusText;
-
-            // Update datasets tab progress (Data Sets)
-            const refreshBar = document.getElementById('refresh-progress-bar');
-            const refreshPhase = document.getElementById('refresh-phase');
-            const refreshTicker = document.getElementById('refresh-ticker');
-            const refreshCount = document.getElementById('refresh-count');
-            if (refreshBar) refreshBar.style.width = `${pct}%`;
-            if (refreshPhase) refreshPhase.textContent = phase;
-            if (refreshTicker) refreshTicker.textContent = progress.ticker || '';
-            if (refreshCount) refreshCount.textContent = `${progress.current} / ${progress.total} (${pct}%)`;
-
-            if (progress.provider_logs && progress.provider_logs.length > 0) {
-                const logContent = document.getElementById('log-content');
-                if (logContent) {
-                    const recentLogs = progress.provider_logs.slice(-5);
-                    logContent.innerHTML = recentLogs
-                        .map(log => `<div class="log-line">${log.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`)
-                        .join('');
-                }
-            }
-
-            if (progress.status === 'complete' || progress.status === 'cancelled') {
-                clearInterval(progressInterval);
-                const screenerProgress = document.getElementById('screener-progress');
-                const datasetsProgress = document.getElementById('refresh-status');
-                if (screenerProgress) screenerProgress.style.display = 'none';
-                if (datasetsProgress) datasetsProgress.style.display = 'none';
-                resetRefreshButton();
-
-                // Reload current view
-                reloadCurrentView();
-            }
-        } catch (e) {
-            console.error('Error checking progress:', e);
-        }
-    }, 1000);
 }
 
 function resetRefreshButton() {
@@ -3032,8 +3166,6 @@ async function loadRecommendations() {
 }
 
 // Data Sets Tab
-let datasetsInterval = null;
-
 async function loadDatasets() {
     try {
         // Load data status and recommendations in parallel
@@ -3104,16 +3236,10 @@ async function loadDatasets() {
 
         // Handle refresh status
         if (data.refresh.running) {
-            showRefreshProgress(data.refresh.progress);
-            if (!datasetsInterval) {
-                datasetsInterval = setInterval(pollDatasetRefresh, 1000);
-            }
+            progressManager.start('Dataset Refresh');
         } else {
             document.getElementById('refresh-status').style.display = 'none';
-            if (datasetsInterval) {
-                clearInterval(datasetsInterval);
-                datasetsInterval = null;
-            }
+            progressManager.stop();
         }
 
     } catch (error) {
@@ -3251,10 +3377,8 @@ async function startGlobalRefresh() {
                 datasetsProgress.style.display = 'block';
             }
 
-            // Start polling for progress
-            if (!datasetsInterval) {
-                datasetsInterval = setInterval(pollDatasetRefresh, 1000);
-            }
+            // Start progress monitoring
+            progressManager.start('Global Refresh');
         }
     } catch (error) {
         console.error('Error starting refresh:', error);
@@ -3283,30 +3407,10 @@ function showRefreshProgress(progress) {
     document.getElementById('refresh-count').textContent = `${progress.current} / ${progress.total} (${pct}%)`;
 }
 
-async function pollDatasetRefresh() {
-    try {
-        const response = await fetch('/api/screener/progress');
-        const progress = await response.json();
-
-        if (progress.status === 'running') {
-            showRefreshProgress(progress);
-        } else {
-            document.getElementById('refresh-status').style.display = 'none';
-            if (datasetsInterval) {
-                clearInterval(datasetsInterval);
-                datasetsInterval = null;
-            }
-            // Reload data to show updated stats
-            loadDatasets();
-        }
-    } catch (error) {
-        console.error('Error polling refresh:', error);
-    }
-}
-
 async function stopRefresh() {
     try {
         await fetch('/api/screener/stop', { method: 'POST' });
+        progressManager.stop();
     } catch (error) {
         console.error('Error stopping refresh:', error);
     }

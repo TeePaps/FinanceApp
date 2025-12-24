@@ -157,7 +157,6 @@ def get_company_name(ticker):
     """
     # Lazy imports to avoid circular dependencies
     import database as db
-    import sec_data
 
     ticker_upper = ticker.upper()
 
@@ -184,15 +183,17 @@ def get_company_name(ticker):
         except Exception:
             pass
 
-    # 3. Try SEC data
-    try:
-        sec_result = sec_data.get_sec_eps(ticker_upper)
-        if sec_result and sec_result.get('company_name'):
-            company_name = sec_result['company_name']
-            if company_name != ticker_upper:
-                return company_name
-    except Exception:
-        pass
+    # 3. Try SEC data via orchestrator
+    if _HAS_PROVIDERS:
+        try:
+            orchestrator = get_orchestrator()
+            sec_result = orchestrator.fetch_eps(ticker_upper)
+            if sec_result.success and sec_result.data and sec_result.data.company_name:
+                company_name = sec_result.data.company_name
+                if company_name != ticker_upper:
+                    return company_name
+        except Exception:
+            pass
 
     # 4. Fall back to ticker
     return ticker_upper

@@ -105,6 +105,14 @@ class AlpacaPriceProvider(PriceProvider):
         tickers = [t.upper() for t in tickers]
         results = {}
 
+        # Log start for larger batches
+        if len(tickers) > 5:
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("info", "alpaca", f"Fetching prices for {len(tickers)} tickers...")
+            except Exception:
+                pass
+
         try:
             from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
 
@@ -189,9 +197,26 @@ class AlpacaPriceProvider(PriceProvider):
                         error="Ticker not processed"
                     )
 
+            # Log results for larger batches
+            if len(tickers) > 5:
+                success_count = sum(1 for r in results.values() if r.success)
+                try:
+                    from services.activity_log import activity_log
+                    if success_count > 0:
+                        activity_log.log("success", "alpaca", f"{success_count} prices fetched")
+                    else:
+                        activity_log.log("warning", "alpaca", "batch returned no data")
+                except Exception:
+                    pass
+
             return results
 
         except ImportError:
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("error", "alpaca", "alpaca-py not installed")
+            except Exception:
+                pass
             return {
                 t: ProviderResult(
                     success=False,
@@ -201,6 +226,11 @@ class AlpacaPriceProvider(PriceProvider):
                 ) for t in tickers
             }
         except Exception as e:
+            try:
+                from services.activity_log import activity_log
+                activity_log.log("error", "alpaca", f"error - {str(e)[:50]}")
+            except Exception:
+                pass
             return {
                 t: ProviderResult(
                     success=False,

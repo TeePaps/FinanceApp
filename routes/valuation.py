@@ -10,8 +10,8 @@ Handles:
 import threading
 from flask import Blueprint, jsonify
 import data_manager
-import sec_data
 from services.valuation import calculate_valuation, get_validated_eps
+from services.providers import get_orchestrator
 from config import PE_RATIO_MULTIPLIER, RECOMMENDED_EPS_YEARS
 from datetime import datetime, timedelta
 
@@ -29,10 +29,20 @@ def api_valuation(ticker):
 def api_sec_metrics(ticker):
     """Get SEC metrics for a ticker."""
     ticker = ticker.upper()
-    metrics = sec_data.get_sec_metrics(ticker)
+    orchestrator = get_orchestrator()
+    result = orchestrator.fetch_sec_metrics(ticker)
 
-    if not metrics:
+    if not result.success or not result.data:
         return jsonify({'error': f'No SEC metrics available for {ticker}'}), 404
+
+    # Convert SECMetricsData to dict format for JSON response
+    metrics = {
+        'ticker': result.data.ticker,
+        'company_name': result.data.company_name,
+        'cik': result.data.cik,
+        'eps_by_year': result.data.eps_matrix,
+        'dividends': result.data.dividend_history
+    }
 
     return jsonify(metrics)
 
@@ -44,11 +54,10 @@ def api_valuation_refresh(ticker):
 
     try:
         # Use provider system for price
-        from services.providers import get_orchestrator
-        from services.screener import log_provider_activity
+        from services.activity_log import activity_log
 
         orchestrator = get_orchestrator()
-        log_provider_activity(f"Refreshing {ticker}...")
+        activity_log.log("info", "valuation", f"Refreshing {ticker}...")
         price_result = orchestrator.fetch_price(ticker, skip_cache=True)
         current_price = price_result.data if price_result.success else 0
         price_source = price_result.source if price_result.success else None
@@ -70,9 +79,9 @@ def api_valuation_refresh(ticker):
 
         # Use SEC company name if available
         if eps_source.startswith('sec'):
-            sec_eps = sec_data.get_sec_eps(ticker)
-            if sec_eps and sec_eps.get('company_name'):
-                company_name = sec_eps['company_name']
+            sec_result = orchestrator.fetch_eps(ticker)
+            if sec_result.success and sec_result.data and sec_result.data.company_name:
+                company_name = sec_result.data.company_name
 
         # Get dividend info using orchestrator
         dividend_result = orchestrator.fetch_dividends(ticker)
