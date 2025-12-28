@@ -131,8 +131,10 @@ def calculate_valuation(ticker):
         eps_data, eps_source, validation_info = get_validated_eps(ticker)
 
         # Use company name from EPS data if available (SEC or other authoritative source)
-        if validation_info.get('company_name'):
-            company_name = validation_info['company_name']
+        # But only if it's a real name, not just the ticker repeated
+        sec_name = validation_info.get('company_name')
+        if sec_name and sec_name.upper() != ticker:
+            company_name = sec_name
 
         # Get dividend info using orchestrator
         dividend_result = orchestrator.fetch_dividends(ticker)
