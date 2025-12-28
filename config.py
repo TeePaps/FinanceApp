@@ -182,6 +182,23 @@ EPS_BACKOFF_BASE = _get('rate_limits.eps_backoff_base', 2)
 INDEX_PROVIDER_TIMEOUT = _get('index_providers.request_timeout', 30)
 
 # ============================================================================
+# Background Scheduler Settings
+# ============================================================================
+SCHEDULER_ENABLED = _get('scheduler.enabled', True)
+PRICE_REFRESH_INTERVAL = _get('scheduler.price_refresh_interval_minutes', 15)
+MARKET_HOURS_START = _get('scheduler.market_hours.start', '09:30')
+MARKET_HOURS_END = _get('scheduler.market_hours.end', '16:00')
+MARKET_TIMEZONE = _get('scheduler.market_hours.timezone', 'America/New_York')
+
+# ============================================================================
+# Staleness Dashboard Thresholds
+# ============================================================================
+STALENESS_PRICE_FRESH_MINUTES = _get('staleness.price_fresh_minutes', 60)
+STALENESS_PRICE_STALE_HOURS = _get('staleness.price_stale_hours', 24)
+STALENESS_DIVIDEND_FRESH_DAYS = _get('staleness.dividend_fresh_days', 7)
+STALENESS_DIVIDEND_STALE_DAYS = _get('staleness.dividend_stale_days', 30)
+
+# ============================================================================
 # Fallback Data Sources (Optional)
 # ============================================================================
 # Set these environment variables to enable fallback price sources when

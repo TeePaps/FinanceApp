@@ -1,0 +1,20 @@
+{
+  "id": "price-graph-live",
+  "started": "2025-12-27T12:30:00Z",
+  "lastUpdated": "2025-12-27T13:00:00Z",
+  "status": "complete",
+  "phase": "complete",
+  "progress": {
+    "discovery": { "answered": 5, "total": 5 },
+    "detail": { "answered": 5, "total": 5 }
+  },
+  "contextFiles": [
+    "services/providers/base.py",
+    "services/providers/yfinance_provider.py",
+    "services/providers/registry.py",
+    "routes/valuation.py",
+    "static/app.js",
+    "templates/index.html"
+  ],
+  "relatedFeatures": ["Company Lookup", "Valuation Display"]
+}

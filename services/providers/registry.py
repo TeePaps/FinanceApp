@@ -523,9 +523,9 @@ class DataOrchestrator:
                         try:
                             from services.activity_log import activity_log
                             if success_count > 0:
-                                activity_log.log("success", provider.name, f"{success_count} prices fetched")
+                                activity_log.log("success", provider.name, f"{success_count}/{len(tickers)} prices fetched")
                             else:
-                                activity_log.log("warning", provider.name, "batch returned no data")
+                                activity_log.log("warning", provider.name, f"Batch price fetch returned no data ({len(tickers)} tickers requested)")
                         except ImportError:
                             pass
 

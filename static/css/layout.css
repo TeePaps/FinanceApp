@@ -100,6 +100,39 @@
     cursor: default;
 }
 
+/* Staleness Dashboard */
+.staleness-dashboard {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.8em;
+    padding: 4px 10px;
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+    border: 1px solid var(--border-color);
+}
+
+.staleness-item {
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+
+.staleness-divider {
+    color: var(--text-muted);
+}
+
+.staleness-fresh {
+    color: #28a745;
+}
+
+.staleness-aging {
+    color: #ffc107;
+}
+
+.staleness-stale {
+    color: #dc3545;
+}
+
 /* Theme Toggle */
 .theme-toggle {
     background: var(--bg-tertiary);

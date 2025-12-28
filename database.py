@@ -902,6 +902,25 @@ def remove_orphan_valuations() -> Dict:
 # SEC Company Operations
 # =============================================================================
 
+def get_eps_history(ticker: str) -> List[Dict]:
+    """Get EPS history for a ticker directly from eps_history table.
+
+    Used as a fallback when in-memory eps_results doesn't have data
+    but the database has cached EPS history from a previous fetch.
+
+    Returns:
+        List of dicts with 'year' and 'eps' keys, ordered by year DESC
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT year, eps, filed, period_start, period_end, eps_type
+            FROM eps_history WHERE ticker = ?
+            ORDER BY year DESC
+        ''', (ticker.upper(),))
+        return [dict(r) for r in cursor.fetchall()]
+
+
 def get_sec_company(ticker: str) -> Optional[Dict]:
     """Get SEC company data for a ticker."""
     with get_db() as conn:
@@ -1502,6 +1521,35 @@ def set_metadata(key: str, value: str):
                 value = excluded.value,
                 updated = excluded.updated
         ''', (key, value, now))
+
+
+def count_tickers_in_enabled_indexes() -> int:
+    """Count unique tickers across all enabled indexes."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(DISTINCT ti.ticker)
+            FROM ticker_indexes ti
+            JOIN indexes i ON ti.index_name = i.name
+            WHERE i.enabled = 1
+        ''')
+        return cursor.fetchone()[0] or 0
+
+
+def count_tickers_with_eps() -> int:
+    """Count tickers in enabled indexes that have EPS data."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(DISTINCT v.ticker)
+            FROM valuations v
+            JOIN ticker_indexes ti ON v.ticker = ti.ticker
+            JOIN indexes i ON ti.index_name = i.name
+            WHERE i.enabled = 1
+              AND v.eps_avg IS NOT NULL
+              AND v.eps_avg > 0
+        ''')
+        return cursor.fetchone()[0] or 0
 
 
 # =============================================================================

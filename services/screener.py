@@ -174,12 +174,16 @@ def run_screener(index_name='all'):
 
     eps_results = {}
     sec_hits = 0
+    sec_failures = 0
+    existing_hits = 0
     orchestrator = get_orchestrator()
 
     for i, t in enumerate(tickers):
-        if i % 100 == 0:
+        if i % 50 == 0:
             _progress['current'] = i
-            _progress['ticker'] = f'Loading SEC EPS... ({sec_hits} found)'
+            _progress['ticker'] = f'Loading SEC EPS... ({sec_hits} SEC, {existing_hits} cached)'
+            if i > 0 and i % 200 == 0:
+                log.info(f"Phase 1 progress: {i}/{len(tickers)} - SEC: {sec_hits}, cached: {existing_hits}, no data: {sec_failures}")
 
         sec_result = orchestrator.fetch_eps(t)
         if sec_result.success and sec_result.data and sec_result.data.eps_history:
@@ -191,20 +195,25 @@ def run_screener(index_name='all'):
                     'company_name': sec_result.data.company_name or t,
                     'eps_avg': round(eps_avg, 2),
                     'eps_years': len(eps_history),
-                    'eps_source': 'sec',
+                    'eps_source': sec_result.source or 'sec',
                     'has_enough_years': len(eps_history) >= 8,
                     'annual_dividend': existing_valuations.get(t, {}).get('annual_dividend', 0),
                 }
                 sec_hits += 1
                 continue
 
+        # Fall back to existing valuations
         existing = existing_valuations.get(t, {})
         if existing.get('eps_avg') is not None:
             eps_results[t] = existing
+            existing_hits += 1
+        else:
+            sec_failures += 1
 
     _progress['current'] = len(tickers)
-    log.info(f"Screener Phase 1 complete: {time.time() - phase1_start:.1f}s, SEC EPS: {sec_hits} found")
-    activity_log.log("success", "screener", f"✓ Phase 1: SEC EPS loaded ({sec_hits} found)")
+    phase1_time = time.time() - phase1_start
+    log.info(f"Screener Phase 1 complete: {phase1_time:.1f}s - SEC: {sec_hits}, cached: {existing_hits}, no data: {sec_failures}")
+    activity_log.log("success", "screener", f"✓ Phase 1: SEC EPS ({sec_hits} new, {existing_hits} cached, {sec_failures} missing)")
 
     if not _running:
         _progress['status'] = 'cancelled'
@@ -376,8 +385,27 @@ def run_screener(index_name='all'):
         if fifty_two_week_high and current_price:
             off_high_pct = ((current_price - fifty_two_week_high) / fifty_two_week_high) * 100
 
-        eps_info = eps_results.get(ticker) or existing_valuations.get(ticker, {})
-        eps_avg = eps_info.get('eps_avg')
+        # Get EPS info: first from Phase 1 results, then database fallback, then existing valuations
+        eps_info = eps_results.get(ticker)
+        eps_avg = eps_info.get('eps_avg') if eps_info else None
+
+        # Database fallback: if Phase 1 didn't get EPS, check eps_history table
+        if not eps_avg:
+            eps_history = db.get_eps_history(ticker)
+            if eps_history and len(eps_history) > 0:
+                calculated_avg = sum(e['eps'] for e in eps_history) / len(eps_history)
+                eps_info = {
+                    'eps_avg': round(calculated_avg, 2),
+                    'eps_years': len(eps_history),
+                    'eps_source': 'sec_cache',
+                    'company_name': eps_info.get('company_name') if eps_info else None
+                }
+                eps_avg = eps_info['eps_avg']
+
+        # Final fallback to existing valuations
+        if not eps_avg:
+            eps_info = existing_valuations.get(ticker, {})
+            eps_avg = eps_info.get('eps_avg')
 
         div_info = dividend_data.get(ticker, {})
         annual_dividend = (
@@ -458,6 +486,16 @@ def run_screener(index_name='all'):
     total_duration = time.time() - start_time
     activity_log.log("success", "screener", f"✓ Complete: {len(valuations_batch)} valuations in {total_duration:.1f}s")
     log.info(f"=== SCREENER COMPLETE for '{index_name}': {len(valuations_batch)} valuations in {total_duration:.1f}s ===")
+
+    # Update staleness metadata
+    now_iso = datetime.now().isoformat()
+    db.set_metadata('last_price_update', now_iso)
+    db.set_metadata('last_dividend_update', now_iso)
+
+    # Phase: Fetch 52-week data for tickers that need it
+    if _running:
+        _fetch_52_week_data(tickers)
+
     _progress['status'] = 'complete'
     _running = False
 
@@ -564,9 +602,24 @@ def run_quick_price_update(index_name='all'):
                 current_price = float(current_prices[ticker])
                 existing = existing_valuations.get(ticker, {})
                 eps_avg = existing.get('eps_avg')
+                eps_years = existing.get('eps_years')
+                eps_source = existing.get('eps_source')
                 annual_dividend = existing.get('annual_dividend', 0)
                 fifty_two_week_high = existing.get('fifty_two_week_high')
                 company_name = existing.get('company_name', ticker)
+
+                # If no EPS data in existing valuation, check SEC cache
+                if eps_avg is None:
+                    sec_data = db.get_sec_company(ticker)
+                    if sec_data and sec_data.get('eps_history'):
+                        eps_history = sec_data['eps_history']
+                        if len(eps_history) > 0:
+                            eps_avg = sum(e['eps'] for e in eps_history) / len(eps_history)
+                            eps_years = len(eps_history)
+                            eps_source = 'sec'
+                            sec_company_name = sec_data.get('company_name')
+                            if sec_company_name and sec_company_name != ticker:
+                                company_name = sec_company_name
 
                 # Try to refresh bad company names (where company_name == ticker)
                 if company_name == ticker:
@@ -611,6 +664,9 @@ def run_quick_price_update(index_name='all'):
                     'company_name': company_name,
                     'current_price': round(current_price, 2),
                     'price_source': price_sources_dict.get(ticker),
+                    'eps_avg': round(eps_avg, 2) if eps_avg is not None else None,
+                    'eps_years': eps_years,
+                    'eps_source': eps_source,
                     'estimated_value': round(estimated_value, 2) if estimated_value else None,
                     'price_vs_value': round(price_vs_value, 1) if price_vs_value is not None else None,
                     'off_high_pct': round(off_high_pct, 1) if off_high_pct is not None else None,
@@ -635,6 +691,14 @@ def run_quick_price_update(index_name='all'):
     total_duration = time.time() - start_time
     activity_log.log("success", "screener", f"✓ Complete: {updated_count} valuations updated in {total_duration:.1f}s")
     log.info(f"=== QUICK PRICE UPDATE COMPLETE for '{index_name}': {updated_count} updated in {total_duration:.1f}s ===")
+
+    # Update staleness metadata (prices only for quick update)
+    db.set_metadata('last_price_update', datetime.now().isoformat())
+
+    # Phase: Fetch 52-week data for tickers that need it
+    if _running:
+        _fetch_52_week_data(tickers)
+
     _progress['status'] = 'complete'
     _running = False
 
@@ -819,6 +883,14 @@ def run_smart_update(index_name='all'):
     total_duration = time.time() - start_time
     activity_log.log("success", "screener", f"✓ Smart Update complete in {total_duration:.1f}s")
     log.info(f"=== SMART UPDATE COMPLETE for '{index_name}' in {total_duration:.1f}s ===")
+
+    # Update staleness metadata
+    db.set_metadata('last_price_update', datetime.now().isoformat())
+
+    # Phase: Fetch 52-week data for tickers that need it
+    if _running:
+        _fetch_52_week_data(tickers)
+
     _progress['status'] = 'complete'
     _running = False
 
@@ -1061,10 +1133,149 @@ def run_global_refresh():
     except Exception:
         pass
 
+    # Update staleness metadata
+    db.set_metadata('last_price_update', now_iso)
+
+    # Phase: Fetch 52-week data for tickers that need it
+    if _running:
+        _fetch_52_week_data(all_tickers)
+
     _progress['status'] = 'complete'
     _progress['ticker'] = f'Done - {len(ticker_valuations)} valuations updated'
     _running = False
     activity_log.log("success", "screener", f"Refresh complete - {len(ticker_valuations)} valuations saved")
+
+
+# =============================================================================
+# 52-WEEK DATA FETCH PHASE
+# =============================================================================
+
+def _fetch_52_week_data(tickers, progress_callback=None):
+    """
+    Fetch 52-week high/low data for tickers that are missing it.
+    Runs with rate limiting to avoid API limits.
+
+    Args:
+        tickers: List of ticker symbols to fetch
+        progress_callback: Optional function to update progress
+
+    Returns:
+        Dict of {ticker: {'fifty_two_week_high': float, 'fifty_two_week_low': float}}
+    """
+    global _running, _progress
+
+    orchestrator = get_orchestrator()
+    results = {}
+
+    # Get existing valuations to check which tickers need 52-week data
+    existing_valuations = data_manager.load_valuations().get('valuations', {})
+
+    # Filter to tickers that don't have 52-week data
+    tickers_needing_data = []
+    for ticker in tickers:
+        existing = existing_valuations.get(ticker, {})
+        if not existing.get('fifty_two_week_high'):
+            tickers_needing_data.append(ticker)
+
+    if not tickers_needing_data:
+        activity_log.log("info", "screener", "All tickers already have 52-week data")
+        return results
+
+    activity_log.log("info", "screener", f"Fetching 52-week data for {len(tickers_needing_data)} tickers...")
+
+    _progress['phase'] = '52-week'
+    _progress['current'] = 0
+    _progress['total'] = len(tickers_needing_data)
+
+    for i, ticker in enumerate(tickers_needing_data):
+        if not _running:
+            activity_log.log("info", "screener", "52-week fetch cancelled")
+            break
+
+        _progress['current'] = i + 1
+        _progress['ticker'] = f"52-week: {ticker}"
+
+        # Rate limiting - delay between calls
+        if i > 0:
+            time.sleep(0.5)
+
+        try:
+            info_result = orchestrator.fetch_stock_info(ticker)
+            if info_result.success and info_result.data:
+                fifty_two_week_high = info_result.data.fifty_two_week_high
+                fifty_two_week_low = info_result.data.fifty_two_week_low
+
+                if fifty_two_week_high:
+                    results[ticker] = {
+                        'fifty_two_week_high': fifty_two_week_high,
+                        'fifty_two_week_low': fifty_two_week_low
+                    }
+        except Exception as e:
+            activity_log.log("warning", "screener", f"52-week fetch failed for {ticker}: {str(e)[:30]}")
+            continue
+
+    # Update database with 52-week data
+    if results:
+        now_iso = datetime.now().isoformat()
+        updates = {}
+        for ticker, data in results.items():
+            existing = existing_valuations.get(ticker, {})
+            current_price = existing.get('current_price', 0)
+            fifty_two_week_high = data['fifty_two_week_high']
+
+            # Calculate off_high_pct
+            off_high_pct = None
+            if fifty_two_week_high and current_price and fifty_two_week_high > 0:
+                off_high_pct = ((current_price - fifty_two_week_high) / fifty_two_week_high) * 100
+
+            updates[ticker] = {
+                **existing,
+                'fifty_two_week_high': round(fifty_two_week_high, 2) if fifty_two_week_high else None,
+                'fifty_two_week_low': round(data['fifty_two_week_low'], 2) if data.get('fifty_two_week_low') else None,
+                'off_high_pct': round(off_high_pct, 1) if off_high_pct else None,
+                'updated': now_iso
+            }
+
+        data_manager.bulk_update_valuations(updates)
+        activity_log.log("success", "screener", f"Updated 52-week data for {len(updates)} tickers")
+
+    return results
+
+
+# =============================================================================
+# SINGLE TICKER REFRESH
+# =============================================================================
+
+def refresh_single_ticker(symbol):
+    """
+    Refresh all data for a single ticker.
+    Returns dict with updated valuation or error.
+    """
+    from services.valuation import calculate_valuation
+    from data_manager import save_single_valuation
+
+    activity_log.log('info', 'screener', f'Refreshing single ticker: {symbol}')
+
+    try:
+        # Full valuation calculation (price + EPS + dividends)
+        valuation = calculate_valuation(symbol)
+
+        if not valuation:
+            return {'success': False, 'error': f'Failed to get data for {symbol}'}
+
+        if valuation.get('current_price', 0) <= 0:
+            return {'success': False, 'error': f'No price data for {symbol}'}
+
+        # Save to database
+        save_single_valuation(symbol, valuation)
+
+        activity_log.log('info', 'screener', f'Refreshed {symbol}: ${valuation.get("current_price", 0):.2f}')
+
+        return {'success': True, 'data': valuation}
+
+    except Exception as e:
+        activity_log.log('error', 'screener', f'Error refreshing {symbol}: {e}')
+        return {'success': False, 'error': str(e)}
 
 
 # =============================================================================

@@ -160,6 +160,7 @@ class ProgressManager {
                 this.hideProgressUI();
                 resetRefreshButton();
                 reloadCurrentView();
+                loadStalenessDashboard();  // Refresh staleness indicators
             }
         } catch (error) {
             console.error('Error polling progress:', error);
@@ -444,9 +445,9 @@ document.addEventListener('DOMContentLoaded', function() {
     initTheme();
     restoreTabFromHash();
     loadGlobalLastUpdated();
+    loadStalenessDashboard();
     initTickerAutocomplete();
     loadIndices();  // Populate index dropdowns from API
-    updateAllPricesCount();  // Update enabled ticker count for All Prices button
 });
 
 // Handle browser back/forward buttons
@@ -513,6 +514,63 @@ function formatTimeAgo(timestamp) {
     if (diffMins < 60) return `${diffMins}m`;
     if (diffHours < 24) return `${diffHours}h`;
     return `${diffDays}d`;
+}
+
+// Load and display staleness dashboard in header
+async function loadStalenessDashboard() {
+    try {
+        const response = await fetch('/api/data-freshness');
+        const data = await response.json();
+
+        // Prices
+        const pricesEl = document.getElementById('staleness-prices');
+        if (pricesEl && data.prices) {
+            const age = data.prices.age_minutes;
+            let text;
+            if (age === null) {
+                text = 'never';
+            } else if (age < 60) {
+                text = `${age}m ago`;
+            } else if (age < 1440) {
+                text = `${Math.floor(age / 60)}h ago`;
+            } else {
+                text = `${Math.floor(age / 1440)}d ago`;
+            }
+            pricesEl.textContent = `Prices: ${text}`;
+            pricesEl.className = `staleness-item staleness-${data.prices.status}`;
+        }
+
+        // EPS
+        const epsEl = document.getElementById('staleness-eps');
+        if (epsEl && data.eps) {
+            epsEl.textContent = `EPS: ${data.eps.percent}%`;
+            if (data.eps.missing > 0) {
+                epsEl.title = `${data.eps.missing} tickers missing EPS data`;
+            }
+            const epsStatus = data.eps.percent >= 95 ? 'fresh' : data.eps.percent >= 80 ? 'aging' : 'stale';
+            epsEl.className = `staleness-item staleness-${epsStatus}`;
+        }
+
+        // Dividends
+        const divsEl = document.getElementById('staleness-dividends');
+        if (divsEl && data.dividends) {
+            const days = data.dividends.age_days;
+            let text;
+            if (days === null) {
+                text = 'never';
+            } else if (days === 0) {
+                text = 'today';
+            } else if (days === 1) {
+                text = '1d ago';
+            } else {
+                text = `${days}d ago`;
+            }
+            divsEl.textContent = `Dividends: ${text}`;
+            divsEl.className = `staleness-item staleness-${data.dividends.status}`;
+        }
+    } catch (e) {
+        console.error('Failed to load staleness dashboard:', e);
+    }
 }
 
 // Restore tab from URL hash on page load/refresh
@@ -1713,30 +1771,29 @@ document.addEventListener('click', function(e) {
     }
 });
 
-// Quick Update - prices only for selected index
-async function startQuickUpdate() {
+// Refresh Prices - fast price update for all enabled indexes
+async function startRefreshPrices() {
     closeRefreshMenu();
-    const index = typeof currentIndex !== 'undefined' ? currentIndex : 'sp500';
-    await runScreenerUpdate('/api/screener/quick-update', 'Quick Update', index);
+    await runScreenerUpdate('/api/screener/quick-update', 'Refresh Prices', 'all');
 }
 
-// All Prices Update - prices for all enabled indexes
-async function startAllPricesUpdate() {
+// Full Sync - EPS + Dividends + Prices (comprehensive)
+async function startFullSync() {
     closeRefreshMenu();
-    await runScreenerUpdate('/api/screener/quick-update', 'All Prices', 'all');
+    await runScreenerUpdate('/api/screener/start', 'Full Sync', 'all');
 }
 
-// Smart Update - missing data + prices
-async function startSmartUpdate() {
+// Fix Missing - fetch missing EPS/dividend data + prices
+async function startFixMissing() {
     closeRefreshMenu();
-    await runScreenerUpdate('/api/screener/smart-update', 'Smart Update', 'all');
+    await runScreenerUpdate('/api/screener/smart-update', 'Fix Missing', 'all');
 }
 
-// Full Update - EPS + Dividends + Prices
-async function startFullUpdate() {
-    closeRefreshMenu();
-    await runScreenerUpdate('/api/screener/start', 'Full Update', 'all');
-}
+// Legacy function aliases for backward compatibility
+async function startQuickUpdate() { await startRefreshPrices(); }
+async function startAllPricesUpdate() { await startRefreshPrices(); }
+async function startSmartUpdate() { await startFixMissing(); }
+async function startFullUpdate() { await startFullSync(); }
 
 // Remove orphan valuations (tickers no longer in any active index)
 async function removeOrphans() {
@@ -2115,6 +2172,10 @@ function renderValuation(data, refreshInfo = '') {
             </div>
         </div>
 
+        <div id="price-chart-container" class="price-chart-container">
+            <div class="chart-loading">Loading price chart...</div>
+        </div>
+
         <div class="valuation-details">
             <div class="detail-section">
                 <h4>EPS History (${data.eps_years} years)</h4>
@@ -2369,6 +2430,218 @@ function renderValuation(data, refreshInfo = '') {
     }
 
     resultsDiv.innerHTML = html;
+
+    // Load price chart after DOM update
+    if (data.ticker) {
+        loadPriceChart(data.ticker, data.estimated_value);
+    }
+}
+
+// =====================================
+// Price History Chart
+// =====================================
+
+let priceChartInstance = null;
+let currentChartTicker = null;
+let currentChartFairValue = null;
+
+/**
+ * Load and render price history chart for a ticker.
+ * @param {string} ticker - Stock ticker symbol
+ * @param {number} fairValue - Estimated fair value for reference line
+ * @param {string} period - Time period (default: '1y')
+ */
+async function loadPriceChart(ticker, fairValue, period = '1y') {
+    currentChartTicker = ticker;
+    currentChartFairValue = fairValue;
+
+    const chartContainer = document.getElementById('price-chart-container');
+    if (!chartContainer) return;
+
+    // Show loading state
+    chartContainer.innerHTML = `
+        <div class="chart-header">
+            <h4>Price History</h4>
+            <div class="period-selector">
+                <button class="period-btn ${period === '1mo' ? 'active' : ''}" onclick="changePriceChartPeriod('1mo')">1M</button>
+                <button class="period-btn ${period === '3mo' ? 'active' : ''}" onclick="changePriceChartPeriod('3mo')">3M</button>
+                <button class="period-btn ${period === '6mo' ? 'active' : ''}" onclick="changePriceChartPeriod('6mo')">6M</button>
+                <button class="period-btn ${period === '1y' ? 'active' : ''}" onclick="changePriceChartPeriod('1y')">1Y</button>
+                <button class="period-btn ${period === '2y' ? 'active' : ''}" onclick="changePriceChartPeriod('2y')">2Y</button>
+                <button class="period-btn ${period === '5y' ? 'active' : ''}" onclick="changePriceChartPeriod('5y')">5Y</button>
+            </div>
+        </div>
+        <div class="chart-loading">Loading chart...</div>
+    `;
+
+    try {
+        const response = await fetch(`/api/price-history/${ticker}?period=${period}`);
+        const data = await response.json();
+
+        if (data.error) {
+            chartContainer.innerHTML += `<div class="chart-error">Unable to load price history</div>`;
+            return;
+        }
+
+        renderPriceChart(data, fairValue, period);
+    } catch (error) {
+        console.error('Error loading price chart:', error);
+        chartContainer.innerHTML += `<div class="chart-error">Error loading chart</div>`;
+    }
+}
+
+/**
+ * Render Chart.js price chart with fair value line.
+ * @param {object} data - Price history data from API
+ * @param {number} fairValue - Fair value for horizontal line
+ * @param {string} period - Selected period for button highlighting
+ */
+function renderPriceChart(data, fairValue, period) {
+    const chartContainer = document.getElementById('price-chart-container');
+    if (!chartContainer) return;
+
+    // Destroy existing chart instance
+    if (priceChartInstance) {
+        priceChartInstance.destroy();
+        priceChartInstance = null;
+    }
+
+    // Build chart HTML
+    chartContainer.innerHTML = `
+        <div class="chart-header">
+            <h4>Price History</h4>
+            <div class="period-selector">
+                <button class="period-btn ${period === '1mo' ? 'active' : ''}" onclick="changePriceChartPeriod('1mo')">1M</button>
+                <button class="period-btn ${period === '3mo' ? 'active' : ''}" onclick="changePriceChartPeriod('3mo')">3M</button>
+                <button class="period-btn ${period === '6mo' ? 'active' : ''}" onclick="changePriceChartPeriod('6mo')">6M</button>
+                <button class="period-btn ${period === '1y' ? 'active' : ''}" onclick="changePriceChartPeriod('1y')">1Y</button>
+                <button class="period-btn ${period === '2y' ? 'active' : ''}" onclick="changePriceChartPeriod('2y')">2Y</button>
+                <button class="period-btn ${period === '5y' ? 'active' : ''}" onclick="changePriceChartPeriod('5y')">5Y</button>
+            </div>
+        </div>
+        <div class="chart-wrapper"><canvas id="price-chart"></canvas></div>
+    `;
+
+    const ctx = document.getElementById('price-chart').getContext('2d');
+
+    // Prepare data
+    const labels = data.prices.map(p => p.date);
+    const prices = data.prices.map(p => p.price);
+
+    // Calculate date label format based on period
+    const formatDateLabel = (dateStr) => {
+        const date = new Date(dateStr);
+        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        if (period === '1mo' || period === '3mo') {
+            return `${months[date.getMonth()]} ${date.getDate()}`;
+        } else {
+            return `${months[date.getMonth()]} ${date.getFullYear().toString().slice(-2)}`;
+        }
+    };
+
+    // Build annotation for fair value line
+    const annotations = {};
+    if (fairValue && fairValue > 0) {
+        annotations.fairValueLine = {
+            type: 'line',
+            yMin: fairValue,
+            yMax: fairValue,
+            borderColor: '#22c55e',
+            borderWidth: 2,
+            borderDash: [6, 4],
+            label: {
+                display: true,
+                content: `Fair Value: $${fairValue.toFixed(2)}`,
+                position: 'end',
+                backgroundColor: '#22c55e',
+                color: '#fff',
+                font: { size: 11 }
+            }
+        };
+    }
+
+    // Create chart
+    priceChartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Price',
+                data: prices,
+                borderColor: '#4a90d9',
+                backgroundColor: 'rgba(74, 144, 217, 0.1)',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.1,
+                pointRadius: 0,
+                pointHoverRadius: 4
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                intersect: false,
+                mode: 'index'
+            },
+            plugins: {
+                legend: {
+                    display: false
+                },
+                tooltip: {
+                    callbacks: {
+                        title: (items) => {
+                            if (items.length > 0) {
+                                return formatDateLabel(items[0].label);
+                            }
+                            return '';
+                        },
+                        label: (context) => {
+                            return `$${context.parsed.y.toFixed(2)}`;
+                        }
+                    }
+                },
+                annotation: {
+                    annotations: annotations
+                }
+            },
+            scales: {
+                x: {
+                    display: true,
+                    ticks: {
+                        maxTicksLimit: 8,
+                        callback: function(value, index) {
+                            return formatDateLabel(this.getLabelForValue(value));
+                        }
+                    },
+                    grid: {
+                        display: false
+                    }
+                },
+                y: {
+                    display: true,
+                    ticks: {
+                        callback: function(value) {
+                            return '$' + value.toFixed(0);
+                        }
+                    },
+                    grid: {
+                        color: 'rgba(0, 0, 0, 0.05)'
+                    }
+                }
+            }
+        }
+    });
+}
+
+/**
+ * Change price chart period.
+ * @param {string} period - New period to display
+ */
+function changePriceChartPeriod(period) {
+    if (currentChartTicker) {
+        loadPriceChart(currentChartTicker, currentChartFairValue, period);
+    }
 }
 
 // Screener
@@ -3052,9 +3325,22 @@ async function loadRecommendations() {
             return;
         }
 
+        // Build exclusion summary
+        let excludedInfo = '';
+        if (data.excluded) {
+            const reasons = [];
+            if (data.excluded.no_valuation > 0) reasons.push(`${data.excluded.no_valuation} no valuation`);
+            if (data.excluded.no_eps > 0) reasons.push(`${data.excluded.no_eps} no EPS`);
+            if (data.excluded.no_price > 0) reasons.push(`${data.excluded.no_price} no price`);
+            if (reasons.length > 0) {
+                const totalExcluded = data.excluded.no_valuation + data.excluded.no_eps + data.excluded.no_price;
+                excludedInfo = ` <span class="excluded-count" title="${reasons.join(', ')}">(${totalExcluded} excluded)</span>`;
+            }
+        }
+
         let html = `
             <div class="recommendations-header">
-                <span class="analyzed-count">Analyzed ${data.total_analyzed} stocks</span>
+                <span class="analyzed-count">Analyzed ${data.total_analyzed} stocks${excludedInfo}</span>
                 <div class="index-legend">
                     <span class="legend-item legend-dow">Dow 30</span>
                     <span class="legend-item legend-sp500">S&P 500</span>

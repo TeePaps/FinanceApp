@@ -14,8 +14,7 @@ from config import (
     DIVIDEND_MAX_POINTS,
     SELLOFF_SEVERE_BONUS,
     SELLOFF_MODERATE_BONUS,
-    SELLOFF_RECENT_BONUS,
-    RECOMMENDATION_MIN_EPS_YEARS
+    SELLOFF_RECENT_BONUS
 )
 
 
@@ -34,9 +33,9 @@ def score_stock(valuation_data):
     Returns:
         Float score (higher = better recommendation)
     """
-    current_price = valuation_data.get('current_price', 0)
-    price_vs_value = valuation_data.get('price_vs_value', 0)
-    annual_dividend = valuation_data.get('annual_dividend', 0)
+    current_price = valuation_data.get('current_price', 0) or 0
+    price_vs_value = valuation_data.get('price_vs_value', 0) or 0
+    annual_dividend = valuation_data.get('annual_dividend', 0) or 0
     off_high_pct = valuation_data.get('off_high_pct', 0) or 0
     in_selloff = valuation_data.get('in_selloff', False)
     selloff_severity = valuation_data.get('selloff_severity', 'none')
@@ -87,11 +86,11 @@ def explain_score(valuation_data):
     Returns:
         List of reason strings
     """
-    current_price = valuation_data.get('current_price', 0)
-    price_vs_value = valuation_data.get('price_vs_value', 0)
-    annual_dividend = valuation_data.get('annual_dividend', 0)
+    current_price = valuation_data.get('current_price', 0) or 0
+    price_vs_value = valuation_data.get('price_vs_value', 0) or 0
+    annual_dividend = valuation_data.get('annual_dividend', 0) or 0
     off_high_pct = valuation_data.get('off_high_pct', 0) or 0
-    eps_years = valuation_data.get('eps_years', 0)
+    eps_years = valuation_data.get('eps_years', 0) or 0
 
     # Calculate dividend yield
     dividend_yield = (annual_dividend / current_price * 100) if current_price > 0 else 0
@@ -152,25 +151,37 @@ def get_top_recommendations(valuations, ticker_indexes=None, limit=10,
     ticker_indexes = ticker_indexes or {}
     scored_stocks = []
 
+    # Track exclusion reasons
+    excluded = {
+        'not_in_index': 0,
+        'no_price': 0,
+        'no_valuation': 0,
+        'no_eps': 0
+    }
+
     for ticker, val in valuations.items():
         # Skip stocks not in any enabled index (if filtering enabled)
         if filter_by_index and ticker not in ticker_indexes:
+            excluded['not_in_index'] += 1
             continue
 
         # Skip stocks without key metrics
         if not val.get('current_price') or val.get('current_price', 0) <= 0:
+            excluded['no_price'] += 1
             continue
         if val.get('price_vs_value') is None:
+            excluded['no_valuation'] += 1
             continue
 
-        eps_years = val.get('eps_years', 0)
+        eps_years = val.get('eps_years', 0) or 0
 
-        # Skip stocks with very low data quality
-        if eps_years < RECOMMENDATION_MIN_EPS_YEARS:
+        # Skip stocks with no EPS data at all
+        if eps_years == 0:
+            excluded['no_eps'] += 1
             continue
 
-        current_price = val.get('current_price', 0)
-        annual_dividend = val.get('annual_dividend', 0)
+        current_price = val.get('current_price', 0) or 0
+        annual_dividend = val.get('annual_dividend', 0) or 0
 
         # Calculate dividend yield for display
         dividend_yield = (annual_dividend / current_price * 100) if current_price > 0 else 0
@@ -218,6 +229,7 @@ def get_top_recommendations(valuations, ticker_indexes=None, limit=10,
     return {
         'recommendations': top_n,
         'total_analyzed': len(scored_stocks),
+        'excluded': excluded,
         'criteria': {
             'undervaluation': 'Stocks trading below estimated value (based on 10x average EPS)',
             'dividend': 'Higher dividend yield preferred',

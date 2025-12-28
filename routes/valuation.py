@@ -5,10 +5,11 @@ Handles:
 - GET /api/valuation/<ticker> - Get valuation for a ticker
 - POST /api/valuation/<ticker>/refresh - Refresh valuation
 - GET /api/sec-metrics/<ticker> - Get SEC metrics
+- GET /api/price-history/<ticker> - Get price history for charting
 """
 
 import threading
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 import data_manager
 from services.valuation import calculate_valuation, get_validated_eps
 from services.providers import get_orchestrator
@@ -146,6 +147,44 @@ def api_valuation_refresh(ticker):
             'eps_validation': validation_info,
             'selloff': selloff_metrics,
             'formula': f'(({round(eps_avg, 2) if eps_avg else "N/A"} avg EPS) + {round(annual_dividend, 2)} dividend) x {PE_RATIO_MULTIPLIER} = ${round(estimated_value, 2) if estimated_value else "N/A"}'
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e), 'ticker': ticker}), 500
+
+
+@valuation_bp.route('/price-history/<ticker>')
+def api_price_history(ticker):
+    """Get price history for charting."""
+    ticker = ticker.upper()
+    period = request.args.get('period', '1y')
+
+    # Validate period
+    valid_periods = ['1mo', '3mo', '6mo', '1y', '2y', '5y']
+    if period not in valid_periods:
+        return jsonify({'error': f'Invalid period. Must be one of: {", ".join(valid_periods)}'}), 400
+
+    try:
+        orchestrator = get_orchestrator()
+        result = orchestrator.fetch_price_history(ticker, period)
+
+        if not result.success or not result.data:
+            return jsonify({'error': f'No price history available for {ticker}'}), 404
+
+        # Convert prices dict to sorted array for chart
+        history_data = result.data
+        prices_list = []
+        for date_str, price in sorted(history_data.prices.items()):
+            prices_list.append({
+                'date': date_str,
+                'price': round(price, 2)
+            })
+
+        return jsonify({
+            'ticker': ticker,
+            'period': period,
+            'prices': prices_list,
+            'current_price': round(history_data.current_price, 2) if history_data.current_price else None
         })
 
     except Exception as e:

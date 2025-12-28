@@ -17,21 +17,27 @@
             <h1>Stock Portfolio Tracker</h1>
             <div class="header-right">
                 <span id="global-last-updated" class="global-last-updated"></span>
+                <div id="staleness-dashboard" class="staleness-dashboard">
+                    <span id="staleness-prices" class="staleness-item">Prices: --</span>
+                    <span class="staleness-divider">|</span>
+                    <span id="staleness-eps" class="staleness-item">EPS: --</span>
+                    <span class="staleness-divider">|</span>
+                    <span id="staleness-dividends" class="staleness-item">Dividends: --</span>
+                </div>
                 <div class="header-buttons">
                     <div class="refresh-dropdown">
                         <button class="refresh-data-btn" id="refresh-main-btn" onclick="toggleRefreshMenu()" title="Refresh data options">
                             Refresh ▾
                         </button>
                         <div class="refresh-menu" id="refresh-menu">
-                            <button onclick="startQuickUpdate()" title="Update prices for current index">
-                                <span class="menu-icon">⚡</span> Quick (Prices Only)
+                            <button onclick="startRefreshPrices()" title="Update prices for all enabled indexes">
+                                <span class="menu-icon">⚡</span> Refresh Prices
                             </button>
-                            <button onclick="startAllPricesUpdate()" title="Update prices for all enabled indexes" id="all-prices-btn"><span class="menu-icon">🌐</span> All Prices <span id="all-prices-count">(...)</span></button>
-                            <button onclick="startSmartUpdate()" title="Fetch missing data + prices">
-                                <span class="menu-icon">🔄</span> Smart (Missing + Prices)
+                            <button onclick="startFullSync()" title="Full refresh: EPS + Dividends + Prices">
+                                <span class="menu-icon">📊</span> Full Sync
                             </button>
-                            <button onclick="startFullUpdate()" title="Full refresh: EPS + Dividends + Prices">
-                                <span class="menu-icon">📊</span> Full Update
+                            <button onclick="startFixMissing()" title="Fetch missing EPS/dividend data + prices">
+                                <span class="menu-icon">🔧</span> Fix Missing
                             </button>
                             <hr style="margin: 4px 0; border-color: var(--border-color);">
                             <button onclick="removeOrphans()" title="Remove valuations for tickers no longer in any index">
@@ -580,7 +586,11 @@
         </div>
     </div>
 
+    <!-- Chart.js for price history graphs -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
+
     <!-- Main App Logic -->
-    <script src="{{ url_for('static', filename='app.js') }}?v=47"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=48"></script>
 </body>
 </html>

@@ -1,0 +1,34 @@
+{
+  "id": "valuation-refresh-investigation",
+  "started": "2025-12-25T14:05:00Z",
+  "lastUpdated": "2025-12-25T19:50:00Z",
+  "status": "complete",
+  "phase": "complete",
+  "progress": {
+    "discovery": { "answered": 5, "total": 5 },
+    "detail": { "answered": 5, "total": 5 }
+  },
+  "contextFiles": [
+    "services/screener.py",
+    "services/providers/sec_provider.py",
+    "sec_data.py",
+    "database.py"
+  ],
+  "relatedFeatures": [
+    "SEC EPS fetching",
+    "IFRS reporting support",
+    "Valuation calculation"
+  ],
+  "findings": {
+    "bugs": [
+      "Phase 4 doesn't use database eps_history",
+      "Phase 1 not completing for all tickers",
+      "SEC code only checks us-gaap, not ifrs-full"
+    ],
+    "enhancements": [
+      "Calculate EPS from NetIncome/Shares fallback",
+      "Better logging in Phase 1"
+    ],
+    "truly_missing": ["V", "STZ", "SOLS"]
+  }
+}

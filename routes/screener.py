@@ -199,3 +199,118 @@ def api_recommendations():
 
     result = get_top_recommendations(all_valuations, ticker_indexes, limit=10, filter_by_index=True)
     return jsonify(result)
+
+
+# =============================================================================
+# Per-Ticker Refresh
+# =============================================================================
+
+@screener_bp.route('/ticker/<symbol>/refresh', methods=['POST'])
+def api_refresh_ticker(symbol):
+    """Refresh data for a single ticker."""
+    from services.screener import refresh_single_ticker
+    result = refresh_single_ticker(symbol.upper())
+    return jsonify(result)
+
+
+# =============================================================================
+# Data Freshness / Staleness Dashboard
+# =============================================================================
+
+def get_freshness_status(age, data_type):
+    """Determine freshness status based on age and data type."""
+    import config
+
+    if age is None:
+        return 'stale'
+
+    if data_type == 'price':
+        if age < config.STALENESS_PRICE_FRESH_MINUTES:
+            return 'fresh'
+        elif age < config.STALENESS_PRICE_STALE_HOURS * 60:
+            return 'aging'
+        return 'stale'
+    elif data_type == 'dividend':
+        if age < config.STALENESS_DIVIDEND_FRESH_DAYS:
+            return 'fresh'
+        elif age < config.STALENESS_DIVIDEND_STALE_DAYS:
+            return 'aging'
+        return 'stale'
+
+    return 'unknown'
+
+
+@screener_bp.route('/data-freshness')
+def api_data_freshness():
+    """Get staleness info for dashboard."""
+    import database as db
+    from datetime import datetime
+
+    # Get last update timestamps
+    last_price = db.get_metadata('last_price_update')
+    last_dividend = db.get_metadata('last_dividend_update')
+
+    # Count EPS completeness
+    total_tickers = db.count_tickers_in_enabled_indexes()
+    tickers_with_eps = db.count_tickers_with_eps()
+
+    def calc_age(timestamp, unit='minutes'):
+        if not timestamp:
+            return None
+        try:
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            # Make both datetimes naive for comparison
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+            diff = datetime.now() - dt
+            if unit == 'minutes':
+                return int(diff.total_seconds() / 60)
+            elif unit == 'hours':
+                return int(diff.total_seconds() / 3600)
+            elif unit == 'days':
+                return diff.days
+            return int(diff.total_seconds())
+        except (ValueError, AttributeError):
+            return None
+
+    price_age = calc_age(last_price, 'minutes')
+    dividend_age = calc_age(last_dividend, 'days')
+
+    return jsonify({
+        'prices': {
+            'last_update': last_price,
+            'age_minutes': price_age,
+            'status': get_freshness_status(price_age, 'price')
+        },
+        'eps': {
+            'total': total_tickers,
+            'complete': tickers_with_eps,
+            'missing': total_tickers - tickers_with_eps,
+            'percent': round(tickers_with_eps / total_tickers * 100) if total_tickers > 0 else 0
+        },
+        'dividends': {
+            'last_update': last_dividend,
+            'age_days': dividend_age,
+            'status': get_freshness_status(dividend_age, 'dividend')
+        }
+    })
+
+
+# =============================================================================
+# Scheduler Control
+# =============================================================================
+
+@screener_bp.route('/scheduler/status')
+def api_scheduler_status():
+    """Get auto-refresh scheduler status."""
+    from services.scheduler import get_status
+    return jsonify(get_status())
+
+
+@screener_bp.route('/scheduler/toggle', methods=['POST'])
+def api_scheduler_toggle():
+    """Toggle auto-refresh scheduler."""
+    from services.scheduler import toggle
+    data = request.get_json() or {}
+    result = toggle(data.get('enabled'))
+    return jsonify(result)
