@@ -78,11 +78,13 @@ def api_valuation_refresh(ticker):
         # Get validated EPS data using orchestrator
         eps_data, eps_source, validation_info = get_validated_eps(ticker)
 
-        # Use SEC company name if available
+        # Use SEC company name if available (but only if it's a real name, not just the ticker)
         if eps_source.startswith('sec'):
             sec_result = orchestrator.fetch_eps(ticker)
             if sec_result.success and sec_result.data and sec_result.data.company_name:
-                company_name = sec_result.data.company_name
+                sec_name = sec_result.data.company_name
+                if sec_name.upper() != ticker:
+                    company_name = sec_name
 
         # Get dividend info using orchestrator
         dividend_result = orchestrator.fetch_dividends(ticker)

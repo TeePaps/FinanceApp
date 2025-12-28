@@ -2646,6 +2646,7 @@ function changePriceChartPeriod(period) {
 
 // Screener
 let screenerInterval = null;
+let wasScreenerRunning = false;  // Track if screener was running to prevent infinite loop
 let currentIndex = 'sp500';  // Default, will be updated by loadIndices()
 let availableIndices = [];   // Cached index list from API
 
@@ -3149,6 +3150,7 @@ async function checkScreenerProgress() {
         const progress = await response.json();
 
         if (progress.status === 'running') {
+            wasScreenerRunning = true;  // Track that screener is running
             document.getElementById('screener-quick-btn').style.display = 'none';
             document.getElementById('screener-start-btn').style.display = 'none';
             document.getElementById('screener-stop-btn').style.display = 'inline-block';
@@ -3191,7 +3193,10 @@ async function checkScreenerProgress() {
                 screenerInterval = null;
             }
 
-            if (progress.status === 'complete') {
+            // Only reload if screener was actually running and just completed
+            // This prevents infinite loop when status is already 'complete'
+            if (wasScreenerRunning && progress.status === 'complete') {
+                wasScreenerRunning = false;
                 loadScreener();
             }
         }
@@ -3228,22 +3233,26 @@ function renderSecStatus(data) {
 
     // CIK mapping status
     const cikStatus = document.getElementById('sec-cik-status');
-    if (cache.cik_mapping.count > 0) {
-        const updated = cache.cik_mapping.updated ?
-            new Date(cache.cik_mapping.updated).toLocaleDateString() : 'Unknown';
-        cikStatus.textContent = `CIK Mapping: ${cache.cik_mapping.count.toLocaleString()} tickers (${updated})`;
-    } else {
-        cikStatus.textContent = 'CIK Mapping: Not loaded';
+    if (cikStatus) {
+        if (cache.cik_mapping.count > 0) {
+            const updated = cache.cik_mapping.updated ?
+                new Date(cache.cik_mapping.updated).toLocaleDateString() : 'Unknown';
+            cikStatus.textContent = `CIK Mapping: ${cache.cik_mapping.count.toLocaleString()} tickers (${updated})`;
+        } else {
+            cikStatus.textContent = 'CIK Mapping: Not loaded';
+        }
     }
 
     // Companies status
     const companiesStatus = document.getElementById('sec-companies-status');
-    if (cache.companies.count > 0) {
-        const updated = cache.companies.last_full_update ?
-            new Date(cache.companies.last_full_update).toLocaleDateString() : 'Never';
-        companiesStatus.textContent = `EPS Data: ${cache.companies.count} companies (Last full update: ${updated})`;
-    } else {
-        companiesStatus.textContent = 'EPS Data: No data cached';
+    if (companiesStatus) {
+        if (cache.companies.count > 0) {
+            const updated = cache.companies.last_full_update ?
+                new Date(cache.companies.last_full_update).toLocaleDateString() : 'Never';
+            companiesStatus.textContent = `EPS Data: ${cache.companies.count} companies (Last full update: ${updated})`;
+        } else {
+            companiesStatus.textContent = 'EPS Data: No data cached';
+        }
     }
 }
 

@@ -1,0 +1,18 @@
+{
+  "id": "market-analysis-click-issue",
+  "started": "2025-12-28T15:02:00Z",
+  "lastUpdated": "2025-12-28T15:02:00Z",
+  "status": "complete",
+  "phase": "complete",
+  "progress": {
+    "discovery": { "answered": 5, "total": 5 },
+    "detail": { "answered": 3, "total": 5 }
+  },
+  "rootCause": "Infinite loop between loadScreener() and checkScreenerProgress()",
+  "contextFiles": [
+    "static/app.js",
+    "static/css/pages.css",
+    "templates/index.html"
+  ],
+  "relatedFeatures": ["screener", "undervalued-cards", "clickable-rows"]
+}
