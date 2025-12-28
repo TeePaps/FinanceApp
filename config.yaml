@@ -165,3 +165,23 @@ providers:
 # ============================================================================
 index_providers:
   request_timeout: 30            # Timeout for index provider requests
+
+# ============================================================================
+# Background Scheduler Settings
+# ============================================================================
+scheduler:
+  enabled: true                  # Enable automatic price refresh
+  price_refresh_interval_minutes: 15  # Minutes between auto-refresh
+  market_hours:
+    start: "09:30"               # Market open (Eastern Time)
+    end: "16:00"                 # Market close (Eastern Time)
+    timezone: "America/New_York"
+
+# ============================================================================
+# Staleness Dashboard Thresholds
+# ============================================================================
+staleness:
+  price_fresh_minutes: 60        # Green: prices updated within this time
+  price_stale_hours: 24          # Red: prices older than this
+  dividend_fresh_days: 7         # Green: dividends updated within this time
+  dividend_stale_days: 30        # Red: dividends older than this

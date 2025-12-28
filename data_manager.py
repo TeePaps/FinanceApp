@@ -150,6 +150,22 @@ def bulk_update_valuations(valuations: Dict[str, Dict]):
     db.bulk_update_valuations(valuations)
 
 
+def save_single_valuation(ticker: str, valuation: Dict):
+    """Save a single ticker's valuation to database."""
+    update_data = {
+        'current_price': valuation.get('current_price'),
+        'eps_avg': valuation.get('eps_avg'),
+        'eps_years': valuation.get('eps_years'),
+        'eps_source': valuation.get('eps_source'),
+        'annual_dividend': valuation.get('annual_dividend'),
+        'estimated_value': valuation.get('estimated_value'),
+        'price_vs_value': valuation.get('price_vs_value'),
+        'company_name': valuation.get('company_name'),
+        'updated': datetime.now().isoformat()
+    }
+    db.update_valuation(ticker, update_data)
+
+
 def get_valuations_for_index(index_name: str, index_tickers: List[str] = None) -> List[Dict]:
     """Get valuations for tickers in a specific index."""
     if index_tickers:

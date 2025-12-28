@@ -95,6 +95,8 @@ class HistoricalPriceData:
     price_3m_ago: Optional[float] = None
     change_1m_pct: Optional[float] = None
     change_3m_pct: Optional[float] = None
+    fifty_two_week_high: Optional[float] = None
+    fifty_two_week_low: Optional[float] = None
     timestamp: datetime = field(default_factory=datetime.now)
 
 

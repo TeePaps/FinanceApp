@@ -4270,3 +4270,102 @@ input:disabled + .toggle-slider {
     from { opacity: 1; transform: translateY(0); }
     to { opacity: 0; transform: translateY(-10px); }
 }
+
+/* =====================================
+   Price History Chart
+   ===================================== */
+
+.price-chart-container {
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+    padding: 15px;
+    margin-bottom: 25px;
+}
+
+.chart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.chart-header h4 {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 1rem;
+}
+
+.period-selector {
+    display: flex;
+    gap: 4px;
+}
+
+.period-btn {
+    padding: 6px 12px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85em;
+    color: var(--text-secondary);
+    transition: all 0.15s;
+}
+
+.period-btn:hover {
+    background: var(--bg-hover);
+    border-color: var(--accent-color);
+}
+
+.period-btn.active {
+    background: var(--accent-color);
+    border-color: var(--accent-color);
+    color: white;
+}
+
+.chart-wrapper {
+    position: relative;
+    height: 200px;
+    width: 100%;
+}
+
+#price-chart {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100% !important;
+    height: 100% !important;
+}
+
+.chart-loading,
+.chart-error {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 200px;
+    color: var(--text-muted);
+    font-size: 0.9em;
+}
+
+.chart-error {
+    color: #dc3545;
+}
+
+@media (max-width: 768px) {
+    .chart-header {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .period-selector {
+        width: 100%;
+        justify-content: space-between;
+    }
+
+    .period-btn {
+        flex: 1;
+        text-align: center;
+        padding: 8px 6px;
+    }
+}

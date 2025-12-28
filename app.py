@@ -737,4 +737,10 @@ if __name__ == '__main__':
 
     # Initialize market data providers
     init_providers()
+
+    # Initialize background scheduler for auto-refresh
+    from services.scheduler import init_scheduler, shutdown as shutdown_scheduler
+    init_scheduler(app)
+    atexit.register(shutdown_scheduler)
+
     app.run(debug=True, port=8080)

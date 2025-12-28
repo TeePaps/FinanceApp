@@ -52,12 +52,6 @@ class SECEPSProvider(EPSProvider):
         ticker = ticker.upper()
 
         try:
-            from services.activity_log import activity_log
-            activity_log.log("info", "sec", f"Fetching EPS for {ticker}...", ticker=ticker)
-        except Exception:
-            pass
-
-        try:
             # Import sec_data here to avoid circular imports
             import sec_data
 
@@ -110,9 +104,11 @@ class SECEPSProvider(EPSProvider):
                 company_name=data.get('company_name')
             )
 
+            # Log result with source info (cache vs API already logged above)
             try:
                 from services.activity_log import activity_log
-                activity_log.log("success", "sec", f"{ticker} EPS: {len(standardized_history)} years", ticker=ticker)
+                source_info = "(cached)" if data.get('_from_cache') else "(from API)"
+                activity_log.log("success", "sec", f"{ticker} EPS: {len(standardized_history)} years {source_info}", ticker=ticker)
             except Exception:
                 pass
 

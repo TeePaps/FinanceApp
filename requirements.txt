@@ -9,6 +9,10 @@ ruamel.yaml>=0.18.0
 pandas>=2.0.0
 lxml>=4.9.0
 
+# Background scheduler for automatic data refresh
+APScheduler>=3.10.0
+pytz>=2024.1
+
 # Optional: Alpaca Markets provider (requires API key)
 # alpaca-py>=0.10.0
 

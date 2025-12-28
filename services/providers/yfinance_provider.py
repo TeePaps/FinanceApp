@@ -268,35 +268,48 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                 date_str = date.strftime('%Y-%m-%d')
                 prices[date_str] = float(row['Close'])
 
-            # Calculate 1m and 3m prices
+            # Calculate 1m and 3m prices using oldest available data in range
             price_1m_ago = None
             price_3m_ago = None
             change_1m_pct = None
             change_3m_pct = None
 
-            # Find price approximately 1 month ago (30 days)
-            # Use timezone-naive comparison (strip tz from index dates)
-            one_month_ago = datetime.now() - timedelta(days=30)
-            for date in hist.index:
-                date_naive = date.replace(tzinfo=None) if hasattr(date, 'tzinfo') and date.tzinfo else date
-                if date_naive <= one_month_ago:
-                    price_1m_ago = float(hist.loc[date, 'Close'])
-                    break
+            # Use oldest price in the range as the "start" price
+            # This handles cases where fetched data doesn't go back exactly 30/90 days
+            if len(hist) > 1:
+                oldest_price = float(hist['Close'].iloc[0])
 
-            # Find price approximately 3 months ago (90 days)
-            three_months_ago = datetime.now() - timedelta(days=90)
-            for date in hist.index:
-                date_naive = date.replace(tzinfo=None) if hasattr(date, 'tzinfo') and date.tzinfo else date
-                if date_naive <= three_months_ago:
-                    price_3m_ago = float(hist.loc[date, 'Close'])
-                    break
+                # For 3-month period, use oldest as 3m ago
+                price_3m_ago = oldest_price
+                if price_3m_ago > 0:
+                    change_3m_pct = ((current_price - price_3m_ago) / price_3m_ago) * 100
 
-            # Calculate percentage changes
-            if price_1m_ago and price_1m_ago > 0:
-                change_1m_pct = ((current_price - price_1m_ago) / price_1m_ago) * 100
+                # For 1-month, find the most recent price that's >= 30 days old
+                # Iterate newest-to-oldest to find first date <= 30 days ago
+                one_month_ago = datetime.now() - timedelta(days=30)
+                for date in reversed(hist.index):
+                    date_naive = date.replace(tzinfo=None) if hasattr(date, 'tzinfo') and date.tzinfo else date
+                    if date_naive <= one_month_ago:
+                        price_1m_ago = float(hist.loc[date, 'Close'])
+                        break
 
-            if price_3m_ago and price_3m_ago > 0:
-                change_3m_pct = ((current_price - price_3m_ago) / price_3m_ago) * 100
+                # Fallback: if no 30-day price found but we have data, use oldest
+                if price_1m_ago is None:
+                    price_1m_ago = oldest_price
+
+                if price_1m_ago and price_1m_ago > 0:
+                    change_1m_pct = ((current_price - price_1m_ago) / price_1m_ago) * 100
+
+            # Fetch 52-week high/low from stock info
+            fifty_two_week_high = None
+            fifty_two_week_low = None
+            try:
+                info = stock.info
+                if info and isinstance(info, dict):
+                    fifty_two_week_high = info.get('fiftyTwoWeekHigh')
+                    fifty_two_week_low = info.get('fiftyTwoWeekLow')
+            except Exception:
+                pass  # Graceful degradation - still return price data
 
             historical_data = HistoricalPriceData(
                 ticker=ticker,
@@ -306,7 +319,9 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                 price_1m_ago=price_1m_ago,
                 price_3m_ago=price_3m_ago,
                 change_1m_pct=change_1m_pct,
-                change_3m_pct=change_3m_pct
+                change_3m_pct=change_3m_pct,
+                fifty_two_week_high=fifty_two_week_high,
+                fifty_two_week_low=fifty_two_week_low
             )
 
             return ProviderResult(
@@ -467,33 +482,40 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                 date_str = date.strftime('%Y-%m-%d')
                 prices[date_str] = float(row['Close'])
 
-            # Calculate 1m and 3m prices
+            # Calculate 1m and 3m prices using oldest available data in range
             price_1m_ago = None
             price_3m_ago = None
             change_1m_pct = None
             change_3m_pct = None
 
-            # Find price approximately 1 month ago (30 days)
-            one_month_ago = datetime.now() - timedelta(days=30)
-            for date in hist_df.index:
-                if date <= one_month_ago:
-                    price_1m_ago = float(hist_df.loc[date, 'Close'])
-                    break
+            # Use oldest price in the range as the "start" price
+            # This handles cases where fetched data doesn't go back exactly 30/90 days
+            if len(hist_df) > 1:
+                oldest_price = float(hist_df['Close'].iloc[0])
 
-            # Find price approximately 3 months ago (90 days)
-            three_months_ago = datetime.now() - timedelta(days=90)
-            for date in hist_df.index:
-                if date <= three_months_ago:
-                    price_3m_ago = float(hist_df.loc[date, 'Close'])
-                    break
+                # For 3-month period, use oldest as 3m ago
+                price_3m_ago = oldest_price
+                if price_3m_ago > 0:
+                    change_3m_pct = ((current_price - price_3m_ago) / price_3m_ago) * 100
 
-            # Calculate percentage changes
-            if price_1m_ago and price_1m_ago > 0:
-                change_1m_pct = ((current_price - price_1m_ago) / price_1m_ago) * 100
+                # For 1-month, find the most recent price that's >= 30 days old
+                # Iterate newest-to-oldest to find first date <= 30 days ago
+                one_month_ago = datetime.now() - timedelta(days=30)
+                for date in reversed(hist_df.index):
+                    date_naive = date.replace(tzinfo=None) if hasattr(date, 'tzinfo') and date.tzinfo else date
+                    if date_naive <= one_month_ago:
+                        price_1m_ago = float(hist_df.loc[date, 'Close'])
+                        break
 
-            if price_3m_ago and price_3m_ago > 0:
-                change_3m_pct = ((current_price - price_3m_ago) / price_3m_ago) * 100
+                # Fallback: if no 30-day price found but we have data, use oldest
+                if price_1m_ago is None:
+                    price_1m_ago = oldest_price
 
+                if price_1m_ago and price_1m_ago > 0:
+                    change_1m_pct = ((current_price - price_1m_ago) / price_1m_ago) * 100
+
+            # Note: 52-week data not available from batch download
+            # Screener handles this in a separate phase
             historical_data = HistoricalPriceData(
                 ticker=ticker,
                 source=self.name,
@@ -502,7 +524,9 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                 price_1m_ago=price_1m_ago,
                 price_3m_ago=price_3m_ago,
                 change_1m_pct=change_1m_pct,
-                change_3m_pct=change_3m_pct
+                change_3m_pct=change_3m_pct,
+                fifty_two_week_high=None,
+                fifty_two_week_low=None
             )
 
             return ProviderResult(

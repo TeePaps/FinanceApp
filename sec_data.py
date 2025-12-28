@@ -188,7 +188,7 @@ def fetch_company_eps(ticker, cik):
                                 }
                 return annual
 
-            # Extract all EPS types
+            # Extract all EPS types from US-GAAP
             all_eps_data = {}
             for field_name, label in eps_fields:
                 eps_data = extract_annual_eps(field_name, label)
@@ -196,6 +196,104 @@ def fetch_company_eps(ticker, cik):
                     if year not in all_eps_data:
                         all_eps_data[year] = []
                     all_eps_data[year].append(data)
+
+            # Fallback 1: Check IFRS section for foreign companies
+            if not all_eps_data:
+                ifrs = data.get('facts', {}).get('ifrs-full', {})
+                if ifrs:
+                    ifrs_eps_fields = [
+                        ('DilutedEarningsLossPerShare', 'Diluted EPS (IFRS)'),
+                        ('BasicEarningsLossPerShare', 'Basic EPS (IFRS)'),
+                        ('BasicAndDilutedEarningsLossPerShare', 'EPS (IFRS)'),
+                    ]
+
+                    def extract_ifrs_eps(field_name, label):
+                        """Extract annual EPS from IFRS filings (20-F, 40-F, or 10-K)"""
+                        if field_name not in ifrs:
+                            return {}
+                        # Check both USD/shares and other currencies
+                        units = ifrs[field_name].get('units', {})
+                        # Prefer USD, but accept EUR/GBP if USD not available
+                        for unit_key in ['USD/shares', 'EUR/shares', 'GBP/shares']:
+                            if unit_key in units:
+                                eps_records = units[unit_key]
+                                annual = {}
+                                for r in eps_records:
+                                    form = r.get('form', '')
+                                    # Accept 20-F, 40-F (foreign filer annual) or 10-K
+                                    if form in ['20-F', '40-F', '10-K']:
+                                        frame = r.get('frame', '')
+                                        if frame and 'Q' not in frame:
+                                            try:
+                                                year = int(frame.replace('CY', ''))
+                                            except ValueError:
+                                                continue
+                                            if year not in annual or r.get('filed', '') > annual[year].get('filed', ''):
+                                                currency = unit_key.split('/')[0]
+                                                annual[year] = {
+                                                    'year': year,
+                                                    'eps': r['val'],
+                                                    'filed': r.get('filed'),
+                                                    'start': r.get('start'),
+                                                    'end': r.get('end'),
+                                                    'eps_type': f"{label} ({currency})"
+                                                }
+                                if annual:
+                                    return annual
+                        return {}
+
+                    for field_name, label in ifrs_eps_fields:
+                        eps_data = extract_ifrs_eps(field_name, label)
+                        for year, eps_entry in eps_data.items():
+                            if year not in all_eps_data:
+                                all_eps_data[year] = []
+                            all_eps_data[year].append(eps_entry)
+
+            # Fallback 2: Calculate EPS from Net Income / Shares Outstanding
+            if not all_eps_data:
+                net_income = us_gaap.get('NetIncomeLoss', {}).get('units', {}).get('USD', [])
+                # Try multiple share fields
+                shares = None
+                for share_field in ['CommonStockSharesOutstanding',
+                                    'WeightedAverageNumberOfDilutedSharesOutstanding',
+                                    'WeightedAverageNumberOfSharesOutstandingBasic']:
+                    if share_field in us_gaap:
+                        shares = us_gaap[share_field].get('units', {}).get('shares', [])
+                        if shares:
+                            break
+
+                if net_income and shares:
+                    # Build year-indexed dicts
+                    ni_by_year = {}
+                    for r in net_income:
+                        if r.get('form') == '10-K' and r.get('fy'):
+                            fy = r['fy']
+                            if fy not in ni_by_year or r.get('filed', '') > ni_by_year[fy].get('filed', ''):
+                                ni_by_year[fy] = r
+
+                    sh_by_year = {}
+                    for r in shares:
+                        if r.get('form') == '10-K' and r.get('fy'):
+                            fy = r['fy']
+                            if fy not in sh_by_year or r.get('filed', '') > sh_by_year[fy].get('filed', ''):
+                                sh_by_year[fy] = r
+
+                    # Calculate EPS for years with both values
+                    for year in set(ni_by_year.keys()) & set(sh_by_year.keys()):
+                        ni_val = ni_by_year[year]['val']
+                        sh_val = sh_by_year[year]['val']
+                        if sh_val and sh_val > 0:
+                            calculated_eps = ni_val / sh_val
+                            if year not in all_eps_data:
+                                all_eps_data[year] = []
+                            all_eps_data[year].append({
+                                'year': year,
+                                'eps': round(calculated_eps, 2),
+                                'filed': ni_by_year[year].get('filed'),
+                                'start': ni_by_year[year].get('start'),
+                                'end': ni_by_year[year].get('end'),
+                                'eps_type': 'Calculated (NI/Shares)'
+                            })
 
             if not all_eps_data:
                 return None
@@ -363,7 +461,7 @@ def get_sec_metrics(ticker):
     return fetch_company_metrics(ticker, cik)
 
 
-def get_sec_eps(ticker):
+def get_sec_eps(ticker, log_source=True):
     """Get SEC EPS data for a ticker, using cache when available"""
     ticker = ticker.upper()
     cached = load_company_cache(ticker)
@@ -373,21 +471,26 @@ def get_sec_eps(ticker):
         try:
             updated = datetime.fromisoformat(cached['updated'])
             if datetime.now() - updated < timedelta(days=EPS_CACHE_DAYS):
+                # Using cached data - mark it so caller knows
+                cached['_from_cache'] = True
                 return cached
         except (ValueError, TypeError):
             pass
 
-    # Fetch fresh data
+    # Fetch fresh data from SEC API
     cik = get_cik_for_ticker(ticker)
     if not cik:
         return None
 
     data = fetch_company_eps(ticker, cik)
     if data:
+        data['_from_cache'] = False
         save_company_cache(ticker, data)
         return data
 
     # Return stale cache if fetch failed
+    if cached:
+        cached['_from_cache'] = True
     return cached
 
 
