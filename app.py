@@ -731,9 +731,52 @@ def cleanup_providers():
     except Exception as e:
         print(f"[Cleanup] Error closing IBKR: {e}")
 
+
+def check_html_parser_dependencies():
+    """Check if HTML parsing dependencies are available and warn if missing."""
+    has_lxml = False
+    has_html5lib = False
+
+    try:
+        import lxml
+        has_lxml = True
+    except ImportError:
+        pass
+
+    try:
+        import html5lib
+        import bs4
+        has_html5lib = True
+    except ImportError:
+        pass
+
+    if has_lxml:
+        print("[Startup] HTML parser: lxml (fast)")
+    elif has_html5lib:
+        print("[Startup] HTML parser: html5lib (cross-platform)")
+    else:
+        print("")
+        print("=" * 60)
+        print("WARNING: No HTML parser available!")
+        print("")
+        print("Index fetching (S&P 500, Nasdaq, etc.) will not work.")
+        print("Please install one of the following:")
+        print("")
+        print("  Option 1 (cross-platform, recommended for Windows):")
+        print("    pip install beautifulsoup4 html5lib")
+        print("")
+        print("  Option 2 (faster, requires C compiler):")
+        print("    pip install lxml")
+        print("=" * 60)
+        print("")
+
+
 if __name__ == '__main__':
     import atexit
     atexit.register(cleanup_providers)
+
+    # Check cross-platform dependencies
+    check_html_parser_dependencies()
 
     # Initialize market data providers
     init_providers()

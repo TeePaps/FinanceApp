@@ -7,7 +7,14 @@ ruamel.yaml>=0.18.0
 
 # Required for index provider HTML parsing (pd.read_html)
 pandas>=2.0.0
-lxml>=4.9.0
+
+# HTML parsing - html5lib works on all platforms without compilation
+beautifulsoup4>=4.12.0
+html5lib>=1.1
+
+# Optional: lxml for faster HTML parsing (requires C compiler on Windows)
+# Install with: pip install lxml
+# lxml>=4.9.0
 
 # Background scheduler for automatic data refresh
 APScheduler>=3.10.0
