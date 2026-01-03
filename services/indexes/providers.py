@@ -18,6 +18,42 @@ from config import INDEX_PROVIDER_TIMEOUT
 
 
 # =============================================================================
+# Cross-Platform HTML Parser Detection
+# =============================================================================
+
+def _get_html_parser_flavor() -> Optional[str]:
+    """
+    Detect the best available HTML parser for pd.read_html().
+
+    Returns:
+        None: Use lxml (fastest, default when available)
+        'bs4': Use html5lib via BeautifulSoup (cross-platform fallback)
+    """
+    try:
+        import lxml
+        return None  # Let pandas use lxml (default, fastest)
+    except ImportError:
+        try:
+            import html5lib
+            import bs4
+            return 'bs4'  # Use html5lib via BeautifulSoup
+        except ImportError:
+            return None  # Will fail, but let pandas give the error
+
+
+def _read_html_safe(html_content: str, **kwargs) -> list:
+    """
+    Cross-platform wrapper for pd.read_html() that uses available parser.
+
+    Uses lxml when available (faster), falls back to html5lib on Windows.
+    """
+    flavor = _get_html_parser_flavor()
+    if flavor:
+        kwargs['flavor'] = flavor
+    return pd.read_html(StringIO(html_content), **kwargs)
+
+
+# =============================================================================
 # Data Classes
 # =============================================================================
 
@@ -152,7 +188,7 @@ class WikipediaIndexProvider(IndexProvider):
             resp = requests.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
             resp.raise_for_status()
 
-            tables = pd.read_html(StringIO(resp.text))
+            tables = _read_html_safe(resp.text)
             if table_idx >= len(tables):
                 return IndexResult(
                     success=False,
@@ -241,7 +277,7 @@ class SlickchartsIndexProvider(IndexProvider):
             resp = requests.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
             resp.raise_for_status()
 
-            tables = pd.read_html(StringIO(resp.text))
+            tables = _read_html_safe(resp.text)
             if not tables:
                 return IndexResult(
                     success=False,
