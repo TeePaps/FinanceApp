@@ -138,7 +138,7 @@ providers:
   disabled_providers:
     - alpaca
     - defeatbeta
-    - ibkr
+    - fmp
   price_cache_seconds: 3600      # 1 hour
   eps_cache_days: 1
   dividend_cache_days: 1

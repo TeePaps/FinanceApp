@@ -1,0 +1,30 @@
+{
+  "id": "split-warning",
+  "started": "2026-04-18T20:26:00Z",
+  "lastUpdated": "2026-04-18T20:50:00Z",
+  "status": "complete",
+  "phase": "complete",
+  "progress": {
+    "discovery": { "answered": 5, "total": 5 },
+    "detail": { "answered": 5, "total": 5 }
+  },
+  "contextFiles": [
+    "templates/index.html",
+    "routes/valuation.py",
+    "routes/screener.py",
+    "services/valuation.py",
+    "services/recommendations.py",
+    "services/providers/sec_provider.py",
+    "services/providers/yfinance_provider.py",
+    "sec_data.py",
+    "database.py",
+    "config.py",
+    "static/app.js",
+    "static/js/utils.js"
+  ],
+  "relatedFeatures": [
+    "staleness dashboard",
+    "selloff severity badge",
+    "EPS validation / sanity checks"
+  ]
+}
