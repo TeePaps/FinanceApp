@@ -85,6 +85,14 @@ PE_RATIO_MULTIPLIER = _get('valuation.pe_ratio_multiplier', 10)
 MIN_EPS_YEARS = _get('valuation.min_eps_years', 3)
 RECOMMENDED_EPS_YEARS = _get('valuation.recommended_eps_years', 8)
 
+# Sanity bounds for the (eps_avg + dividend) * multiplier formula.
+# Companies with non-positive avg EPS produce meaningless negative "fair values".
+# Companies whose SEC EPS doesn't fit the per-share formula (e.g., BRK-B's class B
+# structure) can produce wildly off values. If the computed fair value isn't
+# between LOW * price and HIGH * price, treat it as untrusted (set to None).
+ESTIMATED_VALUE_RATIO_LOW = _get('valuation.sanity_ratio_low', 0.1)
+ESTIMATED_VALUE_RATIO_HIGH = _get('valuation.sanity_ratio_high', 10.0)
+
 # ============================================================================
 # Split Warning Settings
 # ============================================================================
