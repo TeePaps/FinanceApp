@@ -228,6 +228,24 @@ def calculate_valuation(ticker):
             annual_dividend = dividend_data.annual_dividend
             dividend_info = dividend_data.payments
 
+        # yfinance flakiness guard: if fresh fetch returned 0 but the cache
+        # has a non-zero dividend, the fresh fetch is almost certainly wrong.
+        # Preserve the cached value instead of producing a bogus fair value.
+        # Note: the explicit /api/valuation/<ticker>/refresh endpoint bypasses
+        # calculate_valuation and writes the fresh value directly, so a user
+        # who really wants to clear a dividend can still do so.
+        if not annual_dividend or annual_dividend <= 0:
+            import database as db
+            cached = db.get_valuation(ticker) or {}
+            cached_div = cached.get('annual_dividend') or 0
+            if cached_div > 0:
+                from logger import log
+                log.warning(
+                    f"[{ticker}] fresh dividend fetch returned 0; "
+                    f"preserving cached ${cached_div:.2f}"
+                )
+                annual_dividend = cached_div
+
         # Get selloff metrics via orchestrator
         selloff_metrics = None
         selloff_result = orchestrator.fetch_selloff(ticker)

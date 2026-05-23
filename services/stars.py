@@ -643,9 +643,14 @@ def _explain_shares_buyback(ticker, is_holding, first_buy_date):
     }
 
 
-def explain_stars(ticker: str) -> Dict:
+def explain_stars(ticker: str, valuation_override: Optional[Dict] = None) -> Dict:
     """
     Return a per-criterion breakdown for the Company Profile page table.
+
+    When `valuation_override` is provided (e.g., from the fresh
+    /api/valuation/<ticker> response), its non-null fields are merged over
+    the cached `valuations` row. This guarantees the Company Profile's
+    formula card and explain table show the same numbers.
 
     Shape:
       {
@@ -657,7 +662,15 @@ def explain_stars(ticker: str) -> Dict:
       }
     """
     ticker = ticker.upper()
-    valuation = db.get_valuation(ticker) or {}
+    cached = db.get_valuation(ticker) or {}
+    if valuation_override:
+        # Only use the override's non-null values; fall back to cache otherwise.
+        valuation = dict(cached)
+        for k, v in valuation_override.items():
+            if v is not None:
+                valuation[k] = v
+    else:
+        valuation = cached
     is_holding = ticker in _holdings_ticker_set()
     first_buy = db.get_first_buy_date(ticker) if is_holding else None
     yearly_divs = fetch_yearly_dividends(ticker)

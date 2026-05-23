@@ -21,8 +21,23 @@ valuation_bp = Blueprint('valuation', __name__, url_prefix='/api')
 
 @valuation_bp.route('/valuation/<ticker>')
 def api_valuation(ticker):
-    """Calculate stock valuation using EPS and dividend formula."""
+    """Calculate stock valuation using EPS and dividend formula.
+
+    Also lazy-writes the result to the cache so the Stars tab and the
+    /api/stars/<ticker>/explanation endpoint see the same data. New / stale
+    tickers no longer display "missing X" rows on the Company Profile page.
+    """
     result = calculate_valuation(ticker.upper())
+    # Lazy-write cache: only if we got real values (don't poison cache with errors)
+    if (isinstance(result, dict)
+            and not result.get('error')
+            and result.get('current_price') is not None
+            and result.get('estimated_value') is not None):
+        try:
+            data_manager.update_valuation(ticker.upper(), result)
+        except Exception:
+            # Never fail the read because the cache write failed.
+            pass
     return jsonify(result)
 
 

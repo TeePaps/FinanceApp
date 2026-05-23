@@ -8,7 +8,7 @@ Endpoints:
 """
 
 import threading
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 
 import database as db
 from services.activity_log import activity_log
@@ -102,12 +102,21 @@ def api_stars_status():
     return jsonify({'success': True, 'running': _recalc_running})
 
 
-@stars_bp.route('/stars/<ticker>/explanation', methods=['GET'])
+@stars_bp.route('/stars/<ticker>/explanation', methods=['GET', 'POST'])
 def api_stars_explanation(ticker):
-    """Return the 6-criterion breakdown with underlying numbers for one ticker."""
+    """Return the 6-criterion breakdown with underlying numbers for one ticker.
+
+    POST body (optional): {"valuation": {current_price, estimated_value,
+    eps_avg, annual_dividend, ...}} — pass through fresh valuation so the
+    explain table agrees with the formula card on the Company Profile page.
+    """
     from services.stars import explain_stars
+    valuation_override = None
+    if request.method == 'POST':
+        body = request.get_json(silent=True) or {}
+        valuation_override = body.get('valuation')
     try:
-        data = explain_stars(ticker.upper())
+        data = explain_stars(ticker.upper(), valuation_override=valuation_override)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500

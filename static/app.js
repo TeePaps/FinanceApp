@@ -2465,7 +2465,7 @@ function renderValuation(data, refreshInfo = '') {
     // Load price chart after DOM update
     if (data.ticker) {
         loadPriceChart(data.ticker, data.estimated_value);
-        loadStarsExplanation(data.ticker);
+        loadStarsExplanation(data.ticker, data);
     }
 }
 
@@ -5028,11 +5028,18 @@ async function pollStarsStatus(btn) {
 
 // --- Star Rating Breakdown (Company Profile page) ---
 
-async function loadStarsExplanation(ticker) {
+async function loadStarsExplanation(ticker, valuation) {
     const target = document.getElementById('stars-explanation-target');
     if (!target) return;
     try {
-        const res = await fetch(`/api/stars/${encodeURIComponent(ticker)}/explanation`);
+        // POST the fresh valuation so the explain table and the formula
+        // card on the same page always show the same numbers.
+        const hasValuation = !!valuation;
+        const res = await fetch(`/api/stars/${encodeURIComponent(ticker)}/explanation`, {
+            method: hasValuation ? 'POST' : 'GET',
+            headers: hasValuation ? {'Content-Type': 'application/json'} : undefined,
+            body: hasValuation ? JSON.stringify({valuation}) : undefined,
+        });
         const json = await res.json();
         if (!json.success || !json.data) {
             target.innerHTML = '<div class="empty-state">Star breakdown unavailable for this ticker.</div>';
