@@ -12,8 +12,42 @@ import math
 from datetime import datetime, timedelta
 from config import (
     PE_RATIO_MULTIPLIER, RECOMMENDED_EPS_YEARS,
+    ESTIMATED_VALUE_RATIO_LOW, ESTIMATED_VALUE_RATIO_HIGH,
     SPLIT_WARNING_LOOKBACK_YEARS, SPLIT_WARNING_RECENT_YEARS, SPLIT_WARNING_MIN_RATIO,
 )
+
+
+def compute_estimated_value(eps_avg, annual_dividend, current_price=None):
+    """
+    Canonical fair-value computation: (eps_avg + annual_dividend) * multiplier,
+    with sanity guards that return (None, None) when the result is meaningless.
+
+    Returns (estimated_value, price_vs_value). Either may be None.
+
+    Sanity rules — return (None, None) when:
+      - eps_avg is None or eps_avg <= 0  (e.g., company averaged losses)
+      - computed value <= 0              (defense in depth)
+      - current_price > 0 AND the value is outside [LOW * price, HIGH * price]
+        (catches tickers whose SEC EPS doesn't fit the per-share formula,
+         e.g. BRK-B's class B share structure giving avg EPS of $0.01)
+
+    Called from calculate_valuation() and all four screener variants so the
+    same rules apply everywhere fair value is built.
+    """
+    if eps_avg is None or eps_avg <= 0:
+        return None, None
+    annual_dividend = annual_dividend or 0
+    ev = (eps_avg + annual_dividend) * PE_RATIO_MULTIPLIER
+    if ev <= 0:
+        return None, None
+    if current_price is not None and current_price > 0:
+        low_bound = ESTIMATED_VALUE_RATIO_LOW * current_price
+        high_bound = ESTIMATED_VALUE_RATIO_HIGH * current_price
+        if ev < low_bound or ev > high_bound:
+            return None, None
+        pvv = ((current_price - ev) / ev) * 100
+        return round(ev, 2), round(pvv, 1)
+    return round(ev, 2), None
 
 
 def get_validated_eps(ticker):
@@ -264,19 +298,13 @@ def calculate_valuation(ticker):
         refresh_splits(ticker, orchestrator=orchestrator)
         split_warning = compute_split_warning(ticker)
 
-        # Calculate valuation: (Average EPS over up to 8 years + Annual Dividend) x multiplier
+        # Calculate valuation via the shared helper (sanity checks + None on bad input).
         eps_avg = None
-        estimated_value = None
-        price_vs_value = None
-
         if len(eps_data) > 0:
             eps_avg = sum(e['eps'] for e in eps_data) / len(eps_data)
-
-            # Formula: (Average EPS + Annual Dividend) x PE_RATIO_MULTIPLIER
-            estimated_value = (eps_avg + annual_dividend) * PE_RATIO_MULTIPLIER
-
-            if current_price and current_price > 0 and estimated_value > 0:
-                price_vs_value = ((current_price - estimated_value) / estimated_value) * 100
+        estimated_value, price_vs_value = compute_estimated_value(
+            eps_avg, annual_dividend, current_price
+        )
 
         return {
             'ticker': ticker,

@@ -27,7 +27,7 @@ from config import (
 )
 from logger import log, log_error
 from services.providers import get_orchestrator
-from services.valuation import get_validated_eps, calculate_valuation
+from services.valuation import get_validated_eps, calculate_valuation, compute_estimated_value
 from services.indexes import (
     VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES,
     fetch_index_tickers
@@ -482,12 +482,9 @@ def run_screener(index_name='all'):
         if eps_info.get('company_name'):
             company_name = eps_info['company_name']
 
-        estimated_value = None
-        price_vs_value = None
-        if eps_avg and eps_avg > 0:
-            estimated_value = (eps_avg + annual_dividend) * 10
-            if estimated_value > 0:
-                price_vs_value = ((current_price - estimated_value) / estimated_value) * 100
+        estimated_value, price_vs_value = compute_estimated_value(
+            eps_avg, annual_dividend, current_price
+        )
 
         in_selloff = False
         selloff_severity = 'none'
@@ -724,12 +721,9 @@ def run_quick_price_update(index_name='all'):
                 if fifty_two_week_high and fifty_two_week_high > 0:
                     off_high_pct = ((current_price - fifty_two_week_high) / fifty_two_week_high) * 100
 
-                estimated_value = existing.get('estimated_value')
-                price_vs_value = None
-                if eps_avg and eps_avg > 0:
-                    estimated_value = (eps_avg + annual_dividend) * 10
-                    if estimated_value > 0:
-                        price_vs_value = ((current_price - estimated_value) / estimated_value) * 100
+                estimated_value, price_vs_value = compute_estimated_value(
+                    eps_avg, annual_dividend, current_price
+                )
 
                 pc_3m = price_change_3m.get(ticker) if ticker in price_change_3m.index else None
                 pc_1m = price_change_1m.get(ticker) if ticker in price_change_1m.index else None
@@ -916,12 +910,9 @@ def run_smart_update(index_name='all'):
                         if fifty_two_week_high and fifty_two_week_high > 0:
                             off_high_pct = ((current_price - fifty_two_week_high) / fifty_two_week_high) * 100
 
-                        estimated_value = existing.get('estimated_value')
-                        price_vs_value = None
-                        if eps_avg and eps_avg > 0:
-                            estimated_value = (eps_avg + annual_dividend) * 10
-                            if estimated_value > 0:
-                                price_vs_value = ((current_price - estimated_value) / estimated_value) * 100
+                        estimated_value, price_vs_value = compute_estimated_value(
+                            eps_avg, annual_dividend, current_price
+                        )
 
                         pc_3m = price_change_3m.get(ticker) if ticker in price_change_3m.index else None
                         pc_1m = price_change_1m.get(ticker) if ticker in price_change_1m.index else None
@@ -1139,12 +1130,9 @@ def run_global_refresh():
         fifty_two_week_low = existing.get('fifty_two_week_low', 0)
         annual_dividend = existing.get('annual_dividend', 0)
 
-        estimated_value = None
-        price_vs_value = None
-        if eps_avg and eps_avg > 0:
-            estimated_value = (eps_avg + annual_dividend) * 10
-            if current_price and estimated_value > 0:
-                price_vs_value = ((current_price - estimated_value) / estimated_value) * 100
+        estimated_value, price_vs_value = compute_estimated_value(
+            eps_avg, annual_dividend, current_price
+        )
 
         off_high_pct = None
         if fifty_two_week_high and current_price:

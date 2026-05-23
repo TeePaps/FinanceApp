@@ -1,0 +1,19 @@
+{
+  "id": "recommendations-negative-fair-value",
+  "started": "2026-05-23T14:53:00Z",
+  "lastUpdated": "2026-05-23T15:01:00Z",
+  "status": "complete",
+  "phase": "complete",
+  "progress": {
+    "discovery": { "answered": 3, "total": 3 },
+    "detail": { "answered": 0, "total": 0 }
+  },
+  "contextFiles": [
+    "services/valuation.py",
+    "services/screener.py",
+    "services/recommendations.py",
+    "config.py"
+  ],
+  "relatedFeatures": [],
+  "notes": "Phase 4 detail questions skipped — fix is well-scoped: new compute_estimated_value() helper + apply in 4 places + recommendation filter + one-shot cleanup script."
+}

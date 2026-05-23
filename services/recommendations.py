@@ -169,7 +169,10 @@ def get_top_recommendations(valuations, ticker_indexes=None, limit=10,
         if not val.get('current_price') or val.get('current_price', 0) <= 0:
             excluded['no_price'] += 1
             continue
-        if val.get('price_vs_value') is None:
+        # No fair value (None) means the sanity rules in compute_estimated_value
+        # rejected it — e.g., averaged losses or BRK-B-style structural issues.
+        # These tickers must NOT appear in recommendations.
+        if val.get('estimated_value') is None or val.get('price_vs_value') is None:
             excluded['no_valuation'] += 1
             continue
 
