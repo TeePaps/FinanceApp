@@ -184,6 +184,19 @@ def _init_public_database():
             )
         ''')
 
+        # Split History table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS split_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                split_date TEXT NOT NULL,
+                split_ratio REAL,
+                source TEXT,
+                fetched_at TEXT,
+                UNIQUE(ticker, split_date)
+            )
+        ''')
+
         # CIK Mapping table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS cik_mapping (
@@ -227,12 +240,80 @@ def _init_public_database():
             )
         ''')
 
+        # Star Ratings table - 6-criterion scoring system
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS star_ratings (
+                ticker TEXT PRIMARY KEY,
+                earnings_beat INTEGER NOT NULL DEFAULT 0,
+                fair_value_up INTEGER NOT NULL DEFAULT 0,
+                dividend_up INTEGER NOT NULL DEFAULT 0,
+                debt_to_capital_low INTEGER NOT NULL DEFAULT 0,
+                shares_buyback INTEGER NOT NULL DEFAULT 0,
+                undervalued INTEGER NOT NULL DEFAULT 0,
+                total_stars INTEGER NOT NULL DEFAULT 0,
+                is_holding INTEGER NOT NULL DEFAULT 0,
+                updated TEXT
+            )
+        ''')
+
+        # Valuation History - snapshots of fair value over time
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS valuation_history (
+                ticker TEXT NOT NULL,
+                snapshot_date TEXT NOT NULL,
+                estimated_value REAL,
+                eps_avg REAL,
+                annual_dividend REAL,
+                PRIMARY KEY (ticker, snapshot_date)
+            )
+        ''')
+
+        # Dividend History - annual dividend totals by year
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dividend_history (
+                ticker TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                annual_dividend REAL,
+                PRIMARY KEY (ticker, year)
+            )
+        ''')
+
+        # Shares Outstanding History - track share count over time
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS shares_outstanding_history (
+                ticker TEXT NOT NULL,
+                as_of_date TEXT NOT NULL,
+                shares REAL,
+                source TEXT,
+                PRIMARY KEY (ticker, as_of_date)
+            )
+        ''')
+
+        # Balance Sheet - current debt/equity for debt-to-capital ratio
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS balance_sheet (
+                ticker TEXT PRIMARY KEY,
+                long_term_debt REAL,
+                short_term_debt REAL,
+                stockholders_equity REAL,
+                debt_to_capital REAL,
+                as_of_date TEXT,
+                source TEXT,
+                updated TEXT
+            )
+        ''')
+
         # Create indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticker_indexes_ticker ON ticker_indexes(ticker)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticker_indexes_index ON ticker_indexes(index_name)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_eps_history_ticker ON eps_history(ticker)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuations_price_vs_value ON valuations(price_vs_value)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sec_filings_ticker ON sec_filings(ticker)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_split_history_ticker ON split_history(ticker)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_star_ratings_total ON star_ratings(total_stars DESC)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuation_history_ticker ON valuation_history(ticker)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_dividend_history_ticker ON dividend_history(ticker)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_shares_history_ticker ON shares_outstanding_history(ticker)')
 
         # Migrations - add columns if they don't exist
         cursor.execute('PRAGMA table_info(valuations)')
@@ -1056,6 +1137,92 @@ def add_new_eps_years(ticker: str, eps_list: list) -> int:
 
 
 # =============================================================================
+# Split History Operations
+# =============================================================================
+
+def upsert_splits(ticker: str, splits: List[Dict], source: str):
+    """
+    Insert or replace stock split records for a ticker.
+
+    Uses INSERT OR REPLACE on UNIQUE(ticker, split_date) so providers can
+    refresh their previous entries (e.g. a corrected ratio) without creating
+    duplicates. Records from any source are kept — de-duping is by date.
+
+    Args:
+        ticker: Stock ticker symbol
+        splits: List of dicts with 'date' (YYYY-MM-DD) and 'ratio' (float)
+        source: Provider name that supplied the splits
+    """
+    ticker = ticker.upper()
+    now = datetime.now().isoformat()
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        for event in splits:
+            split_date = event.get('date')
+            split_ratio = event.get('ratio')
+            if not split_date or split_ratio is None:
+                continue
+            cursor.execute('''
+                INSERT INTO split_history (ticker, split_date, split_ratio, source, fetched_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(ticker, split_date) DO UPDATE SET
+                    split_ratio = excluded.split_ratio,
+                    source = excluded.source,
+                    fetched_at = excluded.fetched_at
+            ''', (ticker, split_date, float(split_ratio), source, now))
+
+
+def get_splits(ticker: str, since_date: Optional[str] = None) -> List[Dict]:
+    """
+    Get stock split history for a ticker, newest first.
+
+    Args:
+        ticker: Stock ticker symbol
+        since_date: Optional ISO date (YYYY-MM-DD) — only return splits on/after
+
+    Returns:
+        List of dicts with keys: date, ratio, source, fetched_at
+    """
+    ticker = ticker.upper()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if since_date:
+            cursor.execute('''
+                SELECT split_date, split_ratio, source, fetched_at
+                FROM split_history
+                WHERE ticker = ? AND split_date >= ?
+                ORDER BY split_date DESC
+            ''', (ticker, since_date))
+        else:
+            cursor.execute('''
+                SELECT split_date, split_ratio, source, fetched_at
+                FROM split_history
+                WHERE ticker = ?
+                ORDER BY split_date DESC
+            ''', (ticker,))
+        return [
+            {
+                'date': row['split_date'],
+                'ratio': row['split_ratio'],
+                'source': row['source'],
+                'fetched_at': row['fetched_at'],
+            }
+            for row in cursor.fetchall()
+        ]
+
+
+def get_split_history_last_updated(ticker: str) -> Optional[str]:
+    """Get the most recent split fetched_at timestamp for a ticker."""
+    ticker = ticker.upper()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT MAX(fetched_at) AS latest FROM split_history WHERE ticker = ?', (ticker,))
+        row = cursor.fetchone()
+        return row['latest'] if row else None
+
+
+# =============================================================================
 # SEC Filings Operations (10-K document URLs)
 # =============================================================================
 
@@ -1598,6 +1765,193 @@ def get_data_stats() -> Dict:
             'status_last_updated': status_updated,
             'valuations_last_updated': valuations_updated
         }
+
+
+# =============================================================================
+# Star Ratings Operations
+# =============================================================================
+
+CRITERION_COLUMNS = (
+    'earnings_beat',
+    'fair_value_up',
+    'dividend_up',
+    'debt_to_capital_low',
+    'shares_buyback',
+    'undervalued',
+)
+
+
+def bulk_update_star_ratings(ratings: Dict[str, Dict]):
+    """Bulk upsert star ratings for many tickers."""
+    now = datetime.now().isoformat()
+    with get_public_db() as conn:
+        cursor = conn.cursor()
+        for ticker, rating in ratings.items():
+            ticker_u = ticker.upper()
+            vals = [1 if rating.get(c) else 0 for c in CRITERION_COLUMNS]
+            total = sum(vals)
+            is_holding = 1 if rating.get('is_holding') else 0
+            cursor.execute('''
+                INSERT INTO star_ratings (
+                    ticker, earnings_beat, fair_value_up, dividend_up,
+                    debt_to_capital_low, shares_buyback, undervalued,
+                    total_stars, is_holding, updated
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    earnings_beat = excluded.earnings_beat,
+                    fair_value_up = excluded.fair_value_up,
+                    dividend_up = excluded.dividend_up,
+                    debt_to_capital_low = excluded.debt_to_capital_low,
+                    shares_buyback = excluded.shares_buyback,
+                    undervalued = excluded.undervalued,
+                    total_stars = excluded.total_stars,
+                    is_holding = excluded.is_holding,
+                    updated = excluded.updated
+            ''', (ticker_u, *vals, total, is_holding, now))
+
+
+def get_star_ratings() -> List[Dict]:
+    """Get all star ratings joined with valuation data needed for display."""
+    with get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT s.ticker, s.earnings_beat, s.fair_value_up, s.dividend_up,
+                   s.debt_to_capital_low, s.shares_buyback, s.undervalued,
+                   s.total_stars, s.is_holding, s.updated,
+                   v.company_name, v.current_price, v.estimated_value,
+                   v.price_vs_value, v.annual_dividend
+            FROM star_ratings s
+            LEFT JOIN valuations v ON s.ticker = v.ticker
+            ORDER BY s.total_stars DESC, s.ticker ASC
+        ''')
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def snapshot_valuation(ticker: str, snapshot_date: str, estimated_value: Optional[float],
+                       eps_avg: Optional[float], annual_dividend: Optional[float]):
+    """Insert or replace a valuation snapshot for a given date."""
+    with get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO valuation_history (ticker, snapshot_date, estimated_value, eps_avg, annual_dividend)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(ticker, snapshot_date) DO UPDATE SET
+                estimated_value = excluded.estimated_value,
+                eps_avg = excluded.eps_avg,
+                annual_dividend = excluded.annual_dividend
+        ''', (ticker.upper(), snapshot_date, estimated_value, eps_avg, annual_dividend))
+
+
+def get_valuation_history(ticker: str) -> List[Dict]:
+    """Get all valuation snapshots for a ticker, newest first."""
+    with get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT snapshot_date, estimated_value, eps_avg, annual_dividend
+            FROM valuation_history WHERE ticker = ?
+            ORDER BY snapshot_date DESC
+        ''', (ticker.upper(),))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def snapshot_dividend_year(ticker: str, year: int, annual_dividend: float):
+    """Record annual dividend total for a given calendar year."""
+    with get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO dividend_history (ticker, year, annual_dividend)
+            VALUES (?, ?, ?)
+            ON CONFLICT(ticker, year) DO UPDATE SET
+                annual_dividend = excluded.annual_dividend
+        ''', (ticker.upper(), year, annual_dividend))
+
+
+def get_dividend_history(ticker: str) -> Dict[int, float]:
+    """Get all stored annual dividends for a ticker as {year: amount}."""
+    with get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT year, annual_dividend FROM dividend_history WHERE ticker = ?
+        ''', (ticker.upper(),))
+        return {row['year']: row['annual_dividend'] for row in cursor.fetchall()}
+
+
+def snapshot_shares_outstanding(ticker: str, as_of_date: str, shares: float, source: Optional[str] = None):
+    """Record shares outstanding for a given date."""
+    with get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO shares_outstanding_history (ticker, as_of_date, shares, source)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(ticker, as_of_date) DO UPDATE SET
+                shares = excluded.shares,
+                source = excluded.source
+        ''', (ticker.upper(), as_of_date, shares, source))
+
+
+def get_shares_outstanding_history(ticker: str) -> List[Dict]:
+    """Get all shares outstanding entries for a ticker, oldest first."""
+    with get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT as_of_date, shares, source
+            FROM shares_outstanding_history WHERE ticker = ?
+            ORDER BY as_of_date ASC
+        ''', (ticker.upper(),))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def update_balance_sheet(ticker: str, data: Dict):
+    """Upsert balance sheet data for a ticker."""
+    now = datetime.now().isoformat()
+    with get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO balance_sheet (
+                ticker, long_term_debt, short_term_debt, stockholders_equity,
+                debt_to_capital, as_of_date, source, updated
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET
+                long_term_debt = excluded.long_term_debt,
+                short_term_debt = excluded.short_term_debt,
+                stockholders_equity = excluded.stockholders_equity,
+                debt_to_capital = excluded.debt_to_capital,
+                as_of_date = excluded.as_of_date,
+                source = excluded.source,
+                updated = excluded.updated
+        ''', (
+            ticker.upper(),
+            data.get('long_term_debt'),
+            data.get('short_term_debt'),
+            data.get('stockholders_equity'),
+            data.get('debt_to_capital'),
+            data.get('as_of_date'),
+            data.get('source'),
+            now,
+        ))
+
+
+def get_balance_sheet(ticker: str) -> Optional[Dict]:
+    """Get the latest balance sheet for a ticker."""
+    with get_public_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM balance_sheet WHERE ticker = ?', (ticker.upper(),))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_first_buy_date(ticker: str) -> Optional[str]:
+    """Get the earliest buy transaction date for a ticker, or None."""
+    with get_private_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT MIN(date) AS first_buy FROM transactions
+            WHERE ticker = ? AND LOWER(action) = 'buy' AND date IS NOT NULL
+        ''', (ticker.upper(),))
+        row = cursor.fetchone()
+        return row['first_buy'] if row and row['first_buy'] else None
 
 
 # Initialize databases on import if needed

@@ -1,0 +1,18 @@
+{
+  "id": "stars-fair-value-mismatch",
+  "started": "2026-05-22T22:18:00Z",
+  "lastUpdated": "2026-05-22T22:24:00Z",
+  "status": "complete",
+  "phase": "complete",
+  "progress": {
+    "discovery": { "answered": 3, "total": 3 },
+    "detail": { "answered": 0, "total": 0 }
+  },
+  "contextFiles": [
+    "services/screener.py",
+    "services/valuation.py",
+    "database.py"
+  ],
+  "relatedFeatures": ["2026-05-22-2048-star-scoring-system"],
+  "notes": "Phase 4 detail questions skipped — bug is well-understood, fix is well-scoped. Implementation touches services/screener.py + new scripts/backfill_valuations.py."
+}

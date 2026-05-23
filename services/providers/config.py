@@ -79,6 +79,10 @@ class ProviderConfig:
     price_providers: List[str] = field(default_factory=lambda: ["ibkr", "yfinance", "alpaca", "fmp", "defeatbeta"])
     eps_providers: List[str] = field(default_factory=lambda: ["sec_edgar", "yfinance", "defeatbeta"])
     dividend_providers: List[str] = field(default_factory=lambda: ["yfinance"])
+    split_providers: List[str] = field(default_factory=lambda: ["yfinance", "fmp", "alpaca", "sec_edgar"])
+    analyst_estimate_providers: List[str] = field(default_factory=lambda: ["yfinance"])
+    balance_sheet_providers: List[str] = field(default_factory=lambda: ["sec_edgar"])
+    shares_outstanding_providers: List[str] = field(default_factory=lambda: ["sec_edgar", "yfinance"])
 
     # Disabled providers (excluded from fetching even if configured)
     disabled_providers: List[str] = field(default_factory=lambda: ["fmp"])
@@ -87,6 +91,7 @@ class ProviderConfig:
     price_cache_seconds: int = 3600
     eps_cache_days: int = 1
     dividend_cache_days: int = 1
+    split_cache_days: int = 7
 
     # Rate limiting
     default_rate_limit: float = 0.2
@@ -115,10 +120,15 @@ class ProviderConfig:
             price_providers=list(_get_value(providers, 'price_providers', ["ibkr", "yfinance", "alpaca", "fmp", "defeatbeta"])),
             eps_providers=list(_get_value(providers, 'eps_providers', ["sec_edgar", "yfinance", "defeatbeta"])),
             dividend_providers=list(_get_value(providers, 'dividend_providers', ["yfinance"])),
+            split_providers=list(_get_value(providers, 'split_providers', ["yfinance", "fmp", "alpaca", "sec_edgar"])),
+            analyst_estimate_providers=list(_get_value(providers, 'analyst_estimate_providers', ["yfinance"])),
+            balance_sheet_providers=list(_get_value(providers, 'balance_sheet_providers', ["sec_edgar"])),
+            shares_outstanding_providers=list(_get_value(providers, 'shares_outstanding_providers', ["sec_edgar", "yfinance"])),
             disabled_providers=list(_get_value(providers, 'disabled_providers', ["fmp"])),
             price_cache_seconds=_get_value(providers, 'price_cache_seconds', 3600),
             eps_cache_days=_get_value(providers, 'eps_cache_days', 1),
             dividend_cache_days=_get_value(providers, 'dividend_cache_days', 1),
+            split_cache_days=_get_value(providers, 'split_cache_days', 7),
             default_rate_limit=_get_value(providers, 'default_rate_limit', 0.2),
             batch_size=_get_value(providers, 'batch_size', 100),
             prefer_batch=_get_value(providers, 'prefer_batch', True),
@@ -154,12 +164,17 @@ class ProviderConfig:
         update_list('price_providers', self.price_providers)
         update_list('eps_providers', self.eps_providers)
         update_list('dividend_providers', self.dividend_providers)
+        update_list('split_providers', self.split_providers)
+        update_list('analyst_estimate_providers', self.analyst_estimate_providers)
+        update_list('balance_sheet_providers', self.balance_sheet_providers)
+        update_list('shares_outstanding_providers', self.shares_outstanding_providers)
         update_list('disabled_providers', self.disabled_providers)
 
         # Scalar values can be replaced directly
         providers['price_cache_seconds'] = self.price_cache_seconds
         providers['eps_cache_days'] = self.eps_cache_days
         providers['dividend_cache_days'] = self.dividend_cache_days
+        providers['split_cache_days'] = self.split_cache_days
         providers['default_rate_limit'] = self.default_rate_limit
         providers['batch_size'] = self.batch_size
         providers['prefer_batch'] = self.prefer_batch
@@ -245,6 +260,16 @@ def set_dividend_providers(providers: List[str]):
     update_config(dividend_providers=providers)
 
 
+def get_split_providers() -> List[str]:
+    """Get ordered list of split provider names."""
+    return get_config().split_providers
+
+
+def set_split_providers(providers: List[str]):
+    """Set split provider order."""
+    update_config(split_providers=providers)
+
+
 def get_provider_order(data_type: str) -> List[str]:
     """Get provider order for a specific data type."""
     config = get_config()
@@ -254,6 +279,8 @@ def get_provider_order(data_type: str) -> List[str]:
         return config.eps_providers
     elif data_type == 'dividend':
         return config.dividend_providers
+    elif data_type == 'split':
+        return config.split_providers
     else:
         raise ValueError(f"Unknown data type: {data_type}")
 
@@ -266,6 +293,8 @@ def set_provider_order(data_type: str, providers: List[str]):
         set_eps_providers(providers)
     elif data_type == 'dividend':
         set_dividend_providers(providers)
+    elif data_type == 'split':
+        set_split_providers(providers)
     else:
         raise ValueError(f"Unknown data type: {data_type}")
 

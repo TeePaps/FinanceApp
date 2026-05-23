@@ -5,11 +5,15 @@ Provides:
 - EPS data validation (SEC vs yfinance)
 - Fair value calculation using EPS averaging
 - Valuation summary generation
+- Split warning computation
 """
 
 import math
 from datetime import datetime, timedelta
-from config import PE_RATIO_MULTIPLIER, RECOMMENDED_EPS_YEARS
+from config import (
+    PE_RATIO_MULTIPLIER, RECOMMENDED_EPS_YEARS,
+    SPLIT_WARNING_LOOKBACK_YEARS, SPLIT_WARNING_RECENT_YEARS, SPLIT_WARNING_MIN_RATIO,
+)
 
 
 def get_validated_eps(ticker):
@@ -91,6 +95,84 @@ def get_validated_eps(ticker):
     return [], 'none', validation_info
 
 
+def refresh_splits(ticker, orchestrator=None):
+    """
+    Fetch split history for a ticker from the provider chain and persist it.
+
+    Safe to call from any code path (screener, single-ticker refresh, analyze).
+    Silently swallows fetch errors — this feature is informational and must
+    not break the main valuation flow.
+
+    Args:
+        ticker: Stock ticker symbol
+        orchestrator: Optional DataOrchestrator (fetched lazily if None)
+    """
+    import database as db
+    ticker = ticker.upper()
+
+    try:
+        if orchestrator is None:
+            from services.providers import get_orchestrator
+            orchestrator = get_orchestrator()
+
+        result = orchestrator.fetch_splits(ticker)
+        if result.success and result.data and result.data.splits:
+            db.upsert_splits(ticker, result.data.splits, source=result.source or 'unknown')
+    except Exception:
+        pass
+
+
+def compute_split_warning(ticker):
+    """
+    Build the `split_warning` payload for a ticker from persisted split history.
+
+    Only flags splits with ratio >= SPLIT_WARNING_MIN_RATIO within the last
+    SPLIT_WARNING_LOOKBACK_YEARS. Severity is 'recent' if any flagged split
+    is within SPLIT_WARNING_RECENT_YEARS, otherwise 'historical'.
+
+    Args:
+        ticker: Stock ticker symbol
+
+    Returns:
+        Dict with warning fields when active; None otherwise.
+    """
+    import database as db
+    ticker = ticker.upper()
+
+    now = datetime.now()
+    cutoff_date = (now - timedelta(days=365 * SPLIT_WARNING_LOOKBACK_YEARS)).strftime('%Y-%m-%d')
+    recent_cutoff_date = (now - timedelta(days=365 * SPLIT_WARNING_RECENT_YEARS)).strftime('%Y-%m-%d')
+
+    all_splits = db.get_splits(ticker, since_date=cutoff_date)
+    qualifying = [
+        s for s in all_splits
+        if s.get('ratio') is not None and s['ratio'] >= SPLIT_WARNING_MIN_RATIO
+    ]
+
+    if not qualifying:
+        return None
+
+    severity = 'recent' if any(s['date'] >= recent_cutoff_date for s in qualifying) else 'historical'
+    most_recent = qualifying[0]  # get_splits returns newest-first
+
+    note = (
+        f"{len(qualifying)} stock split(s) in the last {SPLIT_WARNING_LOOKBACK_YEARS}-year EPS window — "
+        "fair value may be skewed because historical EPS is on a pre-split basis."
+    )
+
+    return {
+        'active': True,
+        'severity': severity,
+        'count': len(qualifying),
+        'most_recent_date': most_recent['date'],
+        'most_recent_ratio': most_recent['ratio'],
+        'splits': [{'date': s['date'], 'ratio': s['ratio']} for s in qualifying],
+        'lookback_years': SPLIT_WARNING_LOOKBACK_YEARS,
+        'min_ratio': SPLIT_WARNING_MIN_RATIO,
+        'note': note,
+    }
+
+
 def calculate_valuation(ticker):
     """
     Calculate stock valuation using EPS and dividend formula.
@@ -159,6 +241,11 @@ def calculate_valuation(ticker):
                 'severity': selloff_data.severity
             }
 
+        # Refresh split history (persist to DB) and compute the Split Warning.
+        # Informational only — never affects fair value in this iteration.
+        refresh_splits(ticker, orchestrator=orchestrator)
+        split_warning = compute_split_warning(ticker)
+
         # Calculate valuation: (Average EPS over up to 8 years + Annual Dividend) x multiplier
         eps_avg = None
         estimated_value = None
@@ -189,7 +276,8 @@ def calculate_valuation(ticker):
             'estimated_value': round(estimated_value, 2) if estimated_value else None,
             'price_vs_value': round(price_vs_value, 1) if price_vs_value else None,
             'formula': f'(({round(eps_avg, 2) if eps_avg else "N/A"} avg EPS) + {round(annual_dividend, 2)} dividend) x {PE_RATIO_MULTIPLIER} = ${round(estimated_value, 2) if estimated_value else "N/A"}',
-            'selloff': selloff_metrics
+            'selloff': selloff_metrics,
+            'split_warning': split_warning,
         }
     except Exception as e:
         print(f"Error calculating valuation for {ticker}: {e}")

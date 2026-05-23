@@ -647,6 +647,8 @@ function showTab(tabName) {
         loadScreener();
     } else if (tabName === 'recommendations') {
         loadRecommendations();
+    } else if (tabName === 'stars') {
+        loadStars();
     } else if (tabName === 'datasets') {
         loadDatasets();
     } else if (tabName === 'settings') {
@@ -2126,6 +2128,27 @@ function renderValuation(data, refreshInfo = '') {
         cacheNotice = `<div class="cache-notice">⚠️ ${data.cache_note || 'Showing cached data due to rate limiting'}</div>`;
     }
 
+    // Split Warning note (informational — fair value may be distorted by
+    // historical EPS being on a pre-split basis)
+    let splitWarningBlock = '';
+    const sw = data.split_warning;
+    if (sw && sw.active) {
+        const tier = sw.severity === 'recent' ? 'recent' : 'historical';
+        const tierLabel = tier === 'recent' ? 'Recent' : 'Historical';
+        const splitList = (sw.splits || []).map(s => `${s.date} (${s.ratio}:1)`).join(', ');
+        splitWarningBlock = `
+            <div class="split-warning-note split-warning-${tier}">
+                <span class="split-warning-badge split-warning-${tier}-badge">⚠ ${tierLabel} Stock Split</span>
+                <span class="split-warning-text">
+                    ${sw.count} split${sw.count === 1 ? '' : 's'} in last ${sw.lookback_years}yr — most recent
+                    ${sw.most_recent_date} (${sw.most_recent_ratio}:1).
+                    Historical EPS is on a pre-split basis, so the fair value may be skewed.
+                </span>
+                <div class="split-warning-details">${splitList}</div>
+            </div>
+        `;
+    }
+
     let html = `
         ${refreshInfo}
         <div class="valuation-header">
@@ -2138,6 +2161,7 @@ function renderValuation(data, refreshInfo = '') {
         </div>
 
         ${cacheNotice}
+        ${splitWarningBlock}
         ${dataWarning}
 
         <div class="valuation-summary">
@@ -2159,6 +2183,13 @@ function renderValuation(data, refreshInfo = '') {
             <h4>Formula</h4>
             <p class="formula-text">${data.formula}</p>
             <p class="formula-note">Uses <strong>average</strong> EPS over ${data.eps_years} years plus annual dividend</p>
+        </div>
+
+        <div class="stars-explanation-block">
+            <h4>Star Rating Breakdown</h4>
+            <div id="stars-explanation-target">
+                <div class="loading-indicator">Loading star breakdown…</div>
+            </div>
         </div>
 
         <div class="eps-summary">
@@ -2434,6 +2465,7 @@ function renderValuation(data, refreshInfo = '') {
     // Load price chart after DOM update
     if (data.ticker) {
         loadPriceChart(data.ticker, data.estimated_value);
+        loadStarsExplanation(data.ticker);
     }
 }
 
@@ -3391,6 +3423,16 @@ async function loadRecommendations() {
                 return `<span class="${badgeClass}">${idx}</span>`;
             }).join('');
 
+            // Split Warning badge (informational — does not change score/rank)
+            const swRec = stock.split_warning;
+            let splitBadge = '';
+            if (swRec && swRec.active) {
+                const tier = swRec.severity === 'recent' ? 'recent' : 'historical';
+                const label = tier === 'recent' ? 'Recent Split' : 'Split';
+                const tooltip = swRec.note || '';
+                splitBadge = `<span class="split-badge split-badge-${tier}" title="${tooltip}">⚠ ${label} ${swRec.most_recent_date} (${swRec.most_recent_ratio}:1)</span>`;
+            }
+
             html += `
                 <div class="recommendation-card ${selloffClass}">
                     <div class="recommendation-rank">#${rank}</div>
@@ -3398,6 +3440,7 @@ async function loadRecommendations() {
                         <div class="recommendation-header">
                             <a href="#research" class="recommendation-ticker" onclick="lookupTicker('${stock.ticker}', event)">${stock.ticker}</a>
                             <span class="recommendation-name">${stock.company_name}</span>
+                            ${splitBadge}
                             ${indexBadges ? `<span class="recommendation-indexes">${indexBadges}</span>` : ''}
                             ${updatedText ? `<span class="stock-updated" title="${new Date(stock.updated).toLocaleString()}">${updatedText}</span>` : ''}
                             <span class="recommendation-score">Score: ${stock.score}</span>
@@ -4785,4 +4828,268 @@ function showNotification(message, type = 'info') {
         notification.style.animation = 'fadeOut 0.3s ease';
         setTimeout(() => notification.remove(), 300);
     }, 3000);
+}
+
+
+// =============================================================================
+// Star Scoring System
+// =============================================================================
+
+const STAR_CRITERIA = [
+    { key: 'earnings_beat',       label: 'Earnings beat consensus',           num: 1 },
+    { key: 'fair_value_up',       label: 'Fair value up year-over-year',      num: 2 },
+    { key: 'dividend_up',         label: 'Dividend up year-over-year',        num: 3 },
+    { key: 'debt_to_capital_low', label: 'Debt-to-capital ≤ 25%',             num: 4 },
+    { key: 'undervalued',         label: 'Price < fair value',                num: 5 },
+    { key: 'shares_buyback',      label: 'Shares outstanding down since buy', num: 6, holdingsOnly: true },
+];
+
+let _starsData = { holdings: [], watchlist: [] };
+let _starsControlsBound = false;
+
+async function loadStars() {
+    const holdingsEl = document.getElementById('stars-holdings-list');
+    const watchlistEl = document.getElementById('stars-watchlist-list');
+    if (!holdingsEl || !watchlistEl) return;
+
+    holdingsEl.innerHTML = '<div class="loading-indicator">Loading...</div>';
+    watchlistEl.innerHTML = '<div class="loading-indicator">Loading...</div>';
+
+    try {
+        const res = await fetch('/api/stars');
+        const json = await res.json();
+        if (!json.success) {
+            holdingsEl.innerHTML = '<div class="error">Failed to load star ratings.</div>';
+            watchlistEl.innerHTML = '';
+            return;
+        }
+        const { holdings = [], watchlist = [] } = json.data || {};
+        _starsData = { holdings, watchlist };
+        bindStarsControls();
+        renderStarsTab();
+
+        // Show latest update time across all ratings
+        const updatedLabel = document.getElementById('stars-last-updated');
+        if (updatedLabel) {
+            const updates = [...holdings, ...watchlist].map(r => r.updated).filter(Boolean).sort();
+            updatedLabel.textContent = updates.length
+                ? `Updated ${new Date(updates[updates.length - 1]).toLocaleString()}`
+                : 'Not yet calculated';
+        }
+    } catch (err) {
+        holdingsEl.innerHTML = `<div class="error">Error loading stars: ${err.message}</div>`;
+        watchlistEl.innerHTML = '';
+    }
+}
+
+function bindStarsControls() {
+    if (_starsControlsBound) return;
+    const sort = document.getElementById('stars-sort');
+    const min = document.getElementById('stars-min');
+    const uv = document.getElementById('stars-undervalued-only');
+    if (!sort || !min || !uv) return;
+    sort.addEventListener('change', renderStarsTab);
+    min.addEventListener('input', renderStarsTab);
+    uv.addEventListener('change', renderStarsTab);
+    _starsControlsBound = true;
+}
+
+function renderStarsTab() {
+    const sortBy = (document.getElementById('stars-sort') || {}).value || 'stars';
+    const minStars = parseInt((document.getElementById('stars-min') || {}).value, 10) || 0;
+    const undervaluedOnly = !!(document.getElementById('stars-undervalued-only') || {}).checked;
+
+    const apply = (rows) => {
+        let r = rows.filter(x => (x.total_stars || 0) >= minStars);
+        if (undervaluedOnly) {
+            r = r.filter(x => x.price_vs_value != null && x.price_vs_value < 0);
+        }
+        if (sortBy === 'discount') {
+            r = r.slice().sort((a, b) => {
+                const av = a.price_vs_value == null ? Infinity : a.price_vs_value;
+                const bv = b.price_vs_value == null ? Infinity : b.price_vs_value;
+                if (av !== bv) return av - bv;
+                return a.ticker.localeCompare(b.ticker);
+            });
+        } else {
+            r = r.slice().sort((a, b) => {
+                const diff = (b.total_stars || 0) - (a.total_stars || 0);
+                if (diff !== 0) return diff;
+                return a.ticker.localeCompare(b.ticker);
+            });
+        }
+        return r;
+    };
+
+    const filteredHoldings = apply(_starsData.holdings);
+    const filteredWatchlist = apply(_starsData.watchlist);
+
+    renderStarsList(document.getElementById('stars-holdings-list'), filteredHoldings, 6);
+    renderStarsList(document.getElementById('stars-watchlist-list'), filteredWatchlist, 5);
+
+    updateStarsSectionHeading('stars-holdings-heading', 'My Holdings', filteredHoldings.length, _starsData.holdings.length, 6);
+    updateStarsSectionHeading('stars-watchlist-heading', 'Watchlist', filteredWatchlist.length, _starsData.watchlist.length, 5);
+}
+
+function updateStarsSectionHeading(id, label, shown, total, max) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const countTxt = shown === total
+        ? `(${total} total)`
+        : `(${shown} shown / ${total} total)`;
+    el.innerHTML = `${label} <span class="stars-section-sub">${countTxt} — out of ${max}</span>`;
+}
+
+function renderStarsList(container, rows, maxStars) {
+    if (!container) return;
+    if (!rows || rows.length === 0) {
+        container.innerHTML = '<div class="empty-state">No tickers match the current filter.</div>';
+        return;
+    }
+
+    const html = rows.map(row => renderStarRow(row, maxStars)).join('');
+    container.innerHTML = html;
+}
+
+function renderStarRow(row, maxStars) {
+    const isHolding = row.is_holding;
+    const criteria = STAR_CRITERIA.filter(c => isHolding || !c.holdingsOnly);
+    const starsHtml = criteria.map(c => {
+        const earned = row.criteria[c.key];
+        const cls = earned ? 'star star-filled' : 'star star-empty';
+        const title = `${c.num}. ${c.label}${earned ? ' ✓' : ''}`;
+        return `<span class="star-wrap"><span class="${cls}" title="${title}">${earned ? '★' : '☆'}</span><span class="star-tooltip">${title}</span></span>`;
+    }).join('');
+
+    const price = row.current_price != null ? `$${row.current_price.toFixed(2)}` : '—';
+    const fv = row.estimated_value != null ? `$${row.estimated_value.toFixed(2)}` : '—';
+    const pvv = row.price_vs_value != null
+        ? `<span class="${row.price_vs_value < 0 ? 'pvv-undervalued' : 'pvv-overvalued'}">${row.price_vs_value > 0 ? '+' : ''}${row.price_vs_value.toFixed(1)}%</span>`
+        : '—';
+
+    const ticker = row.ticker;
+    return `
+        <div class="star-row" role="button" tabindex="0"
+             onclick="lookupTicker('${ticker}', event)"
+             onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();lookupTicker('${ticker}', event);}"
+             title="View ${ticker} in Company Lookup">
+            <div class="star-row-header">
+                <span class="star-row-ticker">${ticker}</span>
+                <span class="star-row-company">${row.company_name || ''}</span>
+                <span class="star-row-score">${row.total_stars}/${maxStars}</span>
+            </div>
+            <div class="star-row-stars">${starsHtml}</div>
+            <div class="star-row-meta">
+                <span>Price: ${price}</span>
+                <span>Fair Value: ${fv}</span>
+                <span>vs Value: ${pvv}</span>
+            </div>
+        </div>
+    `;
+}
+
+async function recalculateStars() {
+    const btn = document.getElementById('stars-recalc-btn');
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Recalculating...';
+    }
+    try {
+        const res = await fetch('/api/stars/recalculate', { method: 'POST' });
+        const json = await res.json();
+        if (!json.success) {
+            showNotification(json.error || 'Recalculation failed', 'error');
+            if (btn) { btn.disabled = false; btn.textContent = 'Recalculate'; }
+            return;
+        }
+        showNotification('Star recalculation started — this may take a few minutes.', 'info');
+        pollStarsStatus(btn);
+    } catch (err) {
+        showNotification(`Error: ${err.message}`, 'error');
+        if (btn) { btn.disabled = false; btn.textContent = 'Recalculate'; }
+    }
+}
+
+async function pollStarsStatus(btn) {
+    try {
+        const res = await fetch('/api/stars/status');
+        const json = await res.json();
+        if (json.running) {
+            setTimeout(() => pollStarsStatus(btn), 5000);
+        } else {
+            if (btn) { btn.disabled = false; btn.textContent = 'Recalculate'; }
+            showNotification('Star recalculation complete.', 'success');
+            loadStars();
+        }
+    } catch (err) {
+        if (btn) { btn.disabled = false; btn.textContent = 'Recalculate'; }
+    }
+}
+
+// --- Star Rating Breakdown (Company Profile page) ---
+
+async function loadStarsExplanation(ticker) {
+    const target = document.getElementById('stars-explanation-target');
+    if (!target) return;
+    try {
+        const res = await fetch(`/api/stars/${encodeURIComponent(ticker)}/explanation`);
+        const json = await res.json();
+        if (!json.success || !json.data) {
+            target.innerHTML = '<div class="empty-state">Star breakdown unavailable for this ticker.</div>';
+            return;
+        }
+        target.innerHTML = renderStarsExplanationTable(json.data);
+    } catch (err) {
+        target.innerHTML = '<div class="empty-state">Star breakdown unavailable for this ticker.</div>';
+    }
+}
+
+function renderStarsExplanationTable(data) {
+    const isHolding = !!data.is_holding;
+    const rows = (data.criteria || []).map(c => {
+        const star = c.earned ? '★' : '☆';
+        const starCls = c.earned ? 'star-filled' : 'star-empty';
+        const applies = isHolding || !c.holdings_only;
+        const rowCls = applies ? '' : 'row-disabled';
+        const calc = c.summary
+            ? escapeHtml(c.summary)
+            : `<span class="muted">${escapeHtml(c.note || '—')}</span>`;
+        const holdingsTag = c.holdings_only ? ' <span class="holdings-only-tag">holdings only</span>' : '';
+        return `
+            <tr class="${rowCls}">
+                <td class="star-cell"><span class="star ${starCls}">${star}</span></td>
+                <td class="criterion-cell">${c.num}. ${escapeHtml(c.name)}${holdingsTag}</td>
+                <td class="calc-cell">${calc}</td>
+            </tr>
+        `;
+    }).join('');
+    const totalLabel = isHolding ? 'Total (holding)' : 'Total (watchlist)';
+    return `
+        <table class="stars-explanation-table">
+            <thead>
+                <tr>
+                    <th class="star-col">Star</th>
+                    <th class="criterion-col">Criterion</th>
+                    <th class="calc-col">Calculation</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+            <tfoot>
+                <tr class="stars-explanation-total">
+                    <td colspan="2">${totalLabel}</td>
+                    <td><strong>${data.total_stars}/${data.max_stars}</strong></td>
+                </tr>
+            </tfoot>
+        </table>
+    `;
+}
+
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
 }

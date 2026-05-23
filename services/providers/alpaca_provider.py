@@ -9,7 +9,7 @@ import time
 from typing import Dict, List
 from datetime import datetime, timedelta
 
-from .base import PriceProvider, ProviderResult
+from .base import PriceProvider, SplitProvider, ProviderResult, SplitData
 from .secrets import get_secret
 
 # Alpaca configuration
@@ -239,6 +239,104 @@ class AlpacaPriceProvider(PriceProvider):
                     error=str(e)
                 ) for t in tickers
             }
+
+
+class AlpacaSplitProvider(SplitProvider):
+    """
+    Alpaca Markets stock split provider.
+
+    Uses Alpaca's corporate-actions API (where available in alpaca-py).
+    If the installed alpaca-py version does not expose the corporate-actions
+    client, returns an empty success result so the orchestrator falls through
+    to the next provider in the chain.
+    """
+
+    @property
+    def name(self) -> str:
+        return "alpaca"
+
+    @property
+    def display_name(self) -> str:
+        return "Alpaca Markets"
+
+    def is_available(self) -> bool:
+        api_key = get_secret('ALPACA_API_KEY')
+        api_secret = get_secret('ALPACA_API_SECRET')
+        return bool(api_key and api_secret)
+
+    @property
+    def rate_limit(self) -> float:
+        return 0.1
+
+    def fetch_splits(self, ticker: str) -> ProviderResult:
+        api_key = get_secret('ALPACA_API_KEY')
+        api_secret = get_secret('ALPACA_API_SECRET')
+        if not api_key or not api_secret:
+            return ProviderResult(success=False, data=None, source=self.name, error="Alpaca API not configured")
+
+        ticker = ticker.upper()
+        try:
+            try:
+                from alpaca.data.historical.corporate_actions import CorporateActionsClient
+                from alpaca.data.requests import CorporateActionsRequest
+                from alpaca.data.enums import CorporateActionsType
+            except ImportError:
+                return ProviderResult(
+                    success=True,
+                    data=SplitData(ticker=ticker, source=self.name, splits=[]),
+                    source=self.name,
+                )
+
+            from datetime import date, timedelta
+            client = CorporateActionsClient(api_key, api_secret)
+
+            # Fetch splits over the full lookback window. 20 years covers any
+            # reasonable configured lookback comfortably.
+            end = date.today()
+            start = end - timedelta(days=365 * 20)
+            request = CorporateActionsRequest(
+                symbols=[ticker],
+                types=[CorporateActionsType.FORWARD_SPLIT, CorporateActionsType.REVERSE_SPLIT],
+                start=start,
+                end=end,
+            )
+            response = client.get_corporate_actions(request)
+
+            splits_list = []
+            # Response shape varies by alpaca-py version; handle defensively
+            events = []
+            raw = getattr(response, 'data', None) or response
+            if isinstance(raw, dict):
+                for group in raw.values():
+                    if isinstance(group, list):
+                        events.extend(group)
+            elif isinstance(raw, list):
+                events = raw
+
+            for event in events:
+                try:
+                    ex_date = getattr(event, 'ex_date', None) or getattr(event, 'effective_date', None)
+                    new_rate = getattr(event, 'new_rate', None)
+                    old_rate = getattr(event, 'old_rate', None)
+                    ratio = None
+                    if new_rate is not None and old_rate:
+                        ratio = float(new_rate) / float(old_rate)
+                    if ex_date and ratio:
+                        date_str = ex_date.isoformat() if hasattr(ex_date, 'isoformat') else str(ex_date)
+                        splits_list.append({'date': date_str[:10], 'ratio': ratio})
+                except (ValueError, TypeError, AttributeError):
+                    continue
+
+            splits_list.sort(key=lambda s: s['date'], reverse=True)
+
+            return ProviderResult(
+                success=True,
+                data=SplitData(ticker=ticker, source=self.name, splits=splits_list),
+                source=self.name,
+            )
+
+        except Exception as e:
+            return ProviderResult(success=False, data=None, source=self.name, error=str(e))
 
 
 def validate_alpaca_api_key(api_key: str, api_secret: str, api_endpoint: str = None) -> tuple:

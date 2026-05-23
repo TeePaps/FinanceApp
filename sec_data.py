@@ -452,6 +452,188 @@ def fetch_company_metrics(ticker, cik):
     return None
 
 
+def _fetch_companyfacts(cik):
+    """Internal: fetch raw companyfacts JSON for a CIK. Respects rate limit."""
+    rate_limit()
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+    response = requests.get(url, headers=SEC_HEADERS, timeout=SEC_REQUEST_TIMEOUT)
+    if response.status_code != 200:
+        return None
+    return response.json()
+
+
+def _latest_annual_value(us_gaap, field_names, unit='USD'):
+    """
+    From us_gaap dict, find the most recent annual (10-K, non-quarterly) value
+    among the candidate field_names, in priority order.
+
+    Returns (value, as_of_date, field_used) or (None, None, None) if not found.
+    """
+    for field in field_names:
+        if field not in us_gaap:
+            continue
+        unit_key = unit
+        records = us_gaap[field].get('units', {}).get(unit_key, [])
+        latest = None
+        for r in records:
+            if r.get('form') != '10-K':
+                continue
+            frame = r.get('frame', '')
+            # Period instants for balance sheet items use frames like "CY2024Q4I"
+            # Period durations for income/cashflow use "CY2024" (no Q).
+            # Both are valid annual checkpoints.
+            end_date = r.get('end')
+            if not end_date:
+                continue
+            if latest is None or end_date > latest['end']:
+                latest = {'val': r.get('val'), 'end': end_date}
+        if latest is not None:
+            return latest['val'], latest['end'], field
+    return None, None, None
+
+
+def fetch_balance_sheet(ticker):
+    """
+    Fetch the most recent balance-sheet components from SEC EDGAR.
+
+    Returns dict with long_term_debt, short_term_debt, stockholders_equity,
+    as_of_date, and computed debt_to_capital — or None on failure.
+
+    Used by the Star Scoring system (debt-to-capital criterion).
+    """
+    ticker = ticker.upper()
+    cik = get_cik_for_ticker(ticker)
+    if not cik:
+        return None
+
+    try:
+        data = _fetch_companyfacts(cik)
+        if not data:
+            return None
+        us_gaap = data.get('facts', {}).get('us-gaap', {})
+
+        ltd, ltd_date, _ = _latest_annual_value(
+            us_gaap,
+            ['LongTermDebtNoncurrent', 'LongTermDebt'],
+            unit='USD',
+        )
+        std, std_date, _ = _latest_annual_value(
+            us_gaap,
+            ['DebtCurrent', 'LongTermDebtCurrent', 'ShortTermBorrowings'],
+            unit='USD',
+        )
+        equity, equity_date, _ = _latest_annual_value(
+            us_gaap,
+            [
+                'StockholdersEquity',
+                'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest',
+            ],
+            unit='USD',
+        )
+
+        # Need at least equity + some debt to compute the ratio.
+        if equity is None:
+            return None
+
+        ltd_v = float(ltd) if ltd is not None else 0.0
+        std_v = float(std) if std is not None else 0.0
+        equity_v = float(equity)
+        total_debt = ltd_v + std_v
+        denom = total_debt + equity_v
+        debt_to_capital = (total_debt / denom) if denom > 0 else None
+
+        # Use the most recent end date among the fields we found
+        as_of = max(d for d in [ltd_date, std_date, equity_date] if d)
+
+        return {
+            'ticker': ticker,
+            'long_term_debt': ltd_v if ltd is not None else None,
+            'short_term_debt': std_v if std is not None else None,
+            'stockholders_equity': equity_v,
+            'debt_to_capital': debt_to_capital,
+            'as_of_date': as_of,
+            'source': 'sec_edgar',
+        }
+    except Exception as e:
+        print(f"[SEC] Error fetching balance sheet for {ticker}: {e}")
+        return None
+
+
+def fetch_shares_outstanding(ticker):
+    """
+    Fetch shares outstanding history from SEC EDGAR.
+
+    Returns dict with current (most-recent) shares and a time series of
+    {date, shares} entries — or None on failure.
+
+    Used by the Star Scoring system (share-buyback criterion).
+    """
+    ticker = ticker.upper()
+    cik = get_cik_for_ticker(ticker)
+    if not cik:
+        return None
+
+    try:
+        data = _fetch_companyfacts(cik)
+        if not data:
+            return None
+        us_gaap = data.get('facts', {}).get('us-gaap', {})
+
+        # Concepts in priority order — different filers use different ones.
+        candidate_fields = [
+            'CommonStockSharesOutstanding',
+            'EntityCommonStockSharesOutstanding',
+            'WeightedAverageNumberOfDilutedSharesOutstanding',
+        ]
+
+        # Collect ALL records (not just 10-K) so we get the freshest snapshot.
+        records = []
+        field_used = None
+        for field in candidate_fields:
+            if field in us_gaap:
+                shares_records = us_gaap[field].get('units', {}).get('shares', [])
+                if shares_records:
+                    records = shares_records
+                    field_used = field
+                    break
+        if not records:
+            return None
+
+        # Deduplicate by end date keeping latest filing
+        by_date = {}
+        for r in records:
+            end_date = r.get('end')
+            val = r.get('val')
+            if not end_date or val is None:
+                continue
+            existing = by_date.get(end_date)
+            if existing is None or r.get('filed', '') > existing.get('filed', ''):
+                by_date[end_date] = {'end': end_date, 'val': float(val), 'filed': r.get('filed', '')}
+
+        if not by_date:
+            return None
+
+        history = sorted(
+            (
+                {'date': v['end'], 'shares': v['val'], 'source': 'sec_edgar'}
+                for v in by_date.values()
+            ),
+            key=lambda r: r['date'],
+        )
+
+        latest_entry = history[-1]
+        return {
+            'ticker': ticker,
+            'current': latest_entry['shares'],
+            'current_date': latest_entry['date'],
+            'field': field_used,
+            'history': history,
+        }
+    except Exception as e:
+        print(f"[SEC] Error fetching shares outstanding for {ticker}: {e}")
+        return None
+
+
 def get_sec_metrics(ticker):
     """Get SEC metrics for a ticker (fetches fresh each time for now)"""
     ticker = ticker.upper()

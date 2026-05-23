@@ -1,0 +1,21 @@
+{
+  "id": "stars-sort-filter-research-link",
+  "started": "2026-05-22T22:06:00Z",
+  "lastUpdated": "2026-05-22T22:10:00Z",
+  "status": "complete",
+  "phase": "complete",
+  "progress": {
+    "discovery": { "answered": 3, "total": 3 },
+    "detail": { "answered": 0, "total": 0 }
+  },
+  "contextFiles": [
+    "static/app.js",
+    "static/css/pages.css",
+    "templates/index.html"
+  ],
+  "relatedFeatures": [
+    "2026-05-22-2048-star-scoring-system",
+    "2026-05-22-2127-star-undervalued-and-tooltips"
+  ],
+  "notes": "Phase 4 (detail questions) skipped — frontend-only change, fully specified after 3 discovery questions. Important: implementation must be frontend-only because the star recalculation background job is still running (b4dqmu5el). Touching .py files would trigger Flask auto-reload and kill the job."
+}

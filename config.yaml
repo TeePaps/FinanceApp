@@ -26,6 +26,17 @@ valuation:
   recommended_eps_years: 8       # Recommended years for reliable valuation
 
 # ============================================================================
+# Split Warning Settings
+# ============================================================================
+# A stock split makes historical SEC EPS values incomparable to the
+# post-split share price, distorting the fair-value calculation. We warn
+# the user when a split falls within the EPS averaging window.
+split_warning:
+  lookback_years: 8              # Flag splits within last N years (should match recommended_eps_years)
+  recent_years: 3                # Splits within last N years are "recent" severity
+  min_ratio: 1.1                 # Only flag splits with ratio >= this (conservative)
+
+# ============================================================================
 # Recommendation Scoring
 # ============================================================================
 scoring:
@@ -135,6 +146,11 @@ providers:
     - defeatbeta
   dividend_providers:
     - yfinance
+  split_providers:
+    - yfinance
+    - fmp
+    - alpaca
+    - sec_edgar
   disabled_providers:
     - alpaca
     - defeatbeta
@@ -142,6 +158,7 @@ providers:
   price_cache_seconds: 3600      # 1 hour
   eps_cache_days: 1
   dividend_cache_days: 1
+  split_cache_days: 7            # Splits change rarely; cache longer
 
   # Rate limiting
   default_rate_limit: 0.2        # Seconds between requests

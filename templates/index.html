@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=42">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=46">
 </head>
 <body>
     <div class="container">
@@ -68,6 +68,7 @@
             <button class="tab-btn" onclick="showTab('research')">Company Lookup</button>
             <button class="tab-btn" onclick="showTab('screener')">Market Analysis</button>
             <button class="tab-btn" onclick="showTab('recommendations')">Recommendations</button>
+            <button class="tab-btn" onclick="showTab('stars')">Stars</button>
             <button class="tab-btn" onclick="showTab('datasets')">Data Sets</button>
             <button class="tab-btn" onclick="showTab('logs')">Log View</button>
         </nav>
@@ -305,6 +306,62 @@
                     </div>
                 </aside>
             </div>
+        </div>
+
+        <div id="stars-tab" class="tab-content">
+            <section id="stars-section">
+                <div class="stars-header">
+                    <div>
+                        <h2>Star Ratings</h2>
+                        <p class="recommendations-intro">6-criterion scoring. Holdings rated out of 6; watchlist out of 4 (criteria 5 &amp; 6 are holdings-only).</p>
+                    </div>
+                    <div class="stars-controls">
+                        <span id="stars-last-updated" class="stars-last-updated"></span>
+                        <button id="stars-recalc-btn" class="btn-secondary" onclick="recalculateStars()" title="Recompute star ratings now">Recalculate</button>
+                    </div>
+                </div>
+
+                <aside class="stars-legend">
+                    <div class="legend-item"><span class="legend-key">1</span><span>Earnings Beat — most recent reported EPS &gt; prior analyst consensus</span></div>
+                    <div class="legend-item"><span class="legend-key">2</span><span>Fair Value Up — current 8-year formula value &gt; value 1 year ago</span></div>
+                    <div class="legend-item"><span class="legend-key">3</span><span>Dividend Up — trailing-12mo dividend &gt; same period 1 year ago</span></div>
+                    <div class="legend-item"><span class="legend-key">4</span><span>Low Debt — debt-to-capital ratio ≤ 25%</span></div>
+                    <div class="legend-item"><span class="legend-key">5</span><span>Undervalued — current price &lt; fair value</span></div>
+                    <div class="legend-item"><span class="legend-key">6</span><span>Buybacks — shares outstanding declined since you bought (holdings only)</span></div>
+                </aside>
+
+                <div class="stars-controls-bar">
+                    <label class="stars-control">
+                        <span>Sort:</span>
+                        <select id="stars-sort">
+                            <option value="stars" selected>Stars (most first)</option>
+                            <option value="discount">Discount (most undervalued first)</option>
+                        </select>
+                    </label>
+                    <label class="stars-control">
+                        <span>Min stars:</span>
+                        <input type="number" id="stars-min" min="0" max="6" value="0" step="1">
+                    </label>
+                    <label class="stars-control stars-control-checkbox">
+                        <input type="checkbox" id="stars-undervalued-only">
+                        <span>Undervalued only</span>
+                    </label>
+                </div>
+
+                <section id="stars-holdings-section">
+                    <h3 id="stars-holdings-heading">My Holdings <span class="stars-section-sub">(out of 6)</span></h3>
+                    <div id="stars-holdings-list" class="stars-list">
+                        <div class="loading-indicator">Loading...</div>
+                    </div>
+                </section>
+
+                <section id="stars-watchlist-section">
+                    <h3 id="stars-watchlist-heading">Watchlist <span class="stars-section-sub">(out of 5)</span></h3>
+                    <div id="stars-watchlist-list" class="stars-list">
+                        <div class="loading-indicator">Loading...</div>
+                    </div>
+                </section>
+            </section>
         </div>
 
         <div id="datasets-tab" class="tab-content">
@@ -591,6 +648,6 @@
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
 
     <!-- Main App Logic -->
-    <script src="{{ url_for('static', filename='app.js') }}?v=48"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=53"></script>
 </body>
 </html>

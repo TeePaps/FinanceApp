@@ -15,8 +15,10 @@ import yfinance as yf
 import config
 
 from .base import (
-    PriceProvider, EPSProvider, DividendProvider, HistoricalPriceProvider, StockInfoProvider, SelloffProvider,
-    ProviderResult, DataType, PriceData, EPSData, DividendData, HistoricalPriceData, StockInfoData, SelloffData
+    PriceProvider, EPSProvider, DividendProvider, SplitProvider, HistoricalPriceProvider, StockInfoProvider, SelloffProvider,
+    AnalystEstimateProvider, SharesOutstandingProvider,
+    ProviderResult, DataType, PriceData, EPSData, DividendData, SplitData, HistoricalPriceData, StockInfoData, SelloffData,
+    AnalystEstimateData, SharesOutstandingData,
 )
 
 
@@ -921,3 +923,254 @@ class YFinanceDividendProvider(DividendProvider):
                 source=self.name,
                 error=str(e)
             )
+
+
+class YFinanceSplitProvider(SplitProvider):
+    """
+    Yahoo Finance stock split provider.
+
+    Uses yfinance .splits Series (date -> ratio) for split history.
+    """
+
+    @property
+    def name(self) -> str:
+        return "yfinance"
+
+    @property
+    def display_name(self) -> str:
+        return "Yahoo Finance"
+
+    def is_available(self) -> bool:
+        return True
+
+    @property
+    def rate_limit(self) -> float:
+        return 0.2
+
+    def fetch_splits(self, ticker: str) -> ProviderResult:
+        """Fetch split history for a ticker."""
+        ticker = ticker.upper()
+
+        try:
+            stock = yf.Ticker(ticker)
+            splits = stock.splits
+
+            splits_list = []
+            if splits is not None and not splits.empty:
+                for date, ratio in splits.items():
+                    try:
+                        splits_list.append({
+                            'date': date.strftime('%Y-%m-%d'),
+                            'ratio': float(ratio),
+                        })
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                # Newest first
+                splits_list.sort(key=lambda s: s['date'], reverse=True)
+
+            return ProviderResult(
+                success=True,
+                data=SplitData(ticker=ticker, source=self.name, splits=splits_list),
+                source=self.name,
+            )
+
+        except Exception as e:
+            return ProviderResult(
+                success=False,
+                data=None,
+                source=self.name,
+                error=str(e)
+            )
+
+
+class YFinanceAnalystEstimateProvider(AnalystEstimateProvider):
+    """
+    Yahoo Finance analyst-estimate provider.
+
+    Uses Ticker.earnings_history which returns a DataFrame indexed by quarter
+    with columns including 'epsActual', 'epsEstimate', 'surprisePercent'.
+
+    The yfinance API changes frequently — all access is defensive.
+    """
+
+    @property
+    def name(self) -> str:
+        return "yfinance"
+
+    @property
+    def display_name(self) -> str:
+        return "Yahoo Finance"
+
+    def is_available(self) -> bool:
+        return True
+
+    @property
+    def rate_limit(self) -> float:
+        return 0.3
+
+    def fetch_analyst_estimates(self, ticker: str) -> ProviderResult:
+        ticker = ticker.upper()
+        try:
+            stock = yf.Ticker(ticker)
+            hist = None
+            # yfinance has shipped this under both .earnings_history (attribute)
+            # and .get_earnings_history() (method) over time.
+            try:
+                hist = stock.earnings_history
+            except Exception:
+                hist = None
+            if hist is None:
+                getter = getattr(stock, 'get_earnings_history', None)
+                if callable(getter):
+                    try:
+                        hist = getter()
+                    except Exception:
+                        hist = None
+
+            if hist is None or getattr(hist, 'empty', True):
+                return ProviderResult(
+                    success=False, data=None, source=self.name,
+                    error="No analyst estimate data from yfinance"
+                )
+
+            cols = {c.lower(): c for c in hist.columns}
+            actual_col = cols.get('epsactual') or cols.get('eps_actual')
+            est_col = cols.get('epsestimate') or cols.get('eps_estimate')
+            surprise_col = cols.get('surprisepercent') or cols.get('surprise_percent')
+
+            def _f(value):
+                if value is None:
+                    return None
+                try:
+                    fv = float(value)
+                except (TypeError, ValueError):
+                    return None
+                if math.isnan(fv) or math.isinf(fv):
+                    return None
+                return fv
+
+            history = []
+            for idx, row in hist.iterrows():
+                try:
+                    period_end = idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx)
+                except Exception:
+                    period_end = str(idx)
+                history.append({
+                    'period_end': period_end,
+                    'eps_actual': _f(row[actual_col]) if actual_col else None,
+                    'eps_estimate': _f(row[est_col]) if est_col else None,
+                    'surprise_percent': _f(row[surprise_col]) if surprise_col else None,
+                })
+
+            # Sort newest first
+            history.sort(key=lambda r: r['period_end'], reverse=True)
+
+            # Latest entry where actual is present (the most recent REPORTED quarter)
+            latest = next((r for r in history if r['eps_actual'] is not None), None)
+            if latest is None:
+                return ProviderResult(
+                    success=False, data=None, source=self.name,
+                    error="No reported quarters with actual EPS"
+                )
+
+            data = AnalystEstimateData(
+                ticker=ticker,
+                source=self.name,
+                eps_actual=latest['eps_actual'],
+                eps_estimate=latest['eps_estimate'],
+                surprise_percent=latest['surprise_percent'],
+                period_end=latest['period_end'],
+                history=history,
+            )
+            return ProviderResult(success=True, data=data, source=self.name)
+
+        except Exception as e:
+            return ProviderResult(
+                success=False, data=None, source=self.name, error=str(e)
+            )
+
+
+class YFinanceSharesOutstandingProvider(SharesOutstandingProvider):
+    """
+    Yahoo Finance shares-outstanding provider (current only).
+
+    Uses Ticker.info['sharesOutstanding']. SEC EDGAR provides richer
+    historical data — this provider is primarily a fallback when SEC
+    doesn't have the ticker.
+    """
+
+    @property
+    def name(self) -> str:
+        return "yfinance"
+
+    @property
+    def display_name(self) -> str:
+        return "Yahoo Finance"
+
+    def is_available(self) -> bool:
+        return True
+
+    @property
+    def rate_limit(self) -> float:
+        return 0.3
+
+    def fetch_shares_outstanding(self, ticker: str) -> ProviderResult:
+        ticker = ticker.upper()
+        try:
+            stock = yf.Ticker(ticker)
+            info = {}
+            try:
+                info = stock.info or {}
+            except Exception:
+                info = {}
+            current = info.get('sharesOutstanding')
+            if current is None:
+                return ProviderResult(
+                    success=False, data=None, source=self.name,
+                    error="No sharesOutstanding in yfinance info"
+                )
+            try:
+                current_f = float(current)
+            except (TypeError, ValueError):
+                return ProviderResult(
+                    success=False, data=None, source=self.name,
+                    error="sharesOutstanding not numeric"
+                )
+
+            today = datetime.now().strftime('%Y-%m-%d')
+            data = SharesOutstandingData(
+                ticker=ticker,
+                source=self.name,
+                current=current_f,
+                history=[{'date': today, 'shares': current_f, 'source': self.name}],
+            )
+            return ProviderResult(success=True, data=data, source=self.name)
+
+        except Exception as e:
+            return ProviderResult(
+                success=False, data=None, source=self.name, error=str(e)
+            )
+
+
+def fetch_yearly_dividends(ticker: str) -> Dict[int, float]:
+    """
+    Helper: return {calendar_year: sum_of_dividends_paid_that_year} from yfinance.
+
+    Used by the Star Scoring system to detect dividend-growth year-over-year
+    without needing to extend the DividendProvider interface.
+    """
+    try:
+        stock = yf.Ticker(ticker.upper())
+        dividends = stock.dividends
+        if dividends is None or dividends.empty:
+            return {}
+        by_year: Dict[int, float] = {}
+        for date, amount in dividends.items():
+            try:
+                year = int(date.year)
+                by_year[year] = by_year.get(year, 0.0) + float(amount)
+            except (AttributeError, ValueError, TypeError):
+                continue
+        return by_year
+    except Exception:
+        return {}

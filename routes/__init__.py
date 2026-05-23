@@ -12,6 +12,7 @@ from .summary import summary_bp
 from .data import data_bp
 from .sec import sec_bp
 from .admin import admin_bp
+from .stars import stars_bp
 
 
 def register_blueprints(app):
@@ -24,3 +25,4 @@ def register_blueprints(app):
     app.register_blueprint(data_bp)
     app.register_blueprint(sec_bp)
     app.register_blueprint(admin_bp)
+    app.register_blueprint(stars_bp)

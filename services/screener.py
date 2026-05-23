@@ -187,7 +187,8 @@ def run_screener(index_name='all'):
 
         sec_result = orchestrator.fetch_eps(t)
         if sec_result.success and sec_result.data and sec_result.data.eps_history:
-            eps_history = sec_result.data.eps_history
+            # Cap at 8 most recent years — matches Company Lookup / canonical formula.
+            eps_history = sec_result.data.eps_history[:8]
             if len(eps_history) > 0:
                 eps_avg = sum(e['eps'] for e in eps_history) / len(eps_history)
                 eps_results[t] = {
@@ -202,7 +203,26 @@ def run_screener(index_name='all'):
                 sec_hits += 1
                 continue
 
-        # Fall back to existing valuations
+        # Fallback 1: SEC EPS cached in eps_history table from a prior successful fetch.
+        # Prevents a transient SEC outage from overwriting good SEC data with stale
+        # yfinance values via the existing-valuations fallback below.
+        cached_history = db.get_eps_history(t)
+        if cached_history:
+            use = cached_history[:8]
+            eps_avg = sum(e['eps'] for e in use) / len(use)
+            eps_results[t] = {
+                'ticker': t,
+                'company_name': existing_valuations.get(t, {}).get('company_name') or t,
+                'eps_avg': round(eps_avg, 2),
+                'eps_years': len(use),
+                'eps_source': 'sec_cache',
+                'has_enough_years': len(use) >= 8,
+                'annual_dividend': existing_valuations.get(t, {}).get('annual_dividend', 0),
+            }
+            sec_hits += 1
+            continue
+
+        # Fallback 2: previous valuation row (last resort, may be stale yfinance)
         existing = existing_valuations.get(t, {})
         if existing.get('eps_avg') is not None:
             eps_results[t] = existing
@@ -220,21 +240,12 @@ def run_screener(index_name='all'):
         _running = False
         return
 
-    # Phase 2: Dividends
-    four_months_ago = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
-
-    def needs_dividend_update(ticker):
-        existing = existing_valuations.get(ticker, {})
-        eps_info = eps_results.get(ticker, {})
-        annual_div = existing.get('annual_dividend') or eps_info.get('annual_dividend')
-        if not annual_div:
-            return True
-        last_date = existing.get('last_dividend_date') or eps_info.get('last_dividend_date')
-        if last_date and last_date < four_months_ago:
-            return True
-        return False
-
-    tickers_needing_dividends = [t for t in tickers if needs_dividend_update(t)]
+    # Phase 2: Dividends — always refresh on a full screener run.
+    # The previous cache-skip logic (kept dividends if cached and <4mo old)
+    # let stale dividends linger and silently corrupted fair-value calculations
+    # (e.g. PGR cached $4.90 vs actual $13.90). run_quick_price_update and
+    # run_smart_update remain cache-aware for speed.
+    tickers_needing_dividends = list(tickers)
     dividend_data = {}
 
     if tickers_needing_dividends:
@@ -278,6 +289,59 @@ def run_screener(index_name='all'):
         _progress['current'] = len(tickers_needing_dividends)
         log.info(f"Screener Phase 2 complete: found dividends for {dividend_count} tickers")
         activity_log.log("success", "screener", f"✓ Phase 2: Dividends fetched ({dividend_count} found)")
+
+    if not _running:
+        _progress['status'] = 'cancelled'
+        _running = False
+        return
+
+    # Phase 2b: Stock Splits
+    # Persist split history so the Analyze page and Recommendations can show
+    # a Split Warning when a split falls within the EPS averaging window.
+    # Skips tickers whose split data was fetched recently (split_cache_days).
+    from services.providers import get_config as get_provider_config
+    split_cache_days = get_provider_config().split_cache_days
+    split_freshness_cutoff = (datetime.now() - timedelta(days=split_cache_days)).isoformat()
+
+    def _needs_split_refresh(ticker):
+        last = db.get_split_history_last_updated(ticker)
+        return not last or last < split_freshness_cutoff
+
+    tickers_needing_splits = [t for t in tickers if _needs_split_refresh(t)]
+
+    if tickers_needing_splits:
+        log.info(f"Screener Phase 2b: Fetching splits for {len(tickers_needing_splits)} tickers...")
+        activity_log.log("info", "screener", f"Phase 2b: Fetching splits for {len(tickers_needing_splits)} tickers...")
+        _progress['phase'] = 'splits'
+        _progress['total'] = len(tickers_needing_splits)
+        _progress['current'] = 0
+
+        splits_found = 0
+        orchestrator = get_orchestrator()
+
+        for i, ticker in enumerate(tickers_needing_splits):
+            if not _running:
+                break
+            if i % 50 == 0:
+                _progress['current'] = i
+                _progress['ticker'] = f'Fetching splits... {i}/{len(tickers_needing_splits)}'
+
+            try:
+                result = orchestrator.fetch_splits(ticker)
+                if result.success and result.data:
+                    if result.data.splits:
+                        db.upsert_splits(ticker, result.data.splits, source=result.source or 'unknown')
+                        splits_found += 1
+            except Exception:
+                pass
+            time.sleep(SCREENER_DIVIDEND_BACKOFF)
+
+        _progress['current'] = len(tickers_needing_splits)
+        log.info(f"Screener Phase 2b complete: persisted splits for {splits_found} tickers")
+        activity_log.log("success", "screener", f"✓ Phase 2b: Splits persisted ({splits_found} tickers had splits)")
+
+        # Track split refresh for staleness dashboards
+        db.set_metadata('last_split_update', datetime.now().isoformat())
 
     if not _running:
         _progress['status'] = 'cancelled'
@@ -495,6 +559,30 @@ def run_screener(index_name='all'):
     # Phase: Fetch 52-week data for tickers that need it
     if _running:
         _fetch_52_week_data(tickers)
+
+    # Phase 5: Star Ratings (6-criterion scoring)
+    if _running and valuations_batch:
+        log.info("Screener Phase 5: Calculating star ratings...")
+        activity_log.log("info", "screener", f"Phase 5: Calculating star ratings for {len(valuations_batch)} tickers...")
+        _progress['phase'] = 'stars'
+        _progress['ticker'] = 'Calculating star ratings...'
+        _progress['total'] = len(valuations_batch)
+        _progress['current'] = 0
+
+        def _stars_progress(current, ticker):
+            _progress['current'] = current
+            _progress['ticker'] = f'Stars: {ticker}'
+
+        try:
+            from services.stars import calculate_all_star_ratings
+            rated = calculate_all_star_ratings(
+                list(valuations_batch.keys()),
+                progress_callback=_stars_progress,
+            )
+            activity_log.log("success", "screener", f"✓ Phase 5: Star ratings ({rated} tickers)")
+        except Exception as e:
+            log_error("Screener Phase 5 (stars) failed", e)
+            activity_log.log("error", "screener", f"Star rating phase failed: {str(e)[:80]}")
 
     _progress['status'] = 'complete'
     _running = False
