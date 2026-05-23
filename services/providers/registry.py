@@ -15,8 +15,10 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from .base import (
-    BaseProvider, PriceProvider, EPSProvider, DividendProvider, HistoricalPriceProvider, StockInfoProvider, SelloffProvider,
-    DataType, ProviderResult, PriceData, EPSData, DividendData, HistoricalPriceData, StockInfoData, SelloffData
+    BaseProvider, PriceProvider, EPSProvider, DividendProvider, SplitProvider, HistoricalPriceProvider, StockInfoProvider, SelloffProvider,
+    AnalystEstimateProvider, BalanceSheetProvider, SharesOutstandingProvider,
+    DataType, ProviderResult, PriceData, EPSData, DividendData, SplitData, HistoricalPriceData, StockInfoData, SelloffData,
+    AnalystEstimateData, BalanceSheetData, SharesOutstandingData,
 )
 from .config import get_config, ProviderConfig
 from .circuit_breaker import get_circuit_breaker, CircuitBreaker
@@ -40,10 +42,14 @@ class ProviderRegistry:
             DataType.PRICE_HISTORY: [],
             DataType.EPS: [],
             DataType.DIVIDEND: [],
+            DataType.SPLIT: [],
             DataType.STOCK_INFO: [],
             DataType.SELLOFF: [],
             DataType.SEC_METRICS: [],
             DataType.FILINGS: [],
+            DataType.ANALYST_ESTIMATES: [],
+            DataType.BALANCE_SHEET: [],
+            DataType.SHARES_OUTSTANDING: [],
         }
 
     def register(self, provider: BaseProvider):
@@ -119,12 +125,20 @@ class ProviderRegistry:
             order = config.eps_providers
         elif data_type == DataType.DIVIDEND:
             order = config.dividend_providers
+        elif data_type == DataType.SPLIT:
+            order = config.split_providers
         elif data_type == DataType.STOCK_INFO:
             # Use same order as price providers for stock info
             order = config.price_providers
         elif data_type == DataType.SELLOFF:
             # Use same order as price providers for selloff data
             order = config.price_providers
+        elif data_type == DataType.ANALYST_ESTIMATES:
+            order = config.analyst_estimate_providers
+        elif data_type == DataType.BALANCE_SHEET:
+            order = config.balance_sheet_providers
+        elif data_type == DataType.SHARES_OUTSTANDING:
+            order = config.shares_outstanding_providers
         else:
             order = []
 
@@ -724,6 +738,119 @@ class DataOrchestrator:
             error=f"All providers failed: {'; '.join(errors)}"
         )
 
+    def _fetch_simple(self, ticker: str, data_type: DataType, provider_class, method_name: str) -> ProviderResult:
+        """
+        Generic helper for new single-source data types (analyst estimates,
+        balance sheet, shares outstanding). Walks providers in priority order,
+        respects circuit breaker + rate limit + timeout, returns first success.
+        """
+        ticker = ticker.upper()
+        providers = self.registry.get_providers_ordered(data_type, self.config)
+        errors = []
+        for provider in providers:
+            if not isinstance(provider, provider_class):
+                continue
+            if not self._should_try_provider(provider):
+                errors.append(f"{provider.name}: circuit open (skipped)")
+                continue
+            try:
+                self._rate_limit(provider)
+                method = getattr(provider, method_name)
+                result = self._execute_with_timeout(lambda m=method, t=ticker: m(t))
+                if result.success:
+                    self._record_provider_success(provider)
+                    return result
+                self._record_provider_failure(provider)
+                errors.append(f"{provider.name}: {result.error}")
+            except TimeoutError as e:
+                self._record_provider_failure(provider)
+                errors.append(f"{provider.name}: {str(e)}")
+            except Exception as e:
+                self._record_provider_failure(provider)
+                errors.append(f"{provider.name}: {str(e)}")
+
+        return ProviderResult(
+            success=False, data=None, source="none",
+            error=f"All providers failed: {'; '.join(errors)}"
+        )
+
+    def fetch_analyst_estimates(self, ticker: str) -> ProviderResult:
+        """Fetch quarterly EPS actuals + consensus estimates."""
+        return self._fetch_simple(
+            ticker, DataType.ANALYST_ESTIMATES,
+            AnalystEstimateProvider, 'fetch_analyst_estimates'
+        )
+
+    def fetch_balance_sheet(self, ticker: str) -> ProviderResult:
+        """Fetch most-recent balance-sheet components for debt-to-capital."""
+        return self._fetch_simple(
+            ticker, DataType.BALANCE_SHEET,
+            BalanceSheetProvider, 'fetch_balance_sheet'
+        )
+
+    def fetch_shares_outstanding(self, ticker: str) -> ProviderResult:
+        """Fetch shares outstanding current + history."""
+        return self._fetch_simple(
+            ticker, DataType.SHARES_OUTSTANDING,
+            SharesOutstandingProvider, 'fetch_shares_outstanding'
+        )
+
+    def fetch_splits(self, ticker: str) -> ProviderResult:
+        """
+        Fetch stock split history for a ticker.
+
+        Tries providers in configured split order. First provider that
+        returns success=True wins — even if its splits list is empty
+        (an empty-success result is a valid "no splits" answer).
+
+        Args:
+            ticker: Stock ticker symbol
+
+        Returns:
+            ProviderResult with SplitData on success
+        """
+        ticker = ticker.upper()
+
+        providers = self.registry.get_providers_ordered(DataType.SPLIT, self.config)
+        errors = []
+
+        for provider in providers:
+            if not isinstance(provider, SplitProvider):
+                continue
+
+            if not self._should_try_provider(provider):
+                errors.append(f"{provider.name}: circuit open (skipped)")
+                continue
+
+            try:
+                self._rate_limit(provider)
+
+                result = self._execute_with_timeout(
+                    lambda p=provider, t=ticker: p.fetch_splits(t)
+                )
+
+                if result.success:
+                    self._record_provider_success(provider)
+                    return result
+                else:
+                    self._record_provider_failure(provider)
+                    errors.append(f"{provider.name}: {result.error}")
+
+            except TimeoutError as e:
+                self._record_provider_failure(provider)
+                errors.append(f"{provider.name}: {str(e)}")
+
+            except Exception as e:
+                self._record_provider_failure(provider)
+                errors.append(f"{provider.name}: {str(e)}")
+
+        return ProviderResult(
+            success=False,
+            data=None,
+            source="none",
+            error=f"All providers failed: {'; '.join(errors)}"
+        )
+
     def fetch_stock_info(self, ticker: str) -> ProviderResult:
         """
         Fetch stock metadata for a ticker.
@@ -1223,17 +1350,37 @@ def init_providers():
     Should be called once at application startup.
     """
     from .yfinance_provider import (
-        YFinancePriceProvider, YFinanceEPSProvider, YFinanceDividendProvider
+        YFinancePriceProvider, YFinanceEPSProvider, YFinanceDividendProvider, YFinanceSplitProvider,
+        YFinanceAnalystEstimateProvider, YFinanceSharesOutstandingProvider,
     )
-    from .sec_provider import SECEPSProvider
-    from .fmp_provider import FMPPriceProvider
-    from .alpaca_provider import AlpacaPriceProvider
+    from .sec_provider import (
+        SECEPSProvider, SECSplitProvider,
+        SECBalanceSheetProvider, SECSharesOutstandingProvider,
+    )
+    from .fmp_provider import FMPPriceProvider, FMPSplitProvider
+    from .alpaca_provider import AlpacaPriceProvider, AlpacaSplitProvider
     from .ibkr_provider import IBKRPriceProvider
     from .defeatbeta_provider import DefeatBetaPriceProvider, DefeatBetaEPSProvider
 
     registry = get_registry()
 
     # Register all providers
+    #
+    # IMPORTANT: `registry.register()` indexes providers by name in `_providers`,
+    # so later registrations overwrite earlier ones for the same name. Providers
+    # with shared names (e.g., "yfinance", "sec_edgar") are registered in
+    # "less-specific first" order so the primary one ends up canonical. In
+    # particular SECSplitProvider is registered BEFORE SECEPSProvider so that
+    # `get_provider("sec_edgar")` returns the EPS provider — which is what
+    # `fetch_sec_metrics` / `fetch_filings` rely on.
+
+    # Split providers (registered first so EPS/price providers can overwrite
+    # `_providers[name]` entries with richer providers)
+    registry.register(YFinanceSplitProvider())
+    registry.register(FMPSplitProvider())
+    registry.register(AlpacaSplitProvider())
+    registry.register(SECSplitProvider())
+
     # Real-time price providers
     registry.register(YFinancePriceProvider())
     registry.register(FMPPriceProvider())
@@ -1250,6 +1397,12 @@ def init_providers():
 
     # Dividend providers
     registry.register(YFinanceDividendProvider())
+
+    # Star Scoring data providers (analyst estimates, balance sheet, shares outstanding)
+    registry.register(YFinanceAnalystEstimateProvider())
+    registry.register(SECBalanceSheetProvider())
+    registry.register(SECSharesOutstandingProvider())
+    registry.register(YFinanceSharesOutstandingProvider())
 
     print(f"[Providers] Initialized {len(registry.get_all_providers())} providers")
     for provider in registry.get_all_providers():

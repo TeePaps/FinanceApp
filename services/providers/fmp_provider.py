@@ -10,7 +10,7 @@ import requests
 from typing import Dict, List
 
 import config
-from .base import PriceProvider, ProviderResult
+from .base import PriceProvider, SplitProvider, ProviderResult, SplitData
 from .secrets import get_fmp_api_key
 
 # FMP API configuration - using stable endpoint (v3 is legacy)
@@ -298,6 +298,91 @@ class FMPPriceProvider(PriceProvider):
             except Exception:
                 pass
             return None  # Fall back to individual
+
+
+class FMPSplitProvider(SplitProvider):
+    """
+    Financial Modeling Prep stock split provider.
+
+    Uses FMP historical-stock-splits endpoint. Requires API key.
+    """
+
+    @property
+    def name(self) -> str:
+        return "fmp"
+
+    @property
+    def display_name(self) -> str:
+        return "Financial Modeling Prep"
+
+    def is_available(self) -> bool:
+        return bool(get_fmp_api_key())
+
+    @property
+    def rate_limit(self) -> float:
+        return 0.1
+
+    def fetch_splits(self, ticker: str) -> ProviderResult:
+        """Fetch split history from FMP."""
+        api_key = get_fmp_api_key()
+        if not api_key:
+            return ProviderResult(
+                success=False,
+                data=None,
+                source=self.name,
+                error="FMP API key not configured",
+            )
+
+        ticker = ticker.upper()
+        try:
+            url = f"{FMP_BASE_URL}/historical-stock-splits?symbol={ticker}&apikey={api_key}"
+            response = requests.get(url, timeout=FMP_REQUEST_TIMEOUT)
+
+            if response.status_code == 401:
+                return ProviderResult(success=False, data=None, source=self.name, error="Invalid FMP API key")
+            if response.status_code == 403:
+                return ProviderResult(success=False, data=None, source=self.name, error="FMP plan does not include splits")
+            if response.status_code == 429:
+                return ProviderResult(success=False, data=None, source=self.name, error="FMP rate limit exceeded")
+            if response.status_code != 200:
+                return ProviderResult(success=False, data=None, source=self.name, error=f"FMP API error: {response.status_code}")
+
+            data = response.json()
+
+            if isinstance(data, dict) and 'Error Message' in data:
+                return ProviderResult(success=False, data=None, source=self.name, error=data['Error Message'])
+
+            splits_list = []
+            # FMP returns either a list of events or a dict {symbol, historical: [...]}
+            events = data if isinstance(data, list) else data.get('historical', []) if isinstance(data, dict) else []
+
+            for event in events:
+                try:
+                    date = event.get('date')
+                    numerator = event.get('numerator')
+                    denominator = event.get('denominator')
+                    ratio = None
+                    if numerator is not None and denominator:
+                        ratio = float(numerator) / float(denominator)
+                    elif event.get('ratio') is not None:
+                        ratio = float(event['ratio'])
+                    if date and ratio:
+                        splits_list.append({'date': date, 'ratio': ratio})
+                except (ValueError, TypeError):
+                    continue
+
+            splits_list.sort(key=lambda s: s['date'], reverse=True)
+
+            return ProviderResult(
+                success=True,
+                data=SplitData(ticker=ticker, source=self.name, splits=splits_list),
+                source=self.name,
+            )
+
+        except requests.Timeout:
+            return ProviderResult(success=False, data=None, source=self.name, error="FMP API timeout")
+        except Exception as e:
+            return ProviderResult(success=False, data=None, source=self.name, error=str(e))
 
 
 def validate_fmp_api_key(api_key: str) -> tuple:

@@ -12,7 +12,11 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from typing import Dict, List
-from .base import EPSProvider, ProviderResult, EPSData, SECMetricsData, FilingsData
+from .base import (
+    EPSProvider, SplitProvider, BalanceSheetProvider, SharesOutstandingProvider,
+    ProviderResult, EPSData, SplitData, SECMetricsData, FilingsData,
+    BalanceSheetData, SharesOutstandingData,
+)
 
 
 class SECEPSProvider(EPSProvider):
@@ -369,3 +373,145 @@ class SECEPSProvider(EPSProvider):
             sec_data.check_and_update_on_startup(tickers)
         except Exception:
             pass
+
+
+class SECSplitProvider(SplitProvider):
+    """
+    SEC EDGAR stock split provider (best-effort placeholder).
+
+    SEC EDGAR does NOT expose stock splits through its `companyfacts` XBRL API.
+    Splits surface via 8-K filings which require separate parsing. This
+    provider exists so the SplitProvider interface is complete and so a future
+    8-K parser can drop in without changing the orchestrator — for now it
+    returns an empty success result, letting other providers in the chain
+    supply the data.
+    """
+
+    @property
+    def name(self) -> str:
+        return "sec_edgar"
+
+    @property
+    def display_name(self) -> str:
+        return "SEC EDGAR"
+
+    def is_available(self) -> bool:
+        return True
+
+    @property
+    def rate_limit(self) -> float:
+        return 0.12
+
+    @property
+    def is_authoritative(self) -> bool:
+        return True
+
+    def fetch_splits(self, ticker: str) -> ProviderResult:
+        ticker = ticker.upper()
+        return ProviderResult(
+            success=True,
+            data=SplitData(ticker=ticker, source=self.name, splits=[]),
+            source=self.name,
+        )
+
+
+class SECBalanceSheetProvider(BalanceSheetProvider):
+    """
+    SEC EDGAR balance-sheet provider.
+
+    Wraps sec_data.fetch_balance_sheet to fetch LongTermDebt, DebtCurrent,
+    and StockholdersEquity from us-gaap companyfacts.
+    """
+
+    @property
+    def name(self) -> str:
+        return "sec_edgar"
+
+    @property
+    def display_name(self) -> str:
+        return "SEC EDGAR"
+
+    def is_available(self) -> bool:
+        return True
+
+    @property
+    def rate_limit(self) -> float:
+        return 0.12
+
+    @property
+    def is_authoritative(self) -> bool:
+        return True
+
+    def fetch_balance_sheet(self, ticker: str) -> ProviderResult:
+        ticker = ticker.upper()
+        try:
+            import sec_data
+            data = sec_data.fetch_balance_sheet(ticker)
+            if not data:
+                return ProviderResult(
+                    success=False, data=None, source=self.name,
+                    error="No balance sheet data from SEC"
+                )
+            bs = BalanceSheetData(
+                ticker=ticker,
+                source=self.name,
+                long_term_debt=data.get('long_term_debt'),
+                short_term_debt=data.get('short_term_debt'),
+                stockholders_equity=data.get('stockholders_equity'),
+                as_of_date=data.get('as_of_date'),
+            )
+            return ProviderResult(success=True, data=bs, source=self.name)
+        except Exception as e:
+            return ProviderResult(
+                success=False, data=None, source=self.name, error=str(e)
+            )
+
+
+class SECSharesOutstandingProvider(SharesOutstandingProvider):
+    """
+    SEC EDGAR shares-outstanding provider.
+
+    Wraps sec_data.fetch_shares_outstanding which returns a time series of
+    CommonStockSharesOutstanding (or equivalent) us-gaap concept.
+    """
+
+    @property
+    def name(self) -> str:
+        return "sec_edgar"
+
+    @property
+    def display_name(self) -> str:
+        return "SEC EDGAR"
+
+    def is_available(self) -> bool:
+        return True
+
+    @property
+    def rate_limit(self) -> float:
+        return 0.12
+
+    @property
+    def is_authoritative(self) -> bool:
+        return True
+
+    def fetch_shares_outstanding(self, ticker: str) -> ProviderResult:
+        ticker = ticker.upper()
+        try:
+            import sec_data
+            data = sec_data.fetch_shares_outstanding(ticker)
+            if not data:
+                return ProviderResult(
+                    success=False, data=None, source=self.name,
+                    error="No shares outstanding data from SEC"
+                )
+            so = SharesOutstandingData(
+                ticker=ticker,
+                source=self.name,
+                current=data.get('current'),
+                history=data.get('history', []),
+            )
+            return ProviderResult(success=True, data=so, source=self.name)
+        except Exception as e:
+            return ProviderResult(
+                success=False, data=None, source=self.name, error=str(e)
+            )

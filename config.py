@@ -86,6 +86,13 @@ MIN_EPS_YEARS = _get('valuation.min_eps_years', 3)
 RECOMMENDED_EPS_YEARS = _get('valuation.recommended_eps_years', 8)
 
 # ============================================================================
+# Split Warning Settings
+# ============================================================================
+SPLIT_WARNING_LOOKBACK_YEARS = _get('split_warning.lookback_years', RECOMMENDED_EPS_YEARS)
+SPLIT_WARNING_RECENT_YEARS = _get('split_warning.recent_years', 3)
+SPLIT_WARNING_MIN_RATIO = _get('split_warning.min_ratio', 1.1)
+
+# ============================================================================
 # Recommendation Scoring Weights
 # ============================================================================
 SCORING_WEIGHTS = _get('scoring.weights', {
@@ -112,6 +119,13 @@ RECOMMENDATION_MIN_EPS_YEARS = _get('scoring.min_eps_years', 5)
 # ============================================================================
 SELL_OVERVALUED_THRESHOLD = _get('sell_thresholds.overvalued_percent', 10)
 SELL_GAIN_THRESHOLD = _get('sell_thresholds.gain_percent', 30)
+
+# ============================================================================
+# Star Scoring Thresholds
+# ============================================================================
+# Debt-to-capital ratio threshold for the "low debt" star (Criterion 4).
+# Star awarded when (LTD + STD) / (LTD + STD + Equity) ≤ this value.
+DEBT_TO_CAPITAL_THRESHOLD = _get('stars.debt_to_capital_threshold', 0.25)
 
 # ============================================================================
 # Selloff Detection Thresholds (price changes)

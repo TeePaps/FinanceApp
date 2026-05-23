@@ -189,6 +189,8 @@ def api_global_refresh():
 @screener_bp.route('/recommendations')
 def api_recommendations():
     """Get top stock recommendations."""
+    from services.valuation import compute_split_warning
+
     all_valuations = data_manager.load_valuations().get('valuations', {})
 
     if not all_valuations:
@@ -198,6 +200,12 @@ def api_recommendations():
     ticker_indexes = data_manager.get_all_ticker_indexes()
 
     result = get_top_recommendations(all_valuations, ticker_indexes, limit=10, filter_by_index=True)
+
+    # Attach split_warning to each recommendation (informational only — does
+    # not affect score or filtering, per the split-warning feature spec).
+    for rec in result.get('recommendations', []):
+        rec['split_warning'] = compute_split_warning(rec['ticker'])
+
     return jsonify(result)
 
 

@@ -1,0 +1,13 @@
+{
+  "id": "split-eps-correction",
+  "started": "2026-04-19T08:06:00",
+  "lastUpdated": "2026-04-19T08:06:00",
+  "status": "active",
+  "phase": "discovery",
+  "progress": {
+    "discovery": { "answered": 0, "total": 5 },
+    "detail": { "answered": 0, "total": 0 }
+  },
+  "contextFiles": [],
+  "relatedFeatures": ["2026-04-18-2026-split-warning"]
+}

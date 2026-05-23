@@ -19,10 +19,14 @@ class DataType(Enum):
     PRICE_HISTORY = "price_history"
     EPS = "eps"
     DIVIDEND = "dividend"
+    SPLIT = "split"
     STOCK_INFO = "stock_info"
     SELLOFF = "selloff"
     SEC_METRICS = "sec_metrics"  # Multi-year EPS matrix + dividend data from SEC
     FILINGS = "filings"  # 10-K filing URLs from SEC
+    ANALYST_ESTIMATES = "analyst_estimates"  # Quarterly EPS actual vs. consensus estimate
+    BALANCE_SHEET = "balance_sheet"  # Long-term/short-term debt + stockholders equity
+    SHARES_OUTSTANDING = "shares_outstanding"  # Shares outstanding (current + history)
 
 
 @dataclass
@@ -81,6 +85,15 @@ class DividendData:
     source: str
     annual_dividend: float
     payments: List[Dict]  # [{'date': str, 'amount': float}]
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class SplitData:
+    """Stock split history for a single ticker."""
+    ticker: str
+    source: str
+    splits: List[Dict]  # [{'date': 'YYYY-MM-DD', 'ratio': float}] sorted newest-first
     timestamp: datetime = field(default_factory=datetime.now)
 
 
@@ -145,6 +158,41 @@ class FilingsData:
     ticker: str
     source: str
     filings: List[Dict]  # [{fiscal_year, form_type, filing_date, document_url, accession_number}]
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class AnalystEstimateData:
+    """Analyst EPS estimate vs. actual for a single ticker."""
+    ticker: str
+    source: str
+    eps_actual: Optional[float]
+    eps_estimate: Optional[float]
+    surprise_percent: Optional[float]
+    period_end: Optional[str]  # 'YYYY-MM-DD' of most recent reported quarter
+    history: List[Dict] = field(default_factory=list)  # last N quarters
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class BalanceSheetData:
+    """Balance sheet data for debt-to-capital calculation."""
+    ticker: str
+    source: str
+    long_term_debt: Optional[float]
+    short_term_debt: Optional[float]
+    stockholders_equity: Optional[float]
+    as_of_date: Optional[str]  # 'YYYY-MM-DD'
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class SharesOutstandingData:
+    """Shares outstanding data for a single ticker."""
+    ticker: str
+    source: str
+    current: Optional[float]
+    history: List[Dict] = field(default_factory=list)  # [{date, shares, source}]
     timestamp: datetime = field(default_factory=datetime.now)
 
 
@@ -326,6 +374,38 @@ class DividendProvider(BaseProvider):
         pass
 
 
+class SplitProvider(BaseProvider):
+    """
+    Interface for stock split data providers.
+
+    Split data drives the Split Warning signal on valuations — a split in
+    the EPS averaging window means historical EPS from SEC EDGAR is on a
+    pre-split basis and the fair value calculation may be skewed.
+    """
+
+    @property
+    def data_types(self) -> List[DataType]:
+        return [DataType.SPLIT]
+
+    @abstractmethod
+    def fetch_splits(self, ticker: str) -> ProviderResult:
+        """
+        Fetch split history for a ticker.
+
+        Implementations SHOULD return an empty success result (data=SplitData
+        with splits=[]) when the ticker has no split history — this is a
+        normal, not-failure condition. Only return success=False on actual
+        fetch errors (network, auth, parsing).
+
+        Args:
+            ticker: Stock ticker symbol
+
+        Returns:
+            ProviderResult with data=SplitData on success
+        """
+        pass
+
+
 class HistoricalPriceProvider(BaseProvider):
     """
     Interface for historical price data providers.
@@ -432,4 +512,74 @@ class MultiDataProvider(BaseProvider):
     @abstractmethod
     def data_types(self) -> List[DataType]:
         """Override to specify all supported data types."""
+        pass
+
+
+class AnalystEstimateProvider(BaseProvider):
+    """
+    Interface for analyst-estimate providers.
+
+    Provides quarterly EPS actuals + the consensus estimate that preceded
+    each report. Used by the Star Scoring system to award the
+    "earnings beat" star.
+    """
+
+    @property
+    def data_types(self) -> List[DataType]:
+        return [DataType.ANALYST_ESTIMATES]
+
+    @abstractmethod
+    def fetch_analyst_estimates(self, ticker: str) -> ProviderResult:
+        """
+        Fetch the most recent quarterly EPS actual vs. estimate.
+
+        Returns:
+            ProviderResult with data=AnalystEstimateData on success
+        """
+        pass
+
+
+class BalanceSheetProvider(BaseProvider):
+    """
+    Interface for balance-sheet providers.
+
+    Provides the components needed to compute debt-to-capital:
+    long-term debt + short-term debt + stockholders equity.
+    """
+
+    @property
+    def data_types(self) -> List[DataType]:
+        return [DataType.BALANCE_SHEET]
+
+    @abstractmethod
+    def fetch_balance_sheet(self, ticker: str) -> ProviderResult:
+        """
+        Fetch the most recent balance sheet for a ticker.
+
+        Returns:
+            ProviderResult with data=BalanceSheetData on success
+        """
+        pass
+
+
+class SharesOutstandingProvider(BaseProvider):
+    """
+    Interface for shares-outstanding providers.
+
+    Provides current shares outstanding plus a history series so the
+    Star Scoring system can detect buybacks since a given buy date.
+    """
+
+    @property
+    def data_types(self) -> List[DataType]:
+        return [DataType.SHARES_OUTSTANDING]
+
+    @abstractmethod
+    def fetch_shares_outstanding(self, ticker: str) -> ProviderResult:
+        """
+        Fetch shares outstanding current + history for a ticker.
+
+        Returns:
+            ProviderResult with data=SharesOutstandingData on success
+        """
         pass

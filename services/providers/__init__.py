@@ -26,18 +26,26 @@ from .base import (
     PriceData,
     EPSData,
     DividendData,
+    SplitData,
     HistoricalPriceData,
     StockInfoData,
     SelloffData,
     SECMetricsData,
     FilingsData,
+    AnalystEstimateData,
+    BalanceSheetData,
+    SharesOutstandingData,
     BaseProvider,
     PriceProvider,
     EPSProvider,
     DividendProvider,
+    SplitProvider,
     HistoricalPriceProvider,
     StockInfoProvider,
     SelloffProvider,
+    AnalystEstimateProvider,
+    BalanceSheetProvider,
+    SharesOutstandingProvider,
 )
 
 from .config import (
@@ -51,6 +59,8 @@ from .config import (
     set_eps_providers,
     get_dividend_providers,
     set_dividend_providers,
+    get_split_providers,
+    set_split_providers,
     get_provider_order,
     set_provider_order,
     get_disabled_providers,
@@ -100,13 +110,22 @@ from .yfinance_provider import (
     YFinancePriceProvider,
     YFinanceEPSProvider,
     YFinanceDividendProvider,
+    YFinanceSplitProvider,
+    YFinanceAnalystEstimateProvider,
+    YFinanceSharesOutstandingProvider,
+    fetch_yearly_dividends,
 )
 
-from .sec_provider import SECEPSProvider
+from .sec_provider import (
+    SECEPSProvider,
+    SECSplitProvider,
+    SECBalanceSheetProvider,
+    SECSharesOutstandingProvider,
+)
 
-from .fmp_provider import FMPPriceProvider, validate_fmp_api_key
+from .fmp_provider import FMPPriceProvider, FMPSplitProvider, validate_fmp_api_key
 
-from .alpaca_provider import AlpacaPriceProvider, validate_alpaca_api_key
+from .alpaca_provider import AlpacaPriceProvider, AlpacaSplitProvider, validate_alpaca_api_key
 
 from .ibkr_provider import IBKRPriceProvider, validate_ibkr_connection, disconnect_ibkr
 
@@ -119,18 +138,26 @@ __all__ = [
     'PriceData',
     'EPSData',
     'DividendData',
+    'SplitData',
     'HistoricalPriceData',
     'StockInfoData',
     'SelloffData',
     'SECMetricsData',
     'FilingsData',
+    'AnalystEstimateData',
+    'BalanceSheetData',
+    'SharesOutstandingData',
     'BaseProvider',
     'PriceProvider',
     'EPSProvider',
     'DividendProvider',
+    'SplitProvider',
     'HistoricalPriceProvider',
     'StockInfoProvider',
     'SelloffProvider',
+    'AnalystEstimateProvider',
+    'BalanceSheetProvider',
+    'SharesOutstandingProvider',
 
     # Configuration
     'ProviderConfig',
@@ -143,6 +170,8 @@ __all__ = [
     'set_eps_providers',
     'get_dividend_providers',
     'set_dividend_providers',
+    'get_split_providers',
+    'set_split_providers',
     'get_provider_order',
     'set_provider_order',
     'get_disabled_providers',
@@ -187,10 +216,19 @@ __all__ = [
     'YFinancePriceProvider',
     'YFinanceEPSProvider',
     'YFinanceDividendProvider',
+    'YFinanceSplitProvider',
+    'YFinanceAnalystEstimateProvider',
+    'YFinanceSharesOutstandingProvider',
+    'fetch_yearly_dividends',
     'SECEPSProvider',
+    'SECSplitProvider',
+    'SECBalanceSheetProvider',
+    'SECSharesOutstandingProvider',
     'FMPPriceProvider',
+    'FMPSplitProvider',
     'validate_fmp_api_key',
     'AlpacaPriceProvider',
+    'AlpacaSplitProvider',
     'validate_alpaca_api_key',
     'IBKRPriceProvider',
     'validate_ibkr_connection',

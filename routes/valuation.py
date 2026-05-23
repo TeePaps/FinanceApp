@@ -11,7 +11,7 @@ Handles:
 import threading
 from flask import Blueprint, jsonify, request
 import data_manager
-from services.valuation import calculate_valuation, get_validated_eps
+from services.valuation import calculate_valuation, get_validated_eps, refresh_splits, compute_split_warning
 from services.providers import get_orchestrator
 from config import PE_RATIO_MULTIPLIER, RECOMMENDED_EPS_YEARS
 from datetime import datetime, timedelta
@@ -103,6 +103,10 @@ def api_valuation_refresh(ticker):
                 'avg_volume': sd.avg_volume, 'severity': sd.severity
             }
 
+        # Refresh split history and compute the Split Warning for the response.
+        refresh_splits(ticker, orchestrator=orchestrator)
+        split_warning = compute_split_warning(ticker)
+
         # Calculate valuation
         eps_avg = None
         estimated_value = None
@@ -148,6 +152,7 @@ def api_valuation_refresh(ticker):
             'eps_data': eps_data,
             'eps_validation': validation_info,
             'selloff': selloff_metrics,
+            'split_warning': split_warning,
             'formula': f'(({round(eps_avg, 2) if eps_avg else "N/A"} avg EPS) + {round(annual_dividend, 2)} dividend) x {PE_RATIO_MULTIPLIER} = ${round(estimated_value, 2) if estimated_value else "N/A"}'
         })
 
