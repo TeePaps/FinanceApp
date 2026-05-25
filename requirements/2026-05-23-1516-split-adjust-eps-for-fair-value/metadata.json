@@ -1,0 +1,22 @@
+{
+  "id": "split-adjust-eps-for-fair-value",
+  "started": "2026-05-23T15:16:00Z",
+  "lastUpdated": "2026-05-23T15:22:00Z",
+  "status": "complete",
+  "phase": "complete",
+  "progress": {
+    "discovery": { "answered": 3, "total": 3 },
+    "detail": { "answered": 0, "total": 0 }
+  },
+  "contextFiles": [
+    "services/valuation.py",
+    "services/screener.py",
+    "services/stars.py",
+    "scripts/backfill_valuations.py"
+  ],
+  "relatedFeatures": [
+    "2026-04-18-2026-split-warning",
+    "2026-05-23-1453-recommendations-negative-fair-value"
+  ],
+  "notes": "Phase 4 skipped. Fix is one helper + 4 call-site wires + backfill rerun."
+}

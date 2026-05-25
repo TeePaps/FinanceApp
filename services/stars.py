@@ -65,8 +65,12 @@ def _prior_year_fair_value_from_eps(ticker: str, annual_dividend_year_ago: float
     Backfill: recompute fair value as it would have been 1 year ago using the
     EPS history table — 8-year EPS average ending 1 year ago × 10, with
     prior-year dividend included in the formula (same shape as today's).
+
+    Uses split-adjusted EPS so year-over-year comparisons are apples-to-apples
+    across stock splits (e.g. BKNG's 25:1 split inside the window).
     """
-    eps_history = db.get_eps_history(ticker)
+    from services.valuation import get_split_adjusted_eps_history
+    eps_history = get_split_adjusted_eps_history(ticker)
     if not eps_history:
         return None
     current_year = datetime.now().year

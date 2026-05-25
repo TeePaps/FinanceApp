@@ -22,8 +22,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import database as db
-from config import PE_RATIO_MULTIPLIER
 from services.providers import init_providers, get_orchestrator
+from services.valuation import get_split_adjusted_eps_history, compute_estimated_value
 
 
 def main():
@@ -39,13 +39,17 @@ def main():
     for ticker, row in sorted(all_v.items()):
         examined += 1
 
-        hist = db.get_eps_history(ticker)
+        # Split-adjusted history so post-split tickers (e.g. BKNG 25:1) average correctly.
+        hist = get_split_adjusted_eps_history(ticker)
         if not hist:
             no_eps_history += 1
             continue
 
         use = hist[:8]
-        eps_avg = round(sum(h['eps'] for h in use) / len(use), 2)
+        eps_avg = round(
+            sum(h['eps'] for h in use if h.get('eps') is not None) / len(use),
+            2,
+        )
 
         # Always refresh dividends — that's half the bug.
         div_result = orch.fetch_dividends(ticker)
@@ -54,12 +58,11 @@ def main():
         else:
             annual_div = round(row.get('annual_dividend') or 0, 2)
 
-        estimated_value = round((eps_avg + annual_div) * PE_RATIO_MULTIPLIER, 2)
-        cp = row.get('current_price')
-        if cp and estimated_value:
-            pvv = round(((cp - estimated_value) / estimated_value) * 100, 1)
-        else:
-            pvv = None
+        # compute_estimated_value applies sanity rules (eps_avg <= 0 -> None,
+        # value-to-price ratio bounds) consistently with the rest of the codebase.
+        estimated_value, pvv = compute_estimated_value(
+            eps_avg, annual_div, row.get('current_price')
+        )
 
         cached_eps_avg = row.get('eps_avg')
         cached_div = row.get('annual_dividend')

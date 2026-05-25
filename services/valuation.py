@@ -10,11 +10,75 @@ Provides:
 
 import math
 from datetime import datetime, timedelta
+from typing import List, Dict
 from config import (
     PE_RATIO_MULTIPLIER, RECOMMENDED_EPS_YEARS,
     ESTIMATED_VALUE_RATIO_LOW, ESTIMATED_VALUE_RATIO_HIGH,
     SPLIT_WARNING_LOOKBACK_YEARS, SPLIT_WARNING_RECENT_YEARS, SPLIT_WARNING_MIN_RATIO,
 )
+
+
+def get_split_adjusted_eps_history(ticker: str) -> List[Dict]:
+    """
+    Return eps_history with EPS values adjusted for any splits that occurred
+    AFTER each fiscal year. Adjusted values are on the SAME per-share basis as
+    the current ticker price, so averages and fair-value math work correctly.
+
+    SEC reports EPS on a pre-split basis. Without adjustment, a company that
+    split 25:1 (like BKNG on 2026-04-06) will have a fair value 25x too high
+    relative to its post-split price.
+
+    The eps_history table keeps raw SEC values (audit-friendly). Only the
+    returned list is adjusted.
+
+    Args:
+        ticker: Stock ticker symbol
+
+    Returns:
+        List of eps_history rows with `eps` possibly adjusted, plus
+        `split_adjusted=True` and `split_adjustment_factor=<ratio>` keys
+        on rows that were touched.
+    """
+    import database as db
+    history = db.get_eps_history(ticker)
+    if not history:
+        return []
+    splits = db.get_splits(ticker)
+    if not splits:
+        return [dict(row) for row in history]
+
+    adjusted = []
+    for row in history:
+        eps = row.get('eps')
+        if eps is None:
+            adjusted.append(dict(row))
+            continue
+
+        # Use period_end as the fiscal-year cutoff; fall back to filed date,
+        # then to Jan 1 of (year + 1). Conservative — any split in year Y
+        # is attributed to AFTER fiscal year Y.
+        cutoff = row.get('period_end') or row.get('filed')
+        if not cutoff:
+            year = row.get('year')
+            cutoff = f"{int(year) + 1}-01-01" if year else None
+
+        cumulative = 1.0
+        if cutoff:
+            for s in splits:
+                d = s.get('date')
+                ratio = s.get('ratio')
+                if not d or not ratio or ratio <= 0:
+                    continue
+                if d > cutoff:
+                    cumulative *= float(ratio)
+
+        new_row = dict(row)
+        if cumulative != 1.0:
+            new_row['eps'] = eps / cumulative
+            new_row['split_adjusted'] = True
+            new_row['split_adjustment_factor'] = cumulative
+        adjusted.append(new_row)
+    return adjusted
 
 
 def compute_estimated_value(eps_avg, annual_dividend, current_price=None):
@@ -299,8 +363,15 @@ def calculate_valuation(ticker):
         split_warning = compute_split_warning(ticker)
 
         # Calculate valuation via the shared helper (sanity checks + None on bad input).
+        # Prefer split-adjusted EPS from the eps_history table when available — that
+        # keeps fair value consistent across splits (e.g. BKNG 25:1 on 2026-04-06).
+        # Fall back to the freshly-validated EPS list when eps_history isn't populated.
         eps_avg = None
-        if len(eps_data) > 0:
+        adjusted = get_split_adjusted_eps_history(ticker)
+        if adjusted:
+            window = adjusted[:RECOMMENDED_EPS_YEARS]
+            eps_avg = sum(r['eps'] for r in window if r.get('eps') is not None) / len(window)
+        elif len(eps_data) > 0:
             eps_avg = sum(e['eps'] for e in eps_data) / len(eps_data)
         estimated_value, price_vs_value = compute_estimated_value(
             eps_avg, annual_dividend, current_price
