@@ -27,7 +27,10 @@ from config import (
 )
 from logger import log, log_error
 from services.providers import get_orchestrator
-from services.valuation import get_validated_eps, calculate_valuation, compute_estimated_value
+from services.valuation import (
+    get_validated_eps, calculate_valuation, compute_estimated_value,
+    get_split_adjusted_eps_history,
+)
 from services.indexes import (
     VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES,
     fetch_index_tickers
@@ -187,17 +190,24 @@ def run_screener(index_name='all'):
 
         sec_result = orchestrator.fetch_eps(t)
         if sec_result.success and sec_result.data and sec_result.data.eps_history:
-            # Cap at 8 most recent years — matches Company Lookup / canonical formula.
-            eps_history = sec_result.data.eps_history[:8]
-            if len(eps_history) > 0:
-                eps_avg = sum(e['eps'] for e in eps_history) / len(eps_history)
+            # Read split-adjusted history from the eps_history table — the fresh
+            # SEC fetch just persisted the latest raw values, so this picks them up
+            # and applies split-adjustment in one pass (e.g. BKNG's 25:1 split).
+            adjusted = get_split_adjusted_eps_history(t)
+            if not adjusted:
+                # Provider returned data but the table wasn't populated for some
+                # reason — fall back to the raw fetched list (un-adjusted).
+                adjusted = [dict(e) for e in sec_result.data.eps_history]
+            use = adjusted[:8]
+            if len(use) > 0:
+                eps_avg = sum(r['eps'] for r in use if r.get('eps') is not None) / len(use)
                 eps_results[t] = {
                     'ticker': t,
                     'company_name': sec_result.data.company_name or t,
                     'eps_avg': round(eps_avg, 2),
-                    'eps_years': len(eps_history),
+                    'eps_years': len(use),
                     'eps_source': sec_result.source or 'sec',
-                    'has_enough_years': len(eps_history) >= 8,
+                    'has_enough_years': len(use) >= 8,
                     'annual_dividend': existing_valuations.get(t, {}).get('annual_dividend', 0),
                 }
                 sec_hits += 1
@@ -206,10 +216,10 @@ def run_screener(index_name='all'):
         # Fallback 1: SEC EPS cached in eps_history table from a prior successful fetch.
         # Prevents a transient SEC outage from overwriting good SEC data with stale
         # yfinance values via the existing-valuations fallback below.
-        cached_history = db.get_eps_history(t)
+        cached_history = get_split_adjusted_eps_history(t)
         if cached_history:
             use = cached_history[:8]
-            eps_avg = sum(e['eps'] for e in use) / len(use)
+            eps_avg = sum(r['eps'] for r in use if r.get('eps') is not None) / len(use)
             eps_results[t] = {
                 'ticker': t,
                 'company_name': existing_valuations.get(t, {}).get('company_name') or t,
@@ -454,13 +464,15 @@ def run_screener(index_name='all'):
         eps_avg = eps_info.get('eps_avg') if eps_info else None
 
         # Database fallback: if Phase 1 didn't get EPS, check eps_history table
+        # (split-adjusted so post-split tickers like BKNG get correct averages).
         if not eps_avg:
-            eps_history = db.get_eps_history(ticker)
+            eps_history = get_split_adjusted_eps_history(ticker)
             if eps_history and len(eps_history) > 0:
-                calculated_avg = sum(e['eps'] for e in eps_history) / len(eps_history)
+                use = eps_history[:8]
+                calculated_avg = sum(e['eps'] for e in use if e.get('eps') is not None) / len(use)
                 eps_info = {
                     'eps_avg': round(calculated_avg, 2),
-                    'eps_years': len(eps_history),
+                    'eps_years': len(use),
                     'eps_source': 'sec_cache',
                     'company_name': eps_info.get('company_name') if eps_info else None
                 }
