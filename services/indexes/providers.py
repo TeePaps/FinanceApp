@@ -10,9 +10,13 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import time
 import pandas as pd
 import requests
 from io import StringIO
+
+# How long a tripped index-provider circuit stays open before a half-open retry
+INDEX_CIRCUIT_COOLDOWN = 600  # seconds (10 min)
 
 from config import INDEX_PROVIDER_TIMEOUT
 
@@ -206,8 +210,12 @@ class WikipediaIndexProvider(IndexProvider):
                     error=f"Column '{col_name}' not found. Available: {list(table.columns)}"
                 )
 
-            tickers = [self._normalize_ticker(t) for t in table[col_name].tolist()]
-            tickers = [t for t in tickers if t]  # Remove empty
+            # Coerce to str first (like the other providers): pandas.read_html
+            # can yield NaN/numeric cells for blank or footnote rows, and
+            # _normalize_ticker's .replace() would raise AttributeError on a
+            # float, failing the ENTIRE fetch.
+            tickers = [self._normalize_ticker(str(t)) for t in table[col_name].tolist()]
+            tickers = [t for t in tickers if t and t != 'NAN']  # Remove empty / NaN
 
             return IndexResult(
                 success=True,
@@ -372,8 +380,9 @@ class iSharesIndexProvider(IndexProvider):
             # iShares CSV has metadata rows at the top
             lines = resp.text.split('\n')
 
-            # Find the header row (starts with "Ticker,")
-            data_start = 0
+            # Find the header row (starts with "Ticker,"). None sentinel, not
+            # 0 — a header legitimately at line 0 was misread as "not found".
+            data_start = None
             as_of_date = None
             for i, line in enumerate(lines):
                 if line.startswith('Fund Holdings as of,'):
@@ -382,7 +391,7 @@ class iSharesIndexProvider(IndexProvider):
                     data_start = i
                     break
 
-            if data_start == 0:
+            if data_start is None:
                 return IndexResult(
                     success=False,
                     tickers=[],
@@ -536,9 +545,27 @@ class IndexOrchestrator:
         self._providers: Dict[str, IndexProvider] = {}
         self._register_providers()
 
-        # Track failures for circuit breaker pattern
+        # Track failures for circuit breaker pattern. Records the last failure
+        # time too, so an open circuit can self-heal after a cooldown — without
+        # it, 3 cumulative failures abandoned a provider for the entire process
+        # lifetime (reset_circuit_breaker was never called anywhere).
         self._failures: Dict[str, int] = {}
+        self._last_failure: Dict[str, float] = {}
         self._failure_threshold = 3
+
+    def _circuit_open(self, name: str) -> bool:
+        """True if the provider's circuit is open AND still in cooldown.
+
+        Once the cooldown elapses this returns False for a single half-open
+        probe; a subsequent failure re-opens it (count keeps climbing)."""
+        if self._failures.get(name, 0) < self._failure_threshold:
+            return False
+        last = self._last_failure.get(name, 0)
+        return (time.time() - last) < INDEX_CIRCUIT_COOLDOWN
+
+    def _record_failure(self, name: str):
+        self._failures[name] = self._failures.get(name, 0) + 1
+        self._last_failure[name] = time.time()
 
     def _register_providers(self):
         """Register all available index providers."""
@@ -610,17 +637,18 @@ class IndexOrchestrator:
 
         errors = []
         for provider in providers:
-            # Skip providers that have failed too many times
-            if self._failures.get(provider.name, 0) >= self._failure_threshold:
-                errors.append(f"{provider.name}: circuit breaker open")
+            # Skip providers whose circuit is open and still cooling down
+            if self._circuit_open(provider.name):
+                errors.append(f"{provider.name}: circuit breaker open (cooling down)")
                 continue
 
             try:
                 result = provider.fetch_constituents(index_id)
 
                 if result.success and len(result.tickers) > 0:
-                    # Reset failure count on success
+                    # Reset failure count + timer on success
                     self._failures[provider.name] = 0
+                    self._last_failure.pop(provider.name, None)
                     try:
                         from services.activity_log import activity_log
                         activity_log.log("success", "index", f"{index_id}: {len(result.tickers)} tickers from {provider.name}")
@@ -629,11 +657,11 @@ class IndexOrchestrator:
                     return result
                 else:
                     errors.append(f"{provider.name}: {result.error or 'empty result'}")
-                    self._failures[provider.name] = self._failures.get(provider.name, 0) + 1
+                    self._record_failure(provider.name)
 
             except Exception as e:
                 errors.append(f"{provider.name}: {str(e)}")
-                self._failures[provider.name] = self._failures.get(provider.name, 0) + 1
+                self._record_failure(provider.name)
 
         try:
             from services.activity_log import activity_log
