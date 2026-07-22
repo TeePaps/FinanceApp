@@ -280,8 +280,12 @@ def api_summary():
         if ticker not in by_ticker:
             by_ticker[ticker] = {
                 'ticker': ticker,
-                'name': stocks.get(ticker, {}).get('name', ticker),
-                'type': stocks.get(ticker, {}).get('type', 'stock'),
+                # `or` fallback, not dict.get default: a NULL/empty type or
+                # name in the DB is present-but-falsy, so .get(k, default)
+                # returns the None/'' and the ticker (typed None) was dropped
+                # from both frontend summary tables.
+                'name': stocks.get(ticker, {}).get('name') or ticker,
+                'type': stocks.get(ticker, {}).get('type') or 'stock',
                 'shares_held': 0,
                 'total_bought': 0,
                 'total_buy_cost': 0,

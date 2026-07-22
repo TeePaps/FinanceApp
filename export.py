@@ -8,10 +8,36 @@ from config import STOCKS_FILE, TRANSACTIONS_FILE
 
 
 def read_user_csv(filepath):
-    """Read CSV file from data_private directory."""
+    """Read CSV file from data_private directory (legacy; returns [] if gone)."""
+    if not filepath or not os.path.exists(filepath):
+        return []
     with open(filepath, 'r') as f:
         reader = csv.DictReader(f)
         return list(reader)
+
+
+def _load_stocks():
+    """Stocks keyed by ticker — DB first, legacy CSV as fallback."""
+    try:
+        import database as db
+        rows = db.get_stocks()
+        if rows:
+            return {s['ticker']: dict(s) for s in rows}
+    except Exception:
+        pass
+    return {s['ticker']: s for s in read_user_csv(STOCKS_FILE)}
+
+
+def _load_transactions():
+    """Transactions list — DB first, legacy CSV as fallback."""
+    try:
+        import database as db
+        rows = db.get_transactions()
+        if rows:
+            return [dict(t) for t in rows]
+    except Exception:
+        pass
+    return read_user_csv(TRANSACTIONS_FILE)
 
 def format_date(date_str):
     """Convert YYYY-MM-DD to M/D/YYYY format."""
@@ -27,12 +53,19 @@ def format_date(date_str):
     return date_str
 
 def export():
-    stocks = {s['ticker']: s for s in read_user_csv(STOCKS_FILE)}
-    transactions = read_user_csv(TRANSACTIONS_FILE)
+    stocks = _load_stocks()
+    transactions = _load_transactions()
 
-    # Group transactions by ticker
+    # Group transactions by ticker. DB values can be typed (int/float/None)
+    # rather than CSV strings, so coerce to str where the formatting below
+    # assumes strings.
+    def _s(v):
+        return '' if v is None else str(v)
+
     by_ticker = defaultdict(list)
     for txn in transactions:
+        txn = {k: _s(v) if k in ('shares', 'price', 'gain_pct', 'date', 'status', 'action', 'ticker') else v
+               for k, v in txn.items()}
         by_ticker[txn['ticker']].append(txn)
 
     # Separate stocks and index funds
