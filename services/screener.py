@@ -15,6 +15,7 @@ import time
 import json
 import threading
 import math
+import functools
 from datetime import datetime, timedelta
 
 import database as db
@@ -84,6 +85,32 @@ def get_current_index():
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
+def _clears_running_flag(fn):
+    """
+    Guarantee the module _running flag is released when a run_* function
+    exits — INCLUDING unhandled exceptions. These run in daemon threads;
+    without this, one sqlite error or provider TypeError left _running=True
+    forever, and every later screener/refresh request was rejected with
+    "already running" until the app was restarted.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        global _running
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            log_error(f"{fn.__name__} crashed", e)
+            _progress['status'] = 'error'
+            _progress['ticker'] = f"Error: {str(e)[:80]}"
+            try:
+                activity_log.log("error", "screener", f"{fn.__name__} crashed: {str(e)[:80]}")
+            except Exception:
+                pass
+        finally:
+            _running = False
+    return wrapper
+
 
 def _reconcile_delistings(all_tickers, priced_tickers):
     """
@@ -157,6 +184,7 @@ def record_ticker_failures(failed_tickers, successful_tickers):
 # MAIN SCREENER FUNCTIONS
 # =============================================================================
 
+@_clears_running_flag
 def run_screener(index_name='all'):
     """
     Full screener update with 4 phases:
@@ -328,6 +356,26 @@ def run_screener(index_name='all'):
                             'last_dividend_date': last_payment['date'] if last_payment else ''
                         }
                         dividend_count += 1
+                    else:
+                        # Successful fetch of 0. Same policy as
+                        # calculate_valuation's flakiness guard: distrust a
+                        # fresh 0 when the cache has a non-zero dividend
+                        # (yfinance intermittently returns empty payment
+                        # lists), but record an authoritative 0 when the
+                        # cache agrees there's no dividend — otherwise a
+                        # company that ELIMINATED its dividend kept the old
+                        # value inflating fair value forever, the exact
+                        # corruption this phase exists to prevent.
+                        cached_div = existing_valuations.get(ticker, {}).get('annual_dividend') or 0
+                        if cached_div > 0:
+                            log.warning(f"[{ticker}] fresh dividend fetch returned 0; "
+                                        f"keeping cached ${cached_div:.2f} (flaky-fetch guard)")
+                        else:
+                            dividend_data[ticker] = {
+                                'annual_dividend': 0,
+                                'last_dividend': 0,
+                                'last_dividend_date': ''
+                            }
             except Exception:
                 pass
             time.sleep(backoff_delay)
@@ -532,12 +580,18 @@ def run_screener(index_name='all'):
             eps_avg = eps_info.get('eps_avg')
 
         div_info = dividend_data.get(ticker, {})
-        annual_dividend = (
-            div_info.get('annual_dividend') or
-            eps_info.get('annual_dividend') or
-            existing_valuations.get(ticker, {}).get('annual_dividend') or
-            0
-        )
+        if 'annual_dividend' in div_info:
+            # Fresh fetch succeeded this run — authoritative, INCLUDING 0
+            # (an `or` chain here made a fetched 0 fall through to the
+            # stale cached value).
+            annual_dividend = div_info['annual_dividend']
+        else:
+            # Fetch failed — better a cached dividend than none
+            annual_dividend = (
+                eps_info.get('annual_dividend') or
+                existing_valuations.get(ticker, {}).get('annual_dividend') or
+                0
+            )
 
         if eps_info.get('company_name'):
             company_name = eps_info['company_name']
@@ -647,6 +701,7 @@ def run_screener(index_name='all'):
     _running = False
 
 
+@_clears_running_flag
 def run_quick_price_update(index_name='all'):
     """Fast update - batch download prices only, reuse cached EPS data."""
     global _running, _progress, _current_index
@@ -852,6 +907,7 @@ def run_quick_price_update(index_name='all'):
     _running = False
 
 
+@_clears_running_flag
 def run_smart_update(index_name='all'):
     """Smart update - prioritizes missing tickers, then updates prices for existing ones."""
     global _running, _progress, _current_index
@@ -1049,6 +1105,7 @@ def run_smart_update(index_name='all'):
     _running = False
 
 
+@_clears_running_flag
 def run_global_refresh():
     """Global refresh across all indexes."""
     global _running, _progress
@@ -1237,7 +1294,7 @@ def run_global_refresh():
             'company_name': company_name,
             'current_price': round(current_price, 2) if current_price else None,
             'price_source': price_sources_dict.get(ticker),
-            'eps_avg': round(eps_avg, 2) if eps_avg else None,
+            'eps_avg': round(eps_avg, 2) if eps_avg is not None else None,
             'eps_years': eps_years,
             'eps_source': eps_source,
             'has_enough_years': eps_years >= 8,
