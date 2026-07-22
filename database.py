@@ -629,6 +629,12 @@ def refresh_index_membership(index_name: str, current_tickers: List[str]) -> Dic
     - Marks removed tickers (active=0)
     - Does NOT affect tickers.delisted (that's for truly delisted companies)
 
+    Data-safety guard: if the incoming set would deactivate more than half of
+    the currently-active members, the source is almost certainly bad (a stale
+    decade-old snapshot, a truncated/partial parse) rather than a real
+    reconstitution — so this does an ADDITIVE-ONLY refresh (add new members,
+    keep existing ones) instead of wiping the index.
+
     Returns dict with 'added', 'removed', 'total' counts.
     """
     current_set = set(t.upper() for t in current_tickers)
@@ -641,13 +647,32 @@ def refresh_index_membership(index_name: str, current_tickers: List[str]) -> Dic
         cursor.execute('SELECT ticker FROM ticker_indexes WHERE index_name = ?', (index_name,))
         existing = set(row['ticker'] for row in cursor.fetchall())
 
-        # Mark removed tickers as inactive in this index
+        # Currently-active members (what a bad refresh would destroy)
+        cursor.execute(
+            'SELECT ticker FROM ticker_indexes WHERE index_name = ? AND (active IS NULL OR active = 1)',
+            (index_name,))
+        active_existing = set(row['ticker'] for row in cursor.fetchall())
+
         removed = existing - current_set
-        for ticker in removed:
-            cursor.execute('''
-                UPDATE ticker_indexes SET active = 0
-                WHERE ticker = ? AND index_name = ?
-            ''', (ticker, index_name))
+        would_deactivate = active_existing - current_set
+        additive_only = (
+            len(active_existing) >= 20
+            and len(would_deactivate) > 0.5 * len(active_existing)
+        )
+
+        if additive_only:
+            print(f"[Index] Suspicious refresh for {index_name}: would deactivate "
+                  f"{len(would_deactivate)}/{len(active_existing)} active members "
+                  f"(new set size {len(current_set)}). Doing additive-only refresh; "
+                  f"existing members preserved.")
+            removed = set()  # don't deactivate anything
+        else:
+            # Mark removed tickers as inactive in this index
+            for ticker in removed:
+                cursor.execute('''
+                    UPDATE ticker_indexes SET active = 0
+                    WHERE ticker = ? AND index_name = ?
+                ''', (ticker, index_name))
 
         # Add/reactivate current tickers
         added = 0
