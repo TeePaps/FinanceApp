@@ -320,6 +320,15 @@ def _init_public_database():
         existing_columns = {row[1] for row in cursor.fetchall()}
         if 'price_source' not in existing_columns:
             cursor.execute('ALTER TABLE valuations ADD COLUMN price_source TEXT')
+        # Timestamp of the last actual PRICE write. The shared `updated`
+        # column is bumped by every partial upsert (EPS-only, dividend-only,
+        # 52-week-only …), so using it to judge price freshness served stale
+        # prices as fresh. Backfill existing rows from `updated` so nothing
+        # looks infinitely stale right after the migration.
+        if 'price_updated' not in existing_columns:
+            cursor.execute('ALTER TABLE valuations ADD COLUMN price_updated TEXT')
+            cursor.execute('UPDATE valuations SET price_updated = updated '
+                           'WHERE price_updated IS NULL AND current_price IS NOT NULL')
 
         # Add delisted column to tickers if it doesn't exist
         cursor.execute('PRAGMA table_info(tickers)')
@@ -707,14 +716,23 @@ def _upsert_valuation(cursor, ticker: str, valuation: Dict, now: str):
             v = 1 if v else 0
         values.append(v)
 
-    insert_cols = ['ticker'] + cols + ['updated']
+    # Track when the PRICE itself was last written, separately from the
+    # general `updated` timestamp — the price cache uses it to judge
+    # freshness (see registry._get_cached_price).
+    trailing_cols = ['updated']
+    trailing_vals = [now]
+    if 'current_price' in valuation:
+        trailing_cols.append('price_updated')
+        trailing_vals.append(now)
+
+    insert_cols = ['ticker'] + cols + trailing_cols
     placeholders = ', '.join('?' * len(insert_cols))
-    set_clause = ', '.join(f"{c} = excluded.{c}" for c in cols + ['updated'])
+    set_clause = ', '.join(f"{c} = excluded.{c}" for c in cols + trailing_cols)
     cursor.execute(
         f'''INSERT INTO valuations ({', '.join(insert_cols)})
             VALUES ({placeholders})
             ON CONFLICT(ticker) DO UPDATE SET {set_clause}''',
-        [ticker] + values + [now],
+        [ticker] + values + trailing_vals,
     )
 
 
@@ -741,13 +759,14 @@ def update_price_cache(ticker: str, price: float, source: Optional[str] = None):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO valuations (ticker, current_price, price_source, updated)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO valuations (ticker, current_price, price_source, updated, price_updated)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(ticker) DO UPDATE SET
                 current_price = excluded.current_price,
                 price_source = excluded.price_source,
-                updated = excluded.updated
-        ''', (ticker, price, source, now))
+                updated = excluded.updated,
+                price_updated = excluded.price_updated
+        ''', (ticker, price, source, now, now))
 
 
 def bulk_update_valuations(valuations: Dict[str, Dict]):
