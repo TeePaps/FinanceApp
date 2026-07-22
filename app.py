@@ -300,8 +300,11 @@ def api_summary():
             by_ticker[ticker]['total_bought'] += shares
             by_ticker[ticker]['total_buy_cost'] += shares * price
         elif txn['action'] == 'sell':
-            by_ticker[ticker]['shares_held'] -= shares
+            # Only executed sells reduce the position — a 'placed' order is
+            # still owned shares (it appears in the pending_* fields instead),
+            # matching My Portfolio / calculate_fifo_cost_basis semantics.
             if status == 'done':
+                by_ticker[ticker]['shares_held'] -= shares
                 by_ticker[ticker]['total_sold'] += shares
                 by_ticker[ticker]['total_sell_revenue'] += shares * price
             elif status == 'placed':
@@ -351,7 +354,10 @@ def api_summary():
         data['realized_profit'] = realized_profit
         data['current_cost_basis'] = sum(l['remaining'] * l['price'] for l in lots if l['remaining'] > 0)
         data['pending_value'] = pending_value
-        data['pending_profit'] = pending_value - pending_cost if pending_cost > 0 else 0
+        # No pending_cost>0 guard: a zero matched basis (oversell / missing
+        # buy data) should report the full revenue as profit, matching how
+        # realized profit treats the same situation — not report $0.
+        data['pending_profit'] = pending_value - pending_cost
 
         total_invested += data['total_buy_cost']
         total_current_cost_basis += data['current_cost_basis']

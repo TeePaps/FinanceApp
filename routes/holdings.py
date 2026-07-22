@@ -35,7 +35,14 @@ def api_holdings():
         if has_confirmed_shares(holding):
             confirmed[ticker] = holding
         else:
-            pending[ticker] = holding
+            # Watchlist tickers own no shares (FIFO now counts 'done' buys
+            # only), so show the planned buy quantity on the card instead
+            # of 0 — same number the old all-statuses lots produced.
+            planned = sum(
+                int(t['shares']) if t['shares'] else 0
+                for t in holding['transactions'] if t['action'] == 'buy'
+            )
+            pending[ticker] = {**holding, 'shares': planned}
 
     # Separate stocks and index funds for confirmed holdings
     stocks = {k: v for k, v in confirmed.items() if v['type'] == 'stock'}
