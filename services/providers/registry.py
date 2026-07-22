@@ -24,6 +24,18 @@ from .config import get_config, ProviderConfig
 from .circuit_breaker import get_circuit_breaker, CircuitBreaker
 
 
+def _breaker_key(provider: 'BaseProvider') -> str:
+    """
+    Circuit-breaker identity for a provider.
+
+    Four SEC providers all report name=='sec_edgar', so keying the breaker
+    on name alone let a balance-sheet miss open the circuit for EPS, splits,
+    and shares-outstanding too. Include the class name so each capability
+    gets its own circuit while single-class providers keep stable identity.
+    """
+    return f"{provider.name}:{type(provider).__name__}"
+
+
 class ProviderRegistry:
     """
     Central registry for all data providers.
@@ -249,17 +261,17 @@ class DataOrchestrator:
         """
         if not self.config.circuit_breaker_enabled:
             return True
-        return self.circuit_breaker.can_execute(provider.name)
+        return self.circuit_breaker.can_execute(_breaker_key(provider))
 
     def _record_provider_success(self, provider: BaseProvider):
         """Record successful provider call."""
         if self.config.circuit_breaker_enabled:
-            self.circuit_breaker.record_success(provider.name)
+            self.circuit_breaker.record_success(_breaker_key(provider))
 
     def _record_provider_failure(self, provider: BaseProvider):
         """Record failed provider call."""
         if self.config.circuit_breaker_enabled:
-            self.circuit_breaker.record_failure(provider.name)
+            self.circuit_breaker.record_failure(_breaker_key(provider))
 
     def _get_cache_max_age(self, data_type: DataType) -> timedelta:
         """Get cache duration based on data type."""

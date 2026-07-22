@@ -258,13 +258,16 @@ class SECEPSProvider(EPSProvider):
                     error="No SEC metrics available"
                 )
 
+            # sec_data.fetch_company_metrics returns 'eps_matrix' /
+            # 'dividend_matrix' — the old 'eps_by_year' / 'dividends' keys
+            # never existed, so every SEC metrics response was silently empty.
             return ProviderResult(
                 success=True,
                 data=SECMetricsData(
                     ticker=ticker,
                     source=self.name,
-                    eps_matrix=data.get('eps_by_year', []),
-                    dividend_history=data.get('dividends', []),
+                    eps_matrix=data.get('eps_matrix', {}),
+                    dividend_history=data.get('dividend_matrix', {}),
                     company_name=data.get('company_name'),
                     cik=data.get('cik')
                 ),
