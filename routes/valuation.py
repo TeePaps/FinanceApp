@@ -103,10 +103,19 @@ def api_valuation_refresh(ticker):
 
         # Get dividend info using orchestrator
         dividend_result = orchestrator.fetch_dividends(ticker)
+        dividend_ok = bool(dividend_result.success and dividend_result.data)
         annual_dividend = 0
 
-        if dividend_result.success and dividend_result.data:
+        if dividend_ok:
+            # A successful fetch of 0 is honored — refresh is the documented
+            # escape hatch for clearing a stale dividend (see
+            # calculate_valuation's flakiness guard).
             annual_dividend = dividend_result.data.annual_dividend
+        else:
+            # Fetch FAILED — keep the cached dividend instead of silently
+            # zeroing it (and dragging fair value down with it).
+            import database as db
+            annual_dividend = (db.get_valuation(ticker) or {}).get('annual_dividend') or 0
 
         # Get selloff metrics via orchestrator
         selloff_metrics = None
@@ -122,44 +131,72 @@ def api_valuation_refresh(ticker):
         refresh_splits(ticker, orchestrator=orchestrator)
         split_warning = compute_split_warning(ticker)
 
-        # Calculate valuation
+        # Calculate valuation via the canonical helper — the same sanity rules
+        # as the GET path (rejects eps_avg<=0, suppresses values outside the
+        # plausible band vs price), so refresh can no longer persist negative
+        # or nonsense fair values that /api/valuation would refuse to show.
         eps_avg = None
-        estimated_value = None
-        price_vs_value = None
         off_high_pct = None
 
         if len(eps_data) > 0:
             eps_avg = sum(e['eps'] for e in eps_data) / len(eps_data)
-            estimated_value = (eps_avg + annual_dividend) * PE_RATIO_MULTIPLIER
-
-            if current_price and current_price > 0 and estimated_value > 0:
-                price_vs_value = ((current_price - estimated_value) / estimated_value) * 100
+        from services.valuation import compute_estimated_value
+        estimated_value, price_vs_value = compute_estimated_value(
+            eps_avg, annual_dividend, current_price
+        )
 
         if fifty_two_week_high and current_price:
             off_high_pct = ((current_price - fifty_two_week_high) / fifty_two_week_high) * 100
 
-        # Build valuation record
+        # Build valuation record ("is not None" guards: 0.0 is a legitimate
+        # price_vs_value / off_high_pct and must not collapse to null)
         valuation = {
             'ticker': ticker,
             'company_name': company_name,
             'current_price': round(current_price, 2) if current_price else None,
             'price_source': price_source,
-            'eps_avg': round(eps_avg, 2) if eps_avg else None,
+            'eps_avg': round(eps_avg, 2) if eps_avg is not None else None,
             'eps_years': len(eps_data),
             'eps_source': eps_source,
             'annual_dividend': round(annual_dividend, 2),
-            'estimated_value': round(estimated_value, 2) if estimated_value else None,
-            'price_vs_value': round(price_vs_value, 1) if price_vs_value else None,
+            'estimated_value': round(estimated_value, 2) if estimated_value is not None else None,
+            'price_vs_value': round(price_vs_value, 1) if price_vs_value is not None else None,
             'fifty_two_week_high': fifty_two_week_high,
             'fifty_two_week_low': fifty_two_week_low,
-            'off_high_pct': round(off_high_pct, 1) if off_high_pct else None,
+            'off_high_pct': round(off_high_pct, 1) if off_high_pct is not None else None,
             'in_selloff': selloff_metrics.get('severity') in ('severe', 'high', 'moderate') if selloff_metrics else False,
             'selloff_severity': selloff_metrics.get('severity') if selloff_metrics else None,
             'updated': datetime.now().isoformat()
         }
 
+        # Persist only what was actually fetched. update_valuation touches only
+        # the keys present, so dropping the failed pieces preserves cached
+        # values instead of NULLing price/EPS/fair value on a transient
+        # provider error. When EPS *did* fetch but the sanity rules suppressed
+        # the fair value, the None IS persisted deliberately (clears stale
+        # nonsense from the cache).
+        persist = dict(valuation)
+        if not (price_result.success and current_price):
+            for k in ('current_price', 'price_source', 'price_vs_value', 'off_high_pct'):
+                persist.pop(k, None)
+        if not eps_data:
+            for k in ('eps_avg', 'eps_years', 'eps_source',
+                      'estimated_value', 'price_vs_value'):
+                persist.pop(k, None)
+        if not (info_result.success and info_result.data):
+            for k in ('fifty_two_week_high', 'fifty_two_week_low', 'off_high_pct'):
+                persist.pop(k, None)
+        if not dividend_ok:
+            persist.pop('annual_dividend', None)
+        if selloff_metrics is None:
+            for k in ('in_selloff', 'selloff_severity'):
+                persist.pop(k, None)
+        if company_name == ticker:
+            # Placeholder name — don't overwrite a cached real name
+            persist.pop('company_name', None)
+
         # Save to valuations
-        data_manager.update_valuation(ticker, valuation)
+        data_manager.update_valuation(ticker, persist)
 
         return jsonify({
             'success': True,
