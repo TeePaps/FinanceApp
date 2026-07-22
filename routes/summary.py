@@ -136,12 +136,17 @@ def api_profit_timeline():
             continue
 
         txn_date = _parse_date(txn.get('date'))
-        if not txn_date:
+        if txn_date:
+            if start and txn_date < start:
+                continue
+            if end and txn_date > end:
+                continue
+        elif start or end:
+            # An undated sell can't be placed inside a date window
             continue
-        if start and txn_date < start:
-            continue
-        if end and txn_date > end:
-            continue
+        # Undated done sells stay in the unfiltered totals so this endpoint
+        # agrees with /api/performance (which has no date concept); they
+        # just can't be bucketed by month below.
 
         ticker = txn['ticker']
         shares = int(txn['shares']) if txn['shares'] else 0
@@ -173,12 +178,13 @@ def api_profit_timeline():
             'profit': round(profit, 2)
         })
 
-        month_key = txn_date.strftime('%Y-%m')
-        if month_key not in by_month:
-            by_month[month_key] = {'month': month_key, 'profit': 0, 'revenue': 0, 'sales_count': 0}
-        by_month[month_key]['profit'] += profit
-        by_month[month_key]['revenue'] += revenue
-        by_month[month_key]['sales_count'] += 1
+        if txn_date:
+            month_key = txn_date.strftime('%Y-%m')
+            if month_key not in by_month:
+                by_month[month_key] = {'month': month_key, 'profit': 0, 'revenue': 0, 'sales_count': 0}
+            by_month[month_key]['profit'] += profit
+            by_month[month_key]['revenue'] += revenue
+            by_month[month_key]['sales_count'] += 1
 
         sales_in_range.append({
             'date': txn['date'],
@@ -188,7 +194,7 @@ def api_profit_timeline():
             'profit': round(profit, 2)
         })
 
-    sales_in_range.sort(key=lambda x: x['date'])
+    sales_in_range.sort(key=lambda x: x['date'] or '')
     by_ticker_list = sorted(by_ticker.values(), key=lambda x: x['profit'], reverse=True)
     for t in by_ticker_list:
         t['revenue'] = round(t['revenue'], 2)

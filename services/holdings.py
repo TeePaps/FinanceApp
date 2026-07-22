@@ -28,9 +28,43 @@ def get_transactions():
     return db.get_transactions()
 
 
+def _consume_lots(lots, shares_to_sell):
+    """Consume `shares_to_sell` from `lots` (oldest first, in place).
+
+    Returns (total_cost, lots_used, unmatched_shares)."""
+    total_cost = 0
+    lots_used = []
+    for lot in lots:
+        if shares_to_sell <= 0:
+            break
+        if lot['remaining'] <= 0:
+            continue
+
+        take = min(lot['remaining'], shares_to_sell)
+        total_cost += take * lot['price']
+        lot['remaining'] -= take
+        shares_to_sell -= take
+        lots_used.append({'shares': take, 'price': lot['price']})
+    return total_cost, lots_used, shares_to_sell
+
+
 def calculate_fifo_cost_basis(ticker, transactions):
     """
     Calculate FIFO cost basis for sells.
+
+    Status semantics (matching /api/summary, profit-timeline, and the
+    frontend's Pending Sales flow): only transactions with status 'done'
+    have actually executed. Lots are built from confirmed buys and consumed
+    by confirmed sells ONLY — a 'placed' (pending order) or watchlist
+    buy/sell has not executed, so it must not change the shares you own.
+    Previously placed sells consumed lots and watch/placed buys created
+    them, which made whole positions vanish from (or get inflated in)
+    holdings, performance, and sell-candidate views.
+
+    Non-'done' sells still get a sell_basis entry: a quote against the lots
+    left after all confirmed activity, consumed in order among themselves so
+    two pending sells never quote the same shares. Quotes are flagged with
+    'pending': True and never affect remaining_lots.
 
     Args:
         ticker: Stock ticker symbol
@@ -41,42 +75,35 @@ def calculate_fifo_cost_basis(ticker, transactions):
         - sell_basis: Dict mapping transaction id to cost basis info for sells
         - remaining_lots: List of lots with remaining shares
     """
-    # Build list of lots (buys) in order
+    # Build list of lots (confirmed buys) in order
     lots = []  # Each lot: {'shares': n, 'price': p, 'remaining': n}
     sell_basis = {}  # txn_id -> {'cost_basis': total_cost, 'shares': n, 'avg_cost_per_share': p}
+    unexecuted_sells = []  # 'placed' / watchlist sells, quoted after the pass
 
     for txn in transactions:
         if txn['ticker'] != ticker:
             continue
 
+        status = (txn.get('status') or '').lower()
         shares = int(txn['shares']) if txn['shares'] else 0
         price = float(txn['price']) if txn['price'] else 0
 
         if txn['action'] == 'buy':
-            lots.append({'shares': shares, 'price': price, 'remaining': shares})
+            if status == 'done':
+                lots.append({'shares': shares, 'price': price, 'remaining': shares})
         elif txn['action'] == 'sell':
+            if status != 'done':
+                unexecuted_sells.append(txn)
+                continue
+
             # Use FIFO to determine cost basis
-            shares_to_sell = shares
-            total_cost = 0
-            lots_used = []
-
-            for lot in lots:
-                if shares_to_sell <= 0:
-                    break
-                if lot['remaining'] <= 0:
-                    continue
-
-                take = min(lot['remaining'], shares_to_sell)
-                total_cost += take * lot['price']
-                lot['remaining'] -= take
-                shares_to_sell -= take
-                lots_used.append({'shares': take, 'price': lot['price']})
+            total_cost, lots_used, unmatched = _consume_lots(lots, shares)
 
             # Divide by the shares actually matched to lots — if a sell exceeds
             # available buys (oversell / missing data), dividing by the full
             # sell quantity would understate the per-share basis and inflate
             # the computed gain.
-            matched_shares = shares - shares_to_sell
+            matched_shares = shares - unmatched
             avg_cost = total_cost / matched_shares if matched_shares > 0 else 0
             sell_basis[txn['id']] = {
                 'cost_basis': total_cost,
@@ -85,6 +112,22 @@ def calculate_fifo_cost_basis(ticker, transactions):
                 'lots_used': lots_used
             }
 
+    # Quote unexecuted sells against a shadow copy of what's left, so the
+    # quotes are what WOULD be consumed if the orders filled today.
+    shadow = [{'price': l['price'], 'remaining': l['remaining']} for l in lots]
+    for txn in unexecuted_sells:
+        shares = int(txn['shares']) if txn['shares'] else 0
+        total_cost, lots_used, unmatched = _consume_lots(shadow, shares)
+        matched_shares = shares - unmatched
+        avg_cost = total_cost / matched_shares if matched_shares > 0 else 0
+        sell_basis[txn['id']] = {
+            'cost_basis': total_cost,
+            'shares': shares,
+            'avg_cost_per_share': avg_cost,
+            'lots_used': lots_used,
+            'pending': True
+        }
+
     return sell_basis, lots
 
 
@@ -92,8 +135,13 @@ def calculate_holdings(confirmed_only=False):
     """
     Calculate current holdings from transactions with FIFO lot tracking.
 
+    Share counts, cost basis, and remaining lots are ALWAYS built from
+    confirmed ('done') transactions only — calculate_fifo_cost_basis ignores
+    pending/watchlist orders — so a watchlist-only ticker reports shares=0.
+
     Args:
-        confirmed_only: If True, only include buys with status='done'
+        confirmed_only: If True, additionally drop non-'done' buys from the
+            returned per-ticker transaction lists (numbers are unaffected)
 
     Returns:
         Dict mapping ticker to holding info
