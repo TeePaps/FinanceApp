@@ -253,12 +253,16 @@ def migrate_user_transactions(dry_run=False):
         print("  [DRY RUN] Would migrate user transactions")
         return len(transactions)
 
-    with db.get_db() as conn:
+    # Transactions live in the PRIVATE database — db.get_db() is an alias for
+    # the public DB, which has no transactions table, so the old code crashed
+    # with "no such table: transactions" at step 7/7 of every real migration.
+    with db.get_private_db() as conn:
         cursor = conn.cursor()
         for txn in transactions:
-            # Parse values carefully
-            txn_id = int(txn.get('id', 0)) if txn.get('id') else None
-            shares = int(txn.get('shares', 0)) if txn.get('shares') else 0
+            # Parse values carefully. CSV values are strings — int('100.0')
+            # raises, so route share counts through float first.
+            txn_id = int(float(txn.get('id', 0))) if txn.get('id') else None
+            shares = int(float(txn.get('shares', 0))) if txn.get('shares') else 0
             price = float(txn.get('price', 0)) if txn.get('price') else 0
             gain_pct = float(txn.get('gain_pct')) if txn.get('gain_pct') else None
 
