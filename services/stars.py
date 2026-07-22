@@ -60,6 +60,16 @@ def _check_earnings_beat(ticker: str) -> bool:
 # Criterion 2: Fair Value Up Year-over-Year
 # -----------------------------------------------------------------------------
 
+def _one_year_ago_str() -> str:
+    """Date string for 'this day last year'. Feb 29 maps to Feb 28 —
+    datetime.replace(year=...) raises ValueError on leap days, which would
+    otherwise kill the whole star-rating phase once every four years."""
+    now = datetime.now()
+    try:
+        return now.replace(year=now.year - 1).strftime('%Y-%m-%d')
+    except ValueError:
+        return now.replace(year=now.year - 1, day=28).strftime('%Y-%m-%d')
+
 def _prior_year_fair_value_from_eps(ticker: str, annual_dividend_year_ago: float) -> Optional[float]:
     """
     Backfill: recompute fair value as it would have been 1 year ago using the
@@ -99,8 +109,7 @@ def _check_fair_value_up(ticker: str, current_estimated_value: Optional[float],
     # Prefer a stored snapshot from ~1 year ago (most recent that's old enough).
     history = db.get_valuation_history(ticker)
     if history:
-        target = datetime.now().replace(microsecond=0)
-        target_str = target.replace(year=target.year - 1).strftime('%Y-%m-%d')
+        target_str = _one_year_ago_str()
         prior = next((row for row in history if row['snapshot_date'] <= target_str), None)
         if prior and prior.get('estimated_value'):
             return current_estimated_value > prior['estimated_value']
@@ -472,8 +481,7 @@ def _explain_fair_value_up(ticker, valuation, yearly_dividends):
     prior = None
     prior_source = None
     if history:
-        target = datetime.now().replace(microsecond=0)
-        target_str = target.replace(year=target.year - 1).strftime('%Y-%m-%d')
+        target_str = _one_year_ago_str()
         snap = next((row for row in history if row['snapshot_date'] <= target_str), None)
         if snap and snap.get('estimated_value'):
             prior = snap['estimated_value']

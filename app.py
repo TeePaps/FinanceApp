@@ -290,7 +290,10 @@ def api_summary():
                 'realized_profit': 0,
                 'avg_buy_price': 0,
                 'pending_sells': [],
+                'txns': [],
             }
+
+        by_ticker[ticker]['txns'].append(txn)
 
         if txn['action'] == 'buy':
             by_ticker[ticker]['shares_held'] += shares
@@ -314,25 +317,39 @@ def api_summary():
     total_realized_profit = 0
     total_pending_value = 0
     total_pending_profit = 0
+    total_returned = 0
 
     ticker_summaries = []
     for ticker, data in by_ticker.items():
-        # Average buy price
+        # Average buy price (historical average across all confirmed buys)
         if data['total_bought'] > 0:
             data['avg_buy_price'] = data['total_buy_cost'] / data['total_bought']
 
-        # Realized profit (sell revenue - proportional cost)
-        if data['total_sold'] > 0 and data['avg_buy_price'] > 0:
-            cost_of_sold = data['total_sold'] * data['avg_buy_price']
-            data['realized_profit'] = data['total_sell_revenue'] - cost_of_sold
+        # FIFO cost basis — must match holdings-analysis and the per-sell
+        # gain_pct stored on transactions. The previous average-cost math here
+        # made the Summary tab disagree with My Portfolio for any ticker with
+        # partial sells (e.g. TSLA basis $1,639 avg-cost vs $1,807 FIFO).
+        sell_basis, lots = calculate_fifo_cost_basis(ticker, data['txns'])
 
-        # Current holdings value at cost
-        data['current_cost_basis'] = data['shares_held'] * data['avg_buy_price'] if data['shares_held'] > 0 else 0
+        realized_profit = 0
+        pending_value = 0
+        pending_cost = 0
+        for txn in data['txns']:
+            if txn['action'] != 'sell':
+                continue
+            status = (txn.get('status') or '').lower()
+            shares = int(txn['shares']) if txn['shares'] else 0
+            price = float(txn['price']) if txn['price'] else 0
+            revenue = shares * price
+            cost = sell_basis.get(txn['id'], {}).get('cost_basis', 0)
+            if status == 'done':
+                realized_profit += revenue - cost
+            elif status == 'placed':
+                pending_value += revenue
+                pending_cost += cost
 
-        # Pending sells
-        pending_value = sum(p['value'] for p in data['pending_sells'])
-        pending_shares = sum(p['shares'] for p in data['pending_sells'])
-        pending_cost = pending_shares * data['avg_buy_price']
+        data['realized_profit'] = realized_profit
+        data['current_cost_basis'] = sum(l['remaining'] * l['price'] for l in lots if l['remaining'] > 0)
         data['pending_value'] = pending_value
         data['pending_profit'] = pending_value - pending_cost if pending_cost > 0 else 0
 
@@ -341,6 +358,7 @@ def api_summary():
         total_realized_profit += data['realized_profit']
         total_pending_value += pending_value
         total_pending_profit += data['pending_profit']
+        total_returned += data['total_sell_revenue']
 
         ticker_summaries.append({
             'ticker': ticker,
@@ -365,7 +383,10 @@ def api_summary():
             'realized_profit': round(total_realized_profit, 2),
             'pending_value': round(total_pending_value, 2),
             'pending_profit': round(total_pending_profit, 2),
-            'total_returned': round(total_realized_profit + total_invested - total_current_cost_basis, 2),
+            # Cash actually received from completed sales. The old derivation
+            # (realized + invested - basis) double-counts pending/placed sells
+            # because they reduce basis without producing revenue.
+            'total_returned': round(total_returned, 2),
         },
         'by_ticker': ticker_summaries
     })

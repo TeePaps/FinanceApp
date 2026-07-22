@@ -29,7 +29,7 @@ from logger import log, log_error
 from services.providers import get_orchestrator
 from services.valuation import (
     get_validated_eps, calculate_valuation, compute_estimated_value,
-    get_split_adjusted_eps_history,
+    get_split_adjusted_eps_history, average_split_adjusted_eps,
 )
 from services.indexes import (
     VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES,
@@ -198,16 +198,15 @@ def run_screener(index_name='all'):
                 # Provider returned data but the table wasn't populated for some
                 # reason — fall back to the raw fetched list (un-adjusted).
                 adjusted = [dict(e) for e in sec_result.data.eps_history]
-            use = adjusted[:8]
-            if len(use) > 0:
-                eps_avg = sum(r['eps'] for r in use if r.get('eps') is not None) / len(use)
+            eps_avg, years_used = average_split_adjusted_eps(adjusted)
+            if eps_avg is not None:
                 eps_results[t] = {
                     'ticker': t,
                     'company_name': sec_result.data.company_name or t,
                     'eps_avg': round(eps_avg, 2),
-                    'eps_years': len(use),
+                    'eps_years': years_used,
                     'eps_source': sec_result.source or 'sec',
-                    'has_enough_years': len(use) >= 8,
+                    'has_enough_years': years_used >= 8,
                     'annual_dividend': existing_valuations.get(t, {}).get('annual_dividend', 0),
                 }
                 sec_hits += 1
@@ -217,16 +216,15 @@ def run_screener(index_name='all'):
         # Prevents a transient SEC outage from overwriting good SEC data with stale
         # yfinance values via the existing-valuations fallback below.
         cached_history = get_split_adjusted_eps_history(t)
-        if cached_history:
-            use = cached_history[:8]
-            eps_avg = sum(r['eps'] for r in use if r.get('eps') is not None) / len(use)
+        cached_avg, cached_years = average_split_adjusted_eps(cached_history)
+        if cached_avg is not None:
             eps_results[t] = {
                 'ticker': t,
                 'company_name': existing_valuations.get(t, {}).get('company_name') or t,
-                'eps_avg': round(eps_avg, 2),
-                'eps_years': len(use),
+                'eps_avg': round(cached_avg, 2),
+                'eps_years': cached_years,
                 'eps_source': 'sec_cache',
-                'has_enough_years': len(use) >= 8,
+                'has_enough_years': cached_years >= 8,
                 'annual_dividend': existing_valuations.get(t, {}).get('annual_dividend', 0),
             }
             sec_hits += 1
@@ -467,12 +465,11 @@ def run_screener(index_name='all'):
         # (split-adjusted so post-split tickers like BKNG get correct averages).
         if not eps_avg:
             eps_history = get_split_adjusted_eps_history(ticker)
-            if eps_history and len(eps_history) > 0:
-                use = eps_history[:8]
-                calculated_avg = sum(e['eps'] for e in use if e.get('eps') is not None) / len(use)
+            calculated_avg, years_used = average_split_adjusted_eps(eps_history)
+            if calculated_avg is not None:
                 eps_info = {
                     'eps_avg': round(calculated_avg, 2),
-                    'eps_years': len(use),
+                    'eps_years': years_used,
                     'eps_source': 'sec_cache',
                     'company_name': eps_info.get('company_name') if eps_info else None
                 }
@@ -526,9 +523,9 @@ def run_screener(index_name='all'):
             'price_vs_value': round(price_vs_value, 1) if price_vs_value is not None else None,
             'fifty_two_week_high': round(fifty_two_week_high, 2) if fifty_two_week_high else None,
             'fifty_two_week_low': round(fifty_two_week_low, 2) if fifty_two_week_low else None,
-            'off_high_pct': round(off_high_pct, 1) if off_high_pct else None,
-            'price_change_1m': round(price_change_1m, 1) if price_change_1m else None,
-            'price_change_3m': round(price_change_3m, 1) if price_change_3m else None,
+            'off_high_pct': round(off_high_pct, 1) if off_high_pct is not None else None,
+            'price_change_1m': round(price_change_1m, 1) if price_change_1m is not None else None,
+            'price_change_3m': round(price_change_3m, 1) if price_change_3m is not None else None,
             'in_selloff': in_selloff,
             'selloff_severity': selloff_severity,
             'updated': now_iso
@@ -545,7 +542,9 @@ def run_screener(index_name='all'):
 
         ticker_status_updates = {}
         for ticker, val in valuations_batch.items():
-            sec_status = 'available' if val.get('eps_source') == 'sec' else 'unavailable'
+            sec_status = ('available'
+                          if str(val.get('eps_source') or '').startswith('sec')
+                          else 'unavailable')
             ticker_status_updates[ticker] = {
                 'sec_status': sec_status,
                 'valuation_updated': now_iso,
@@ -629,6 +628,7 @@ def run_quick_price_update(index_name='all'):
 
     activity_log.log("info", "screener", f"Quick Update: {len(tickers)} tickers ({index_display_name})")
 
+    updated_count = 0
     try:
         activity_log.log("info", "screener", f"Phase 1: Fetching 3mo history...")
         orchestrator = get_orchestrator()
@@ -706,17 +706,18 @@ def run_quick_price_update(index_name='all'):
                 company_name = existing.get('company_name', ticker)
 
                 # If no EPS data in existing valuation, check SEC cache
+                # (split-adjusted + 8-year window, same as the full screener)
                 if eps_avg is None:
-                    sec_data = db.get_sec_company(ticker)
-                    if sec_data and sec_data.get('eps_history'):
-                        eps_history = sec_data['eps_history']
-                        if len(eps_history) > 0:
-                            eps_avg = sum(e['eps'] for e in eps_history) / len(eps_history)
-                            eps_years = len(eps_history)
-                            eps_source = 'sec'
-                            sec_company_name = sec_data.get('company_name')
-                            if sec_company_name and sec_company_name != ticker:
-                                company_name = sec_company_name
+                    cached_history = get_split_adjusted_eps_history(ticker)
+                    cached_avg, cached_years = average_split_adjusted_eps(cached_history)
+                    if cached_avg is not None:
+                        eps_avg = cached_avg
+                        eps_years = cached_years
+                        eps_source = 'sec_cache'
+                        sec_data = db.get_sec_company(ticker)
+                        sec_company_name = sec_data.get('company_name') if sec_data else None
+                        if sec_company_name and sec_company_name != ticker:
+                            company_name = sec_company_name
 
                 # Try to refresh bad company names (where company_name == ticker)
                 if company_name == ticker:
@@ -960,7 +961,9 @@ def run_smart_update(index_name='all'):
 
         except Exception as e:
             try:
-                from services.activity_log import activity_log
+                # NOTE: do not re-import activity_log here — a function-level
+                # import binds it as a local for the WHOLE function, making every
+                # earlier activity_log.log() call raise UnboundLocalError.
                 activity_log.log("error", "screener", f"Smart Update price phase error: {str(e)[:50]}")
             except Exception:
                 pass
@@ -1122,10 +1125,17 @@ def run_global_refresh():
 
         sec_result = orchestrator.fetch_eps(ticker)
         if sec_result.success and sec_result.data and sec_result.data.eps_history:
-            eps_history = sec_result.data.eps_history
-            if len(eps_history) > 0:
-                eps_avg = sum(e['eps'] for e in eps_history) / len(eps_history)
-                eps_years = len(eps_history)
+            # Read back split-adjusted history (the fresh fetch just persisted
+            # raw values) so global refresh can't reintroduce pre-split EPS
+            # averages (e.g. BKNG 25:1). Fall back to the raw list if the
+            # table wasn't populated.
+            adjusted = get_split_adjusted_eps_history(ticker)
+            if not adjusted:
+                adjusted = [dict(e) for e in sec_result.data.eps_history]
+            calc_avg, years_used = average_split_adjusted_eps(adjusted)
+            if calc_avg is not None:
+                eps_avg = calc_avg
+                eps_years = years_used
                 eps_source = 'sec'
                 company_name = sec_result.data.company_name or ticker
 
@@ -1173,12 +1183,12 @@ def run_global_refresh():
             'has_enough_years': eps_years >= 8,
             'annual_dividend': round(annual_dividend, 2) if annual_dividend else 0,
             'estimated_value': round(estimated_value, 2) if estimated_value else None,
-            'price_vs_value': round(price_vs_value, 1) if price_vs_value else None,
+            'price_vs_value': round(price_vs_value, 1) if price_vs_value is not None else None,
             'fifty_two_week_high': fifty_two_week_high,
             'fifty_two_week_low': fifty_two_week_low,
-            'off_high_pct': round(off_high_pct, 1) if off_high_pct else None,
-            'price_change_1m': round(price_change_1m, 1) if price_change_1m else None,
-            'price_change_3m': round(price_change_3m, 1) if price_change_3m else None,
+            'off_high_pct': round(off_high_pct, 1) if off_high_pct is not None else None,
+            'price_change_1m': round(price_change_1m, 1) if price_change_1m is not None else None,
+            'price_change_3m': round(price_change_3m, 1) if price_change_3m is not None else None,
             'in_selloff': in_selloff,
             'selloff_severity': selloff_severity,
             'updated': now_iso
@@ -1196,7 +1206,9 @@ def run_global_refresh():
 
     ticker_status_updates = {}
     for ticker, val in ticker_valuations.items():
-        sec_status = 'available' if val.get('eps_source') == 'sec' else 'unavailable'
+        sec_status = ('available'
+                          if str(val.get('eps_source') or '').startswith('sec')
+                          else 'unavailable')
         ticker_status_updates[ticker] = {
             'sec_status': sec_status,
             'valuation_updated': now_iso,
@@ -1320,12 +1332,21 @@ def _fetch_52_week_data(tickers, progress_callback=None):
                 **existing,
                 'fifty_two_week_high': round(fifty_two_week_high, 2) if fifty_two_week_high else None,
                 'fifty_two_week_low': round(data['fifty_two_week_low'], 2) if data.get('fifty_two_week_low') else None,
-                'off_high_pct': round(off_high_pct, 1) if off_high_pct else None,
+                'off_high_pct': round(off_high_pct, 1) if off_high_pct is not None else None,
                 'updated': now_iso
             }
 
         data_manager.bulk_update_valuations(updates)
         activity_log.log("success", "screener", f"Updated 52-week data for {len(updates)} tickers")
+    else:
+        # All fetches came back empty (commonly yfinance throttling .info
+        # right after a large batch download). Don't fail silently — the
+        # missing data looks identical to "phase never ran" otherwise.
+        activity_log.log(
+            "warning", "screener",
+            f"52-week fetch found no data for any of {len(tickers_needing_data)} tickers "
+            "(provider may be rate-limiting; will retry next update)"
+        )
 
     return results
 

@@ -72,7 +72,12 @@ def calculate_fifo_cost_basis(ticker, transactions):
                 shares_to_sell -= take
                 lots_used.append({'shares': take, 'price': lot['price']})
 
-            avg_cost = total_cost / shares if shares > 0 else 0
+            # Divide by the shares actually matched to lots — if a sell exceeds
+            # available buys (oversell / missing data), dividing by the full
+            # sell quantity would understate the per-share basis and inflate
+            # the computed gain.
+            matched_shares = shares - shares_to_sell
+            avg_cost = total_cost / matched_shares if matched_shares > 0 else 0
             sell_basis[txn['id']] = {
                 'cost_basis': total_cost,
                 'shares': shares,

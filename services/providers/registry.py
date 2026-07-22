@@ -307,17 +307,14 @@ class DataOrchestrator:
         return None
 
     def _save_price_to_cache(self, ticker: str, price: float, source: str):
-        """Save price to database cache."""
-        import database as db
-        ticker = ticker.upper()
+        """Save price to database cache.
 
-        # Update just the price fields in the valuation
-        db.bulk_update_valuations({
-            ticker: {
-                'current_price': price,
-                'price_source': source,
-            }
-        })
+        Uses the column-scoped update_price_cache(): writing a partial dict
+        through bulk_update_valuations() (a full-row upsert) wiped the
+        ticker's EPS / dividend / fair-value columns on every price fetch.
+        """
+        import database as db
+        db.update_price_cache(ticker, price, source)
 
     def _get_cached(self, data_type: DataType, ticker: str) -> Optional[ProviderResult]:
         """Get cached data - stub for EPS/dividend (not database cached yet)."""
@@ -1247,6 +1244,20 @@ class DataOrchestrator:
     # SEC-specific methods
     # These provide access to SEC data through the orchestrator
 
+    def _get_sec_eps_provider(self):
+        """
+        Return the registered SECEPSProvider instance.
+
+        Cannot use `get_provider("sec_edgar")`: four SEC provider classes share
+        that name and `_providers` is keyed by name, so whichever registered
+        last wins (SECSharesOutstandingProvider) — it lacks fetch_metrics /
+        fetch_filings. Look up by type + class so registration order can't
+        break these endpoints.
+        """
+        from .sec_provider import SECEPSProvider
+        candidates = self.registry._by_type.get(DataType.EPS, [])
+        return next((p for p in candidates if isinstance(p, SECEPSProvider)), None)
+
     def fetch_sec_metrics(self, ticker: str) -> 'ProviderResult':
         """
         Fetch SEC metrics (multi-year EPS matrix + dividends) for a ticker.
@@ -1257,9 +1268,7 @@ class DataOrchestrator:
         Returns:
             ProviderResult with SECMetricsData
         """
-        from .sec_provider import SECEPSProvider
-
-        provider = self.registry.get_provider("sec_edgar")
+        provider = self._get_sec_eps_provider()
         if not provider:
             return ProviderResult(
                 success=False,
@@ -1280,7 +1289,7 @@ class DataOrchestrator:
         Returns:
             ProviderResult with FilingsData
         """
-        provider = self.registry.get_provider("sec_edgar")
+        provider = self._get_sec_eps_provider()
         if not provider:
             return ProviderResult(
                 success=False,
@@ -1336,10 +1345,19 @@ def get_registry() -> ProviderRegistry:
 
 
 def get_orchestrator() -> DataOrchestrator:
-    """Get the global data orchestrator."""
+    """
+    Get the global data orchestrator.
+
+    Auto-initializes providers when needed — an orchestrator over an empty
+    registry fails every fetch silently (no providers → no data, no error),
+    which is a trap for scripts/threads that forget init_providers().
+    """
     global _orchestrator
     if _orchestrator is None:
-        _orchestrator = DataOrchestrator(get_registry())
+        registry = get_registry()
+        if not registry.get_all_providers():
+            init_providers()
+        _orchestrator = DataOrchestrator(registry)
     return _orchestrator
 
 
@@ -1347,8 +1365,14 @@ def init_providers():
     """
     Initialize all providers.
 
-    Should be called once at application startup.
+    Idempotent — a repeat call is a no-op. Without the guard, calling this
+    twice would register duplicate provider instances in the per-data-type
+    lists (instances aren't equal, so register()'s membership check passes)
+    and every fetch would hit each API twice.
     """
+    if get_registry().get_all_providers():
+        return
+
     from .yfinance_provider import (
         YFinancePriceProvider, YFinanceEPSProvider, YFinanceDividendProvider, YFinanceSplitProvider,
         YFinanceAnalystEstimateProvider, YFinanceSharesOutstandingProvider,
@@ -1367,12 +1391,12 @@ def init_providers():
     # Register all providers
     #
     # IMPORTANT: `registry.register()` indexes providers by name in `_providers`,
-    # so later registrations overwrite earlier ones for the same name. Providers
-    # with shared names (e.g., "yfinance", "sec_edgar") are registered in
-    # "less-specific first" order so the primary one ends up canonical. In
-    # particular SECSplitProvider is registered BEFORE SECEPSProvider so that
-    # `get_provider("sec_edgar")` returns the EPS provider — which is what
-    # `fetch_sec_metrics` / `fetch_filings` rely on.
+    # so later registrations overwrite earlier ones for the same name (e.g.,
+    # "yfinance", "sec_edgar"). Do NOT rely on `get_provider(name)` returning a
+    # specific class for shared names — the Star Scoring providers registered
+    # below silently broke an earlier ordering assumption here, 500-ing the
+    # SEC metrics/filings endpoints. Capability-specific lookups should go
+    # through `_by_type` (see DataOrchestrator._get_sec_eps_provider).
 
     # Split providers (registered first so EPS/price providers can overwrite
     # `_providers[name]` entries with richer providers)

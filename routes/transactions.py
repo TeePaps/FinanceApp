@@ -76,3 +76,21 @@ def add_stock():
         stock_type=data.get('type', 'stock')
     )
     return jsonify({'success': True})
+
+
+@transactions_bp.route('/stocks/<ticker>', methods=['DELETE'])
+def remove_stock(ticker):
+    """
+    Remove a stock from the registry.
+
+    Refuses while transactions reference the ticker — delete those first.
+    Without this route a typo'd ticker stayed in the registry forever (the
+    UI has Add Stock but no way to undo it).
+    """
+    ticker = ticker.upper()
+    if not any(s['ticker'] == ticker for s in db.get_stocks()):
+        return jsonify({'error': f'{ticker} not found'}), 404
+    if any(t['ticker'] == ticker for t in db.get_transactions()):
+        return jsonify({'error': f'{ticker} has transactions; delete them first'}), 409
+    db.remove_stock(ticker)
+    return jsonify({'success': True})

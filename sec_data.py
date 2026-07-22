@@ -1009,7 +1009,11 @@ def get_eps_update_recommendations():
 
         # Determine if new filing might be available
         if fiscal_year_end:
-            next_fy_end = fiscal_year_end.replace(year=fiscal_year_end.year + 1)
+            try:
+                next_fy_end = fiscal_year_end.replace(year=fiscal_year_end.year + 1)
+            except ValueError:
+                # Feb 29 fiscal year end — the following year isn't a leap year
+                next_fy_end = fiscal_year_end.replace(year=fiscal_year_end.year + 1, day=28)
             expected_filing_date = next_fy_end + timedelta(days=75)
             ticker_info['next_fy_end'] = next_fy_end.strftime('%b %d, %Y')
             ticker_info['expected_filing'] = expected_filing_date.strftime('%b %d, %Y')

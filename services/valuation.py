@@ -81,6 +81,23 @@ def get_split_adjusted_eps_history(ticker: str) -> List[Dict]:
     return adjusted
 
 
+def average_split_adjusted_eps(history: List[Dict], years: int = RECOMMENDED_EPS_YEARS):
+    """
+    Average the newest `years` usable EPS values from a newest-first history list
+    (as returned by get_split_adjusted_eps_history / db.get_eps_history).
+
+    Rows with eps=None don't consume window slots and don't dilute the average —
+    summing only non-None values while dividing by the full window length would
+    bias fair value low whenever a year is missing.
+
+    Returns (eps_avg, years_used); (None, 0) when no usable rows exist.
+    """
+    valid = [row['eps'] for row in history if row.get('eps') is not None][:years]
+    if not valid:
+        return None, 0
+    return sum(valid) / len(valid), len(valid)
+
+
 def compute_estimated_value(eps_avg, annual_dividend, current_price=None):
     """
     Canonical fair-value computation: (eps_avg + annual_dividend) * multiplier,
@@ -369,9 +386,20 @@ def calculate_valuation(ticker):
         eps_avg = None
         adjusted = get_split_adjusted_eps_history(ticker)
         if adjusted:
-            window = adjusted[:RECOMMENDED_EPS_YEARS]
-            eps_avg = sum(r['eps'] for r in window if r.get('eps') is not None) / len(window)
-        elif len(eps_data) > 0:
+            eps_avg, _ = average_split_adjusted_eps(adjusted)
+            # Display the same per-share basis the average uses. Returning the
+            # raw fetched list alongside the adjusted average made the EPS
+            # table read as nonsense after a split (BKNG: rows of ~$165
+            # "averaging" to $3.78).
+            display_rows = [r for r in adjusted if r.get('eps') is not None][:RECOMMENDED_EPS_YEARS]
+            if display_rows:
+                keep = ('year', 'eps', 'eps_type', 'period_start', 'period_end',
+                        'split_adjusted', 'split_adjustment_factor')
+                eps_data = [
+                    {k: r[k] for k in keep if r.get(k) is not None}
+                    for r in display_rows
+                ]
+        if eps_avg is None and len(eps_data) > 0:
             eps_avg = sum(e['eps'] for e in eps_data) / len(eps_data)
         estimated_value, price_vs_value = compute_estimated_value(
             eps_avg, annual_dividend, current_price
@@ -391,7 +419,7 @@ def calculate_valuation(ticker):
             'annual_dividend': round(annual_dividend, 2),
             'dividend_payments': dividend_info,
             'estimated_value': round(estimated_value, 2) if estimated_value else None,
-            'price_vs_value': round(price_vs_value, 1) if price_vs_value else None,
+            'price_vs_value': round(price_vs_value, 1) if price_vs_value is not None else None,
             'formula': f'(({round(eps_avg, 2) if eps_avg else "N/A"} avg EPS) + {round(annual_dividend, 2)} dividend) x {PE_RATIO_MULTIPLIER} = ${round(estimated_value, 2) if estimated_value else "N/A"}',
             'selloff': selloff_metrics,
             'split_warning': split_warning,
