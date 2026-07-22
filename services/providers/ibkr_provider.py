@@ -12,6 +12,8 @@ Connection settings stored in data_private/secrets.json:
 
 import time
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 from datetime import datetime
 from threading import Lock
@@ -76,7 +78,26 @@ class IBKRConnection:
         self._connected = False
         self._last_connect_attempt = 0
         self._connect_cooldown = 5  # Seconds between reconnect attempts
+        # Dedicated single worker that owns the IB event loop. ib_async /
+        # ib_insync bind their asyncio loop to the thread that created the
+        # IB() instance; the orchestrator dispatches provider calls on a
+        # SHARED pool with no thread affinity, so a later request picked up
+        # by a different worker used to hit "no current event loop in
+        # thread" RuntimeErrors and trip the circuit breaker. Every
+        # loop-touching operation must funnel through run().
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ibkr-loop')
+        self._loop_thread_id = None
         self._initialized = True
+
+    def run(self, fn, *args, timeout=60, **kwargs):
+        """Execute fn(*args, **kwargs) on the dedicated IB loop thread.
+
+        Runs inline when already on that thread (prevents self-deadlock on
+        the single worker, e.g. connect() reached from inside a batch)."""
+        if threading.get_ident() == self._loop_thread_id:
+            return fn(*args, **kwargs)
+        future = self._executor.submit(fn, *args, **kwargs)
+        return future.result(timeout=timeout)
 
     def _get_connection_params(self) -> tuple:
         """Get connection parameters from secrets or defaults."""
@@ -107,6 +128,10 @@ class IBKRConnection:
         """
         Connect to TWS/Gateway if not already connected.
 
+        The actual connect runs on the dedicated IB loop thread so the
+        IB() instance and its event loop live where every later operation
+        (reqMktData, ib.sleep, disconnect) will also run.
+
         Returns:
             True if connected successfully, False otherwise
         """
@@ -123,9 +148,25 @@ class IBKRConnection:
             return False
 
         try:
+            return self.run(self._connect_impl, timeout=30)
+        except Exception:
+            self._connected = False
+            return False
+
+    def _connect_impl(self) -> bool:
+        """Create + connect the IB instance. MUST run on the IB loop thread."""
+        self._loop_thread_id = threading.get_ident()
+        try:
+            # Non-main threads have no default asyncio loop; give this
+            # thread one before ib_async/ib_insync go looking for it.
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+
             host, port, client_id = self._get_connection_params()
 
-            # Create new IB instance
+            # Create new IB instance (binds its loop to THIS thread)
             self._ib = self._ib_module.IB()
 
             # Connect synchronously
@@ -140,16 +181,16 @@ class IBKRConnection:
                 self._connected = False
                 return False
 
-        except Exception as e:
+        except Exception:
             self._connected = False
             self._ib = None
             return False
 
     def disconnect(self):
-        """Disconnect from TWS/Gateway."""
+        """Disconnect from TWS/Gateway (on the IB loop thread)."""
         if self._ib:
             try:
-                self._ib.disconnect()
+                self.run(self._ib.disconnect, timeout=10)
             except Exception:
                 pass
         self._connected = False
@@ -338,10 +379,25 @@ class IBKRPriceProvider(PriceProvider):
                 ) for t in tickers
             }
 
-        # Process in batches to avoid overwhelming IB's API
+        # Process in batches to avoid overwhelming IB's API. Each batch runs
+        # on the connection's dedicated loop thread — reqMktData/ib.sleep from
+        # an arbitrary pool worker raise on ib_async's thread-bound loop.
         for batch_start in range(0, len(tickers), IBKR_BATCH_SIZE):
             batch = tickers[batch_start:batch_start + IBKR_BATCH_SIZE]
-            batch_results = self._fetch_batch_snapshot(ib, batch)
+            try:
+                batch_results = self._connection.run(
+                    self._fetch_batch_snapshot, ib, batch,
+                    timeout=MARKET_DATA_TIMEOUT + 30
+                )
+            except Exception as e:
+                batch_results = {
+                    t: ProviderResult(
+                        success=False,
+                        data=None,
+                        source=self.name,
+                        error=f"IB batch failed: {str(e)[:80]}"
+                    ) for t in batch
+                }
             results.update(batch_results)
 
         # Ensure all tickers have a result
