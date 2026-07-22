@@ -333,6 +333,12 @@ def _init_public_database():
         if 'enabled' not in ticker_columns:
             cursor.execute('ALTER TABLE tickers ADD COLUMN enabled INTEGER DEFAULT 1')
 
+        # Add delist_strikes column (consecutive price-fetch misses) to tickers
+        cursor.execute('PRAGMA table_info(tickers)')
+        ticker_columns = {row[1] for row in cursor.fetchall()}
+        if 'delist_strikes' not in ticker_columns:
+            cursor.execute('ALTER TABLE tickers ADD COLUMN delist_strikes INTEGER DEFAULT 0')
+
         # Add active column to ticker_indexes if it doesn't exist
         cursor.execute('PRAGMA table_info(ticker_indexes)')
         ticker_index_columns = {row[1] for row in cursor.fetchall()}
@@ -1405,6 +1411,63 @@ def mark_tickers_delisted(tickers: List[str], delisted: bool = True):
             cursor.execute('''
                 UPDATE tickers SET delisted = ? WHERE ticker = ?
             ''', (1 if delisted else 0, ticker))
+
+
+def record_price_successes(tickers: List[str]):
+    """
+    A ticker produced a price this run: clear its consecutive-miss strikes
+    and, crucially, its delisted flag. This is the ONLY automatic recovery
+    path — before it existed, one flaky yfinance batch marked live tickers
+    delisted=1 forever (get_active_index_tickers then hid them from every
+    subsequent screener run, so nothing could ever price them again).
+    """
+    if not tickers:
+        return
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.executemany('''
+            UPDATE tickers SET delist_strikes = 0, delisted = 0
+            WHERE ticker = ? AND (delist_strikes > 0 OR delisted = 1)
+        ''', [(t.upper(),) for t in tickers])
+
+
+def record_price_failures(tickers: List[str], threshold: int = 3) -> List[str]:
+    """
+    A ticker produced no price anywhere this run: add one strike, and mark
+    it delisted only after `threshold` CONSECUTIVE missing runs (a single
+    flaky batch must not delist a live ticker).
+
+    Returns the tickers newly flagged delisted by this call.
+    """
+    if not tickers:
+        return []
+    newly_delisted = []
+    with get_db() as conn:
+        cursor = conn.cursor()
+        for ticker in tickers:
+            ticker = ticker.upper()
+            cursor.execute('''
+                INSERT OR IGNORE INTO tickers (ticker, delist_strikes) VALUES (?, 0)
+            ''', (ticker,))
+            cursor.execute('''
+                UPDATE tickers SET delist_strikes = COALESCE(delist_strikes, 0) + 1
+                WHERE ticker = ?
+            ''', (ticker,))
+            cursor.execute('''
+                UPDATE tickers SET delisted = 1
+                WHERE ticker = ? AND delisted = 0 AND delist_strikes >= ?
+            ''', (ticker, threshold))
+            if cursor.rowcount > 0:
+                newly_delisted.append(ticker)
+    return newly_delisted
+
+
+def get_delisted_tickers() -> List[str]:
+    """All tickers currently flagged delisted (for recovery retries)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT ticker FROM tickers WHERE delisted = 1 ORDER BY ticker')
+        return [row['ticker'] for row in cursor.fetchall()]
 
 
 def is_ticker_delisted(ticker: str) -> bool:

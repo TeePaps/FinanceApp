@@ -85,6 +85,44 @@ def get_current_index():
 # HELPER FUNCTIONS
 # =============================================================================
 
+def _reconcile_delistings(all_tickers, priced_tickers):
+    """
+    Delisting bookkeeping — call ONLY after every price source for the run
+    (history batch + real-time override) has been consulted.
+
+    Tickers that priced get their strike count and delisted flag cleared;
+    tickers that produced nothing anywhere get one strike and are delisted
+    only after FAILURE_THRESHOLD consecutive missing runs. The old code
+    delisted immediately after the (flaky) yfinance history batch, BEFORE
+    the real-time fetch could recover the ticker — and nothing ever reset
+    delisted=0, so live tickers silently vanished from every future run.
+
+    If NOTHING priced, the whole pass looks like a provider outage — record
+    no failures at all.
+    """
+    priced = [t for t in all_tickers if t in priced_tickers]
+    failed = [t for t in all_tickers if t not in priced_tickers]
+
+    if not priced:
+        if all_tickers:
+            activity_log.log(
+                "warning", "screener",
+                f"No prices for any of {len(all_tickers)} tickers — "
+                "treating as provider outage, recording no delistings"
+            )
+        return
+
+    db.record_price_successes(priced)
+    if failed:
+        newly = db.record_price_failures(failed, threshold=FAILURE_THRESHOLD)
+        if newly:
+            activity_log.log(
+                "warning", "screener",
+                f"Delisted after {FAILURE_THRESHOLD} consecutive missing runs: "
+                f"{', '.join(newly[:10])}{'…' if len(newly) > 10 else ''}"
+            )
+
+
 def save_index_data(index_name, data):
     """Save index tickers to database."""
     if index_name not in VALID_INDICES or index_name == 'all':
@@ -372,9 +410,9 @@ def run_screener(index_name='all'):
         history_results = orchestrator.fetch_price_history_batch(tickers, period='3mo')
         activity_log.log("success", "screener", f"✓ 3mo history: {len(history_results)} tickers downloaded")
 
-        failed_tickers = [t for t in tickers if t not in history_results]
-        if failed_tickers:
-            db.mark_tickers_delisted(failed_tickers)
+        # NOTE: no delisting here — the real-time price override below is a
+        # second chance; _reconcile_delistings runs after it (finding: a
+        # transient batch miss permanently delisted live tickers).
 
         for t in tickers:
             existing = existing_valuations.get(t, {})
@@ -419,16 +457,29 @@ def run_screener(index_name='all'):
             if hist_data.change_1m_pct is not None:
                 price_change_1m_dict[ticker] = hist_data.change_1m_pct
 
-    # Override with real-time prices
+    # Override with real-time prices. Include currently-delisted tickers in
+    # the fetch — pricing successfully is the recovery path that clears a
+    # wrong delisted flag (nothing else ever retries them, because
+    # get_active_index_tickers hides delisted tickers from ticker lists).
+    retry_delisted = []
+    try:
+        retry_delisted = [t for t in db.get_delisted_tickers() if t not in set(tickers)]
+    except Exception:
+        pass
     try:
         orchestrator = get_orchestrator()
-        provider_prices, provider_sources = orchestrator.fetch_prices(tickers, skip_cache=True, return_sources=True)
+        provider_prices, provider_sources = orchestrator.fetch_prices(
+            tickers + retry_delisted, skip_cache=True, return_sources=True)
         for ticker, price in provider_prices.items():
             if price and price > 0:
                 current_prices_dict[ticker] = float(price)
                 price_sources_dict[ticker] = provider_sources.get(ticker)
     except Exception:
         pass
+
+    # All price sources consulted — now do the delisting bookkeeping
+    _reconcile_delistings(tickers + retry_delisted,
+                          {t for t, p in current_prices_dict.items() if p and p > 0})
 
     for i, ticker in enumerate(tickers):
         if i % 500 == 0:
@@ -640,9 +691,8 @@ def run_quick_price_update(index_name='all'):
             _running = False
             return
 
-        failed_tickers = [t for t in tickers if t not in history_results]
-        if failed_tickers:
-            db.mark_tickers_delisted(failed_tickers)
+        # Delisting decisions deferred to _reconcile_delistings after the
+        # real-time price phase below (transient batch miss ≠ delisted).
 
         _progress['current'] = len(tickers)
         _progress['phase'] = 'combining'
@@ -678,6 +728,10 @@ def run_quick_price_update(index_name='all'):
             activity_log.log("success", "screener", f"✓ Real-time prices: {realtime_count} tickers updated")
         except Exception as e:
             activity_log.log("warning", "screener", f"Real-time prices failed: {str(e)[:50]}")
+
+        # All price sources consulted — delisting bookkeeping
+        _reconcile_delistings(tickers,
+                              {t for t, p in current_prices_dict.items() if p and p > 0})
 
         activity_log.log("info", "screener", f"Phase 3: Building valuations...")
         valuations_batch = {}
@@ -848,10 +902,13 @@ def run_smart_update(index_name='all'):
         valuation = calculate_valuation(ticker)
         if valuation and valuation.get('current_price', 0) > 0:
             data['valuations'][ticker] = valuation
+            db.record_price_successes([ticker])
             if (i + 1) % 10 == 0:
                 save_index_data(index_name, data)
         else:
-            db.mark_ticker_delisted(ticker)
+            # One strike — a single failed fetch must not permanently
+            # delist a brand-new ticker (nothing ever retried them).
+            db.record_price_failures([ticker], threshold=FAILURE_THRESHOLD)
 
         time.sleep(SCREENER_TICKER_PAUSE)
 
@@ -868,9 +925,8 @@ def run_smart_update(index_name='all'):
             history_results = orchestrator.fetch_price_history_batch(existing_tickers, period='3mo')
             activity_log.log("success", "screener", f"✓ 3mo history: {len(history_results)} tickers downloaded")
 
-            failed_tickers = [t for t in existing_tickers if t not in history_results]
-            if failed_tickers:
-                db.mark_tickers_delisted(failed_tickers)
+            # Delisting decisions deferred to _reconcile_delistings after the
+            # real-time price phase below (transient batch miss ≠ delisted).
 
             if history_results:
                 current_prices_dict = {}
@@ -900,6 +956,10 @@ def run_smart_update(index_name='all'):
                     current_prices = pd.Series(current_prices_dict)
                 except Exception:
                     pass
+
+                # All price sources consulted — delisting bookkeeping
+                _reconcile_delistings(existing_tickers,
+                                      {t for t, p in current_prices_dict.items() if p and p > 0})
 
                 for i, ticker in enumerate(existing_tickers):
                     if not _running:
