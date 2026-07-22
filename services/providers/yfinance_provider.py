@@ -588,11 +588,11 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
             sector = info.get('sector')
             industry = info.get('industry')
             pe_ratio = info.get('trailingPE') or info.get('forwardPE')
+            # yfinance >= 0.2.x already returns dividendYield as a PERCENTAGE
+            # (KO -> 2.58, not 0.0258). The old unconditional *100 produced a
+            # 100x-inflated 258%. Use it as-is; the decimal-form field is the
+            # separate trailingAnnualDividendYield if ever needed.
             dividend_yield = info.get('dividendYield')
-
-            # Convert dividend yield from decimal to percentage if present
-            if dividend_yield is not None:
-                dividend_yield = dividend_yield * 100
 
             stock_info_data = StockInfoData(
                 ticker=ticker,

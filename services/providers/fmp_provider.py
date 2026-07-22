@@ -5,6 +5,7 @@ Provides price data from FMP API. Supports batch fetching when available.
 API key required - stored in data_private/secrets.json
 """
 
+import re
 import time
 import requests
 from typing import Dict, List
@@ -17,6 +18,16 @@ from .secrets import get_fmp_api_key
 FMP_BASE_URL = "https://financialmodelingprep.com/stable"
 FMP_REQUEST_TIMEOUT = 15
 FMP_BATCH_SIZE = 100  # Max tickers per batch request
+
+_APIKEY_RE = re.compile(r'(apikey=)[^&\s\'"]+', re.IGNORECASE)
+
+
+def _redact(text) -> str:
+    """Strip the FMP apikey from any string before it lands in an error
+    message or the activity log. requests bakes the full request URL —
+    including &apikey=<secret> — into connection/SSL exception text, so the
+    key would otherwise leak to a user-visible, potentially shared surface."""
+    return _APIKEY_RE.sub(r'\1***', str(text))
 
 
 class FMPPriceProvider(PriceProvider):
@@ -129,7 +140,7 @@ class FMPPriceProvider(PriceProvider):
                 success=False,
                 data=None,
                 source=self.name,
-                error=str(e)
+                error=_redact(e)
             )
 
     def fetch_prices(self, tickers: List[str]) -> Dict[str, ProviderResult]:
@@ -190,8 +201,25 @@ class FMPPriceProvider(PriceProvider):
                 batch = tickers[i:i + FMP_BATCH_SIZE]
                 symbols = ','.join(batch)
 
-                url = f"{FMP_BASE_URL}/quote?symbol={symbols}&apikey={api_key}"
-                response = requests.get(url, timeout=FMP_REQUEST_TIMEOUT)
+                # On HTTP 429, retry THIS chunk (a bare `continue` advanced to
+                # the next chunk, silently dropping every rate-limited ticker).
+                max_429_retries = 3
+                attempt = 0
+                while True:
+                    url = f"{FMP_BASE_URL}/quote?symbol={symbols}&apikey={api_key}"
+                    response = requests.get(url, timeout=FMP_REQUEST_TIMEOUT)
+                    if response.status_code == 429 and attempt < max_429_retries:
+                        attempt += 1
+                        try:
+                            from services.activity_log import activity_log
+                            activity_log.log("warning", "fmp",
+                                             f"Rate limit hit, waiting {config.FMP_RATE_LIMIT_BACKOFF}s "
+                                             f"(retry {attempt}/{max_429_retries})...")
+                        except Exception:
+                            pass
+                        time.sleep(config.FMP_RATE_LIMIT_BACKOFF)
+                        continue
+                    break
 
                 if response.status_code == 401:
                     # Invalid API key
@@ -209,13 +237,14 @@ class FMPPriceProvider(PriceProvider):
                     return None  # Signal to fall back to individual
 
                 if response.status_code == 429:
-                    # Rate limit - wait and retry
-                    try:
-                        from services.activity_log import activity_log
-                        activity_log.log("warning", "fmp", f"Rate limit hit, waiting {config.FMP_RATE_LIMIT_BACKOFF}s...")
-                    except Exception:
-                        pass
-                    time.sleep(config.FMP_RATE_LIMIT_BACKOFF)
+                    # Still rate-limited after the bounded retries above — mark
+                    # this chunk failed (don't silently drop it) and move on.
+                    for ticker in batch:
+                        if ticker not in results:
+                            results[ticker] = ProviderResult(
+                                success=False, data=None, source=self.name,
+                                error="Rate limited (429) after retries"
+                            )
                     continue
 
                 if response.status_code != 200:
@@ -294,7 +323,7 @@ class FMPPriceProvider(PriceProvider):
         except Exception as e:
             try:
                 from services.activity_log import activity_log
-                activity_log.log("error", "fmp", f"Batch error: {str(e)[:50]}")
+                activity_log.log("error", "fmp", f"Batch error: {_redact(e)[:50]}")
             except Exception:
                 pass
             return None  # Fall back to individual
@@ -382,7 +411,7 @@ class FMPSplitProvider(SplitProvider):
         except requests.Timeout:
             return ProviderResult(success=False, data=None, source=self.name, error="FMP API timeout")
         except Exception as e:
-            return ProviderResult(success=False, data=None, source=self.name, error=str(e))
+            return ProviderResult(success=False, data=None, source=self.name, error=_redact(e))
 
 
 def validate_fmp_api_key(api_key: str) -> tuple:
@@ -417,4 +446,4 @@ def validate_fmp_api_key(api_key: str) -> tuple:
     except requests.Timeout:
         return False, "Request timed out"
     except Exception as e:
-        return False, str(e)
+        return False, _redact(e)

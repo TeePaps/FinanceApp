@@ -312,9 +312,14 @@ class DefeatBetaEPSProvider(EPSProvider):
                 except (ValueError, TypeError, KeyError):
                     continue
 
-            # Sum quarterly EPS to get annual EPS
+            # Sum quarterly EPS to get annual EPS. Only emit a year with all
+            # four quarters — the source typically carries just 1-3 quarters
+            # for the in-progress year, and summing those produced a fractional
+            # value that (after the descending sort) became the FIRST, most
+            # heavily weighted entry in the fair-value average, understating it.
+            # The current year is covered by the TTM entry below instead.
             for year, quarters in yearly_eps.items():
-                if len(quarters) >= 1:  # Accept partial years
+                if len(quarters) >= 4:
                     annual_eps = sum(quarters)
                     eps_history.append({
                         'year': year,
@@ -324,10 +329,13 @@ class DefeatBetaEPSProvider(EPSProvider):
                         'source': self.name
                     })
 
-            # Also add TTM if available
+            # Also add TTM if available. Explicit sentinel checks (not
+            # truthiness) so a legitimate break-even TTM of 0.0 is kept — the
+            # quarterly loop above already uses explicit checks for the same
+            # reason.
             try:
                 ttm_value = df.loc[eps_row_idx, 'TTM']
-                if ttm_value and ttm_value != '*' and ttm_value != '':
+                if ttm_value is not None and ttm_value != '*' and ttm_value != '':
                     ttm_eps = float(ttm_value)
                     if ttm_eps == ttm_eps:  # Not NaN
                         # Add as current year if not already present

@@ -53,11 +53,24 @@ def _save_secrets(secrets: dict):
     _ensure_secrets_dir()
 
     try:
-        with open(SECRETS_FILE, 'w') as f:
-            json.dump(secrets, f, indent=2)
-
-        # Restrict file permissions (owner read/write only)
-        os.chmod(SECRETS_FILE, 0o600)
+        # Create the file 0o600 BEFORE writing any bytes — the old
+        # open('w')-then-chmod left the API keys briefly world/group
+        # readable (fresh files are created 0o666 & ~umask, commonly 0o644).
+        # Write to a temp file with restrictive perms, then atomically
+        # replace so a concurrent reader never sees a truncated file.
+        tmp_path = f"{SECRETS_FILE}.tmp"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(secrets, f, indent=2)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp_path, SECRETS_FILE)
+        os.chmod(SECRETS_FILE, 0o600)  # ensure perms if the target pre-existed
 
         _secrets_cache = secrets
     except IOError as e:
@@ -178,11 +191,19 @@ def get_alpaca_api_secret() -> Optional[str]:
 
 
 def set_alpaca_credentials(api_key: str, api_secret: str, api_endpoint: Optional[str] = None):
-    """Save Alpaca API credentials and optional custom endpoint."""
+    """Save Alpaca API credentials and optional custom endpoint.
+
+    A falsy endpoint CLEARS any stored custom endpoint (reverts to the
+    default). The old code only ever wrote a truthy endpoint and never
+    deleted it, so once a custom endpoint was saved it could not be undone
+    through the UI — fetches stayed pinned to a stale/paper environment.
+    """
     set_secret('ALPACA_API_KEY', api_key)
     set_secret('ALPACA_API_SECRET', api_secret)
     if api_endpoint:
         set_secret('ALPACA_API_ENDPOINT', api_endpoint)
+    else:
+        delete_secret('ALPACA_API_ENDPOINT')
 
 
 def has_alpaca_credentials() -> bool:
