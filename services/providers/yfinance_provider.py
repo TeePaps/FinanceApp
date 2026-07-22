@@ -7,12 +7,49 @@ the standard provider interface.
 
 import time
 import math
-from typing import Dict, List
+from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 
+import pandas as pd
 import yfinance as yf
 
 import config
+
+
+def _last_close(data, ticker: str) -> Optional[float]:
+    """
+    Scalar-safe last close for `ticker` from a yf.download() frame.
+
+    Handles both column layouts — yfinance >= 0.2.51 defaults to
+    multi_level_index=True, so even a single-ticker download has MultiIndex
+    columns. The old guards were broken for both shapes:
+    - single ticker: data['Close'] is a DataFrame, .iloc[-1] a Series, and
+      bool(Series) raised "truth value ... is ambiguous" — every
+      single-ticker batch fetch crashed
+    - multi ticker: .iloc[-1] is a numpy scalar with NO .isna() method, so
+      the hasattr guard collapsed to bool(nan) == True and NaN was stored
+      as a real price
+
+    Returns the last non-NaN positive close, or None.
+    """
+    col = None
+    if isinstance(data.columns, pd.MultiIndex):
+        if ('Close', ticker) in data.columns:
+            col = data[('Close', ticker)]
+    elif 'Close' in data.columns:
+        col = data['Close']
+    if col is None:
+        return None
+    series = col.dropna()
+    if series.empty:
+        return None
+    try:
+        price = float(series.iloc[-1])
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(price) or math.isinf(price) or price <= 0:
+        return None
+    return price
 
 from .base import (
     PriceProvider, EPSProvider, DividendProvider, SplitProvider, HistoricalPriceProvider, StockInfoProvider, SelloffProvider,
@@ -163,15 +200,15 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                     )
                 return results
 
-            # Handle single vs multiple tickers (different DataFrame structure)
-            if len(tickers) == 1:
-                ticker = tickers[0]
-                if 'Close' in data.columns:
-                    price = data['Close'].iloc[-1]
-                    if price and not (hasattr(price, 'isna') and price.isna()):
+            # _last_close handles both frame shapes (flat and MultiIndex
+            # columns), so single- and multi-ticker batches share one path.
+            for ticker in tickers:
+                try:
+                    price = _last_close(data, ticker)
+                    if price is not None:
                         results[ticker] = ProviderResult(
                             success=True,
-                            data=float(price),
+                            data=price,
                             source=self.name
                         )
                     else:
@@ -179,48 +216,15 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                             success=False,
                             data=None,
                             source=self.name,
-                            error="Price is NaN"
+                            error="No usable close price (missing or NaN)"
                         )
-                else:
+                except Exception as e:
                     results[ticker] = ProviderResult(
                         success=False,
                         data=None,
                         source=self.name,
-                        error="No Close column"
+                        error=str(e)
                     )
-            else:
-                # Multiple tickers - MultiIndex columns
-                for ticker in tickers:
-                    try:
-                        if ('Close', ticker) in data.columns:
-                            price = data[('Close', ticker)].iloc[-1]
-                            if price and not (hasattr(price, 'isna') and price.isna()):
-                                results[ticker] = ProviderResult(
-                                    success=True,
-                                    data=float(price),
-                                    source=self.name
-                                )
-                            else:
-                                results[ticker] = ProviderResult(
-                                    success=False,
-                                    data=None,
-                                    source=self.name,
-                                    error="Price is NaN"
-                                )
-                        else:
-                            results[ticker] = ProviderResult(
-                                success=False,
-                                data=None,
-                                source=self.name,
-                                error="Ticker not in results"
-                            )
-                    except Exception as e:
-                        results[ticker] = ProviderResult(
-                            success=False,
-                            data=None,
-                            source=self.name,
-                            error=str(e)
-                        )
 
             # Mark any tickers not in results as failed
             for ticker in tickers:
@@ -475,14 +479,27 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                     error="Empty or invalid historical data"
                 )
 
-            # Get current price (last close)
-            current_price = float(hist_df['Close'].iloc[-1])
+            # Get current price (last NON-NaN close — in a multi-ticker batch
+            # the frames share a union date index, so a ticker's latest rows
+            # can legitimately be NaN)
+            close = hist_df['Close'].dropna()
+            if close.empty:
+                return ProviderResult(
+                    success=False,
+                    data=None,
+                    source=self.name,
+                    error="All close prices are NaN"
+                )
+            current_price = float(close.iloc[-1])
 
-            # Build prices dict {date_str: price}
+            # Build prices dict {date_str: price}, skipping NaN gap rows
             prices = {}
             for date, row in hist_df.iterrows():
+                px = row['Close']
+                if px is None or (isinstance(px, float) and math.isnan(px)):
+                    continue
                 date_str = date.strftime('%Y-%m-%d')
-                prices[date_str] = float(row['Close'])
+                prices[date_str] = float(px)
 
             # Calculate 1m and 3m prices using oldest available data in range
             price_1m_ago = None
@@ -492,8 +509,8 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
 
             # Use oldest price in the range as the "start" price
             # This handles cases where fetched data doesn't go back exactly 30/90 days
-            if len(hist_df) > 1:
-                oldest_price = float(hist_df['Close'].iloc[0])
+            if len(close) > 1:
+                oldest_price = float(close.iloc[0])
 
                 # For 3-month period, use oldest as 3m ago
                 price_3m_ago = oldest_price
@@ -503,10 +520,10 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                 # For 1-month, find the most recent price that's >= 30 days old
                 # Iterate newest-to-oldest to find first date <= 30 days ago
                 one_month_ago = datetime.now() - timedelta(days=30)
-                for date in reversed(hist_df.index):
+                for date in reversed(close.index):
                     date_naive = date.replace(tzinfo=None) if hasattr(date, 'tzinfo') and date.tzinfo else date
                     if date_naive <= one_month_ago:
-                        price_1m_ago = float(hist_df.loc[date, 'Close'])
+                        price_1m_ago = float(close.loc[date])
                         break
 
                 # Fallback: if no 30-day price found but we have data, use oldest
