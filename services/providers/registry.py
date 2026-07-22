@@ -282,7 +282,11 @@ class DataOrchestrator:
             return None
 
         current_price = valuation.get('current_price')
-        updated_str = valuation.get('updated')
+        # Judge freshness by when the PRICE was last written, not the shared
+        # `updated` column that any partial upsert (EPS/dividend/52-week)
+        # bumps — otherwise an EPS refresh made a week-old price look fresh.
+        # Fall back to `updated` for rows predating the price_updated column.
+        updated_str = valuation.get('price_updated') or valuation.get('updated')
         price_source = valuation.get('price_source', 'unknown')
 
         if not current_price or not updated_str:
