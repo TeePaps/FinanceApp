@@ -189,6 +189,17 @@ def get_top_recommendations(valuations, ticker_indexes=None, limit=10,
         # Calculate dividend yield for display
         dividend_yield = (annual_dividend / current_price * 100) if current_price > 0 else 0
 
+        # Recompute price_vs_value from THIS row's current fields before
+        # scoring. The stored value can be stale: the price cache writes only
+        # current_price/price_source (update_price_cache), leaving a
+        # price_vs_value computed against an older price — which is exactly the
+        # signal the undervaluation score keys on. Recomputing keeps score and
+        # displayed % consistent with the shown price.
+        estimated_value = val.get('estimated_value')
+        if estimated_value and estimated_value > 0 and current_price > 0:
+            val = {**val, 'price_vs_value': round(
+                (current_price - estimated_value) / estimated_value * 100, 1)}
+
         # Calculate score
         total_score = score_stock(val)
 

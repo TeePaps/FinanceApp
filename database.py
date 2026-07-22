@@ -599,6 +599,22 @@ def set_indexes_enabled(index_states: Dict[str, bool]) -> int:
         return updated
 
 
+# Bumped on every index-membership mutation so in-process caches (e.g.
+# data_manager's ticker->index map) can tell membership changed without the
+# enabled-index SET changing.
+_membership_version = 0
+
+
+def get_membership_version() -> int:
+    """Monotonic counter incremented whenever index membership changes."""
+    return _membership_version
+
+
+def _bump_membership_version():
+    global _membership_version
+    _membership_version += 1
+
+
 def sync_index_membership(index_name: str, tickers: List[str]):
     """Sync index membership for a list of tickers."""
     now = datetime.now().isoformat()
@@ -620,6 +636,7 @@ def sync_index_membership(index_name: str, tickers: List[str]):
                 INSERT OR IGNORE INTO ticker_indexes (ticker, index_name)
                 VALUES (?, ?)
             ''', (ticker, index_name))
+    _bump_membership_version()
 
 
 def refresh_index_membership(index_name: str, current_tickers: List[str]) -> Dict:
@@ -694,7 +711,9 @@ def refresh_index_membership(index_name: str, current_tickers: List[str]) -> Dic
             if ticker not in existing:
                 added += 1
 
-        return {'added': added, 'removed': len(removed), 'total': len(current_set)}
+    if added or removed:
+        _bump_membership_version()
+    return {'added': added, 'removed': len(removed), 'total': len(current_set)}
 
 
 # =============================================================================

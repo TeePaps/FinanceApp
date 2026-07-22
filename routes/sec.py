@@ -93,28 +93,41 @@ def api_sec_compare(ticker):
     ticker = ticker.upper()
     orchestrator = get_orchestrator()
 
-    # Get SEC EPS via orchestrator
-    sec_result = orchestrator.fetch_eps(ticker)
+    def _provider_of(cls):
+        """Find a registered EPS provider of a specific class."""
+        from services.providers.base import DataType
+        candidates = orchestrator.registry._by_type.get(DataType.EPS, [])
+        return next((p for p in candidates if isinstance(p, cls)), None)
+
+    # Fetch each side from its OWN provider — the old code called
+    # orchestrator.fetch_eps(ticker) for BOTH sides, which returns the same
+    # cached fallback-chain result, so every row reported sec_eps == yf_eps
+    # and a 100% match regardless of reality.
+    from services.providers.sec_provider import SECEPSProvider
+    from services.providers.yfinance_provider import YFinanceEPSProvider
+
     sec_eps = None
-    if sec_result.success and sec_result.data:
-        sec_eps = {
-            'company_name': sec_result.data.company_name,
-            'eps_history': sec_result.data.eps_history
-        }
+    sec_provider = _provider_of(SECEPSProvider)
+    if sec_provider:
+        sec_result = sec_provider.fetch_eps(ticker)
+        if sec_result.success and sec_result.data:
+            sec_eps = {
+                'company_name': sec_result.data.company_name,
+                'eps_history': sec_result.data.eps_history
+            }
 
-    # Get yfinance EPS via orchestrator (already uses it)
+    # yfinance side from the yfinance provider directly
     yf_eps = {}
-    try:
-        result = orchestrator.fetch_eps(ticker)
-
-        if result.success and result.data:
-            eps_data = result.data
-            # Convert orchestrator format to dict format {year: eps}
-            for entry in eps_data.eps_history:
-                if 'eps' in entry and entry['eps'] is not None:
-                    yf_eps[int(entry['year'])] = float(entry['eps'])
-    except Exception as e:
-        yf_eps = {}
+    yf_provider = _provider_of(YFinanceEPSProvider)
+    if yf_provider:
+        try:
+            result = yf_provider.fetch_eps(ticker)
+            if result.success and result.data:
+                for entry in result.data.eps_history:
+                    if 'eps' in entry and entry['eps'] is not None:
+                        yf_eps[int(entry['year'])] = float(entry['eps'])
+        except Exception:
+            yf_eps = {}
 
     # Build comparison
     comparison = []

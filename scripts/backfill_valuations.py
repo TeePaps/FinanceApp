@@ -57,7 +57,15 @@ def main():
         # Always refresh dividends — that's half the bug.
         div_result = orch.fetch_dividends(ticker)
         if div_result.success and div_result.data:
-            annual_div = round(div_result.data.annual_dividend, 2)
+            fetched_div = div_result.data.annual_dividend
+            cached_div_val = row.get('annual_dividend') or 0
+            # Same flakiness guard as calculate_valuation: distrust a fresh 0
+            # when the cache has a non-zero dividend (yfinance intermittently
+            # returns empty payment lists) rather than zeroing fair value.
+            if (not fetched_div or fetched_div <= 0) and cached_div_val > 0:
+                annual_div = round(cached_div_val, 2)
+            else:
+                annual_div = round(fetched_div, 2)
         else:
             annual_div = round(row.get('annual_dividend') or 0, 2)
 
