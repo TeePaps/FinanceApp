@@ -1462,14 +1462,6 @@ def record_price_failures(tickers: List[str], threshold: int = 3) -> List[str]:
     return newly_delisted
 
 
-def get_delisted_tickers() -> List[str]:
-    """All tickers currently flagged delisted (for recovery retries)."""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT ticker FROM tickers WHERE delisted = 1 ORDER BY ticker')
-        return [row['ticker'] for row in cursor.fetchall()]
-
-
 def is_ticker_delisted(ticker: str) -> bool:
     """Check if a ticker is marked as delisted."""
     ticker = ticker.upper()
@@ -1974,12 +1966,20 @@ def get_balance_sheet(ticker: str) -> Optional[Dict]:
 
 
 def get_first_buy_date(ticker: str) -> Optional[str]:
-    """Get the earliest buy transaction date for a ticker, or None."""
+    """Get the earliest CONFIRMED buy date (ISO) for a ticker, or None.
+
+    Filters to real YYYY-MM-DD values — legacy seed rows carry sentinel
+    dates like 'START', and because every real date sorts before 'S' in a
+    string comparison, MIN() returned the sentinel and the buyback star's
+    date-vs-date comparisons silently matched nothing. Only 'done' buys
+    count: a pending order has no meaningful buy date."""
     with get_private_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT MIN(date) AS first_buy FROM transactions
-            WHERE ticker = ? AND LOWER(action) = 'buy' AND date IS NOT NULL
+            WHERE ticker = ? AND LOWER(action) = 'buy'
+              AND LOWER(COALESCE(status, '')) = 'done'
+              AND date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'
         ''', (ticker.upper(),))
         row = cursor.fetchone()
         return row['first_buy'] if row and row['first_buy'] else None

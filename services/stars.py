@@ -30,9 +30,13 @@ from services.providers.yfinance_provider import fetch_yearly_dividends
 # -----------------------------------------------------------------------------
 
 def _holdings_ticker_set() -> Set[str]:
-    """Return uppercase tickers with current shares > 0 (FIFO-aware)."""
+    """Return uppercase tickers with current shares > 0 (FIFO-aware).
+
+    confirmed_only=True matches the app-wide holding definition (a 'done'
+    buy) — watchlist/placed buys must not put a ticker in the holdings
+    bucket (rated /6) or make the buyback criterion apply to it."""
     from services.holdings import calculate_holdings
-    holdings = calculate_holdings(confirmed_only=False)
+    holdings = calculate_holdings(confirmed_only=True)
     return {t.upper() for t, h in holdings.items() if h.get('shares', 0) > 0}
 
 
@@ -137,17 +141,17 @@ def _check_dividend_up(ticker: str, current_annual_dividend: Optional[float],
     """
     if not current_annual_dividend or current_annual_dividend <= 0:
         return False
-    if not yearly_dividends:
-        # Fall back to the snapshot table
-        history = db.get_dividend_history(ticker)
-        prior_year = datetime.now().year - 1
-        prior_div = history.get(prior_year)
-        if prior_div is None or prior_div <= 0:
-            return False
-        return current_annual_dividend > prior_div
-
+    # Resolve the prior-year total exactly like _explain_dividend_up does
+    # (yfinance dict first, then the snapshot table) — the old check only
+    # consulted the DB when yearly_dividends was ENTIRELY empty, so a
+    # non-empty dict missing the prior year made the persisted star and
+    # the Company Profile explanation reach opposite conclusions.
     prior_year = datetime.now().year - 1
-    prior_div = yearly_dividends.get(prior_year)
+    prior_div = None
+    if yearly_dividends:
+        prior_div = yearly_dividends.get(prior_year)
+    if prior_div is None:
+        prior_div = db.get_dividend_history(ticker).get(prior_year)
     if prior_div is None or prior_div <= 0:
         return False
     return current_annual_dividend > prior_div
@@ -173,12 +177,21 @@ def _check_debt_to_capital_low(ticker: str) -> bool:
 # Criterion 5: Share Buybacks Since Buy Date (holdings only)
 # -----------------------------------------------------------------------------
 
+def _is_iso_date(s: Optional[str]) -> bool:
+    """True for 'YYYY-MM-DD...' strings — guards the string comparisons
+    below against sentinel dates like 'START' (every real date < 'S', so a
+    sentinel silently matched the newest snapshot and compared it to
+    itself)."""
+    return bool(s) and len(s) >= 10 and s[:4].isdigit() and s[4] == '-' \
+        and s[5:7].isdigit() and s[7] == '-' and s[8:10].isdigit()
+
+
 def _check_shares_buyback_since_buy(ticker: str, first_buy_date: Optional[str]) -> bool:
     """
     Star earned when current shares outstanding < shares outstanding at
     the earliest buy date for this ticker.
     """
-    if not first_buy_date:
+    if not _is_iso_date(first_buy_date):
         return False
     history = db.get_shares_outstanding_history(ticker)
     if not history:
@@ -606,10 +619,10 @@ def _explain_shares_buyback(ticker, is_holding, first_buy_date):
             'note': 'Only applies to holdings',
             'values': {},
         }
-    if not first_buy_date:
+    if not _is_iso_date(first_buy_date):
         return {
             'earned': False, 'summary': None,
-            'note': 'No buy transactions found',
+            'note': 'No dated buy transactions found',
             'values': {},
         }
     history = db.get_shares_outstanding_history(ticker)
