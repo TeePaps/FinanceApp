@@ -40,9 +40,13 @@ def add_transaction():
 
 @transactions_bp.route('/transactions/<int:txn_id>', methods=['PUT'])
 def update_transaction(txn_id):
-    """Update an existing transaction."""
-    data = request.json
-    db.update_transaction(txn_id, data)
+    """Update an existing transaction (whitelisted fields only)."""
+    data = request.json or {}
+    try:
+        db.update_transaction(txn_id, data)
+    except ValueError as e:
+        # Unknown field name — reject instead of 500ing in SQL
+        return jsonify({'error': str(e)}), 400
     return jsonify({'success': True})
 
 

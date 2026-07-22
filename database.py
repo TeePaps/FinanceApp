@@ -441,13 +441,19 @@ def update_ticker_status(ticker: str, updates: Dict):
                 updates.get('cik')
             ))
         else:
-            # Build dynamic update query
+            # Build dynamic update query — whitelisted columns only (keys are
+            # interpolated into the SQL, never trust caller-supplied names)
+            allowed = ('company_name', 'sec_status', 'sec_checked', 'valuation_updated',
+                       'updated', 'cik', 'delisted', 'enabled', 'delist_strikes')
+            unknown = [k for k in updates if k not in allowed and k not in ('indexes', 'ticker')]
+            if unknown:
+                raise ValueError(f"Unknown ticker fields: {', '.join(sorted(unknown))}")
             set_parts = []
             values = []
-            for key, value in updates.items():
-                if key != 'indexes' and key != 'ticker':
+            for key in allowed:
+                if key in updates:
                     set_parts.append(f"{key} = ?")
-                    values.append(value)
+                    values.append(updates[key])
 
             if set_parts:
                 values.append(ticker)
@@ -1652,16 +1658,32 @@ def add_transaction(ticker: str, action: str, shares: int, price: float,
         return cursor.lastrowid
 
 
+# Writable transactions columns. Keys are interpolated into the SET clause
+# below, so they MUST come from this whitelist — request JSON reaches
+# update_transaction directly (PUT /api/transactions/<id>), and an arbitrary
+# key was both an unhandled 500 ("no such column") and an SQL-identifier
+# injection sink.
+_TRANSACTION_COLUMNS = ('ticker', 'action', 'shares', 'price', 'gain_pct', 'date', 'status')
+
+
 def update_transaction(txn_id: int, updates: Dict):
-    """Update a transaction."""
+    """Update a transaction (whitelisted columns only).
+
+    Raises ValueError for unknown keys so callers can reject bad input
+    (the route turns it into a 400) instead of 500ing mid-statement.
+    """
+    unknown = [k for k in updates if k != 'id' and k not in _TRANSACTION_COLUMNS]
+    if unknown:
+        raise ValueError(f"Unknown transaction fields: {', '.join(sorted(unknown))}")
+
     with get_private_db() as conn:
         cursor = conn.cursor()
         set_parts = []
         values = []
-        for key, value in updates.items():
-            if key != 'id':
+        for key in _TRANSACTION_COLUMNS:
+            if key in updates:
                 set_parts.append(f"{key} = ?")
-                values.append(value)
+                values.append(updates[key])
 
         if set_parts:
             values.append(txn_id)
