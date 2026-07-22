@@ -499,7 +499,11 @@ class DataOrchestrator:
             remaining = list(tickers)
 
         if not remaining:
-            return results
+            # Honor the return_sources contract on the all-cached fast path —
+            # a bare dict here made `prices, sources = fetch_prices(...,
+            # return_sources=True)` raise "too many values to unpack" (or
+            # silently mis-destructure) for the screener's callers.
+            return (results, sources) if return_sources else results
 
         # Get providers in order (batch-capable first if preferred)
         providers = self.registry.get_providers_ordered(DataType.PRICE, self.config)
@@ -566,6 +570,7 @@ class DataOrchestrator:
                     # Individual fetch for remaining tickers
                     still_remaining = []
                     success_count = 0
+                    attempted = len(remaining)  # what THIS provider tries (post-cache)
 
                     for ticker in remaining:
                         try:
@@ -593,7 +598,10 @@ class DataOrchestrator:
                     # Record overall success/failure
                     if success_count > 0:
                         self._record_provider_success(provider)
-                    elif len(still_remaining) == len(tickers):
+                    elif success_count == 0 and attempted > 0:
+                        # Provider produced nothing from everything it tried.
+                        # (Comparing against len(tickers) missed this whenever
+                        # some tickers were served from cache.)
                         self._record_provider_failure(provider)
 
             except TimeoutError as e:
@@ -1135,6 +1143,7 @@ class DataOrchestrator:
                     # Individual fetch for remaining tickers
                     still_remaining = []
                     success_count = 0
+                    attempted = len(remaining)  # what THIS provider tries (post-cache)
 
                     for ticker in remaining:
                         try:
@@ -1159,7 +1168,10 @@ class DataOrchestrator:
 
                     if success_count > 0:
                         self._record_provider_success(provider)
-                    elif len(still_remaining) == len(tickers):
+                    elif success_count == 0 and attempted > 0:
+                        # Provider produced nothing from everything it tried.
+                        # (Comparing against len(tickers) missed this whenever
+                        # some tickers were served from cache.)
                         self._record_provider_failure(provider)
 
             except TimeoutError as e:

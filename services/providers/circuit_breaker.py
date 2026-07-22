@@ -134,9 +134,18 @@ class CircuitBreaker:
                 if not circuit.half_open_request_in_flight:
                     circuit.half_open_request_in_flight = True
                     return True
-                else:
-                    # Another request is already testing
-                    return False
+                # A probe is supposedly in flight. Self-heal: if its outcome
+                # was never recorded (a caller skipped record_success/failure,
+                # e.g. the batch path that under-counts on partial cache hits),
+                # the in-flight flag would otherwise wedge this provider to
+                # False forever. After a bounded wait, release it for a fresh
+                # probe rather than staying disabled until process restart.
+                stuck_for = now - circuit.last_failure_time
+                if stuck_for >= self.cooldown_seconds * 2:
+                    circuit.half_open_request_in_flight = True
+                    circuit.last_failure_time = now  # restart the stuck timer
+                    return True
+                return False
 
             return True  # Default allow
 
@@ -188,31 +197,38 @@ class CircuitBreaker:
         with self._lock:
             return self._get_circuit(provider_name).state
 
+    def _status_locked(self, provider_name: str) -> Dict:
+        """Build status for a provider. Caller MUST already hold self._lock."""
+        circuit = self._get_circuit(provider_name)
+        now = time.time()
+
+        status = {
+            "provider": provider_name,
+            "state": circuit.state.value,
+            "failure_count": circuit.failure_count,
+            "threshold": self.failure_threshold,
+        }
+
+        if circuit.state == CircuitState.OPEN:
+            remaining = self.cooldown_seconds - (now - circuit.last_failure_time)
+            status["cooldown_remaining_seconds"] = max(0, remaining)
+
+        return status
+
     def get_status(self, provider_name: str) -> Dict:
         """Get detailed status for a provider's circuit."""
         with self._lock:
-            circuit = self._get_circuit(provider_name)
-            now = time.time()
-
-            status = {
-                "provider": provider_name,
-                "state": circuit.state.value,
-                "failure_count": circuit.failure_count,
-                "threshold": self.failure_threshold,
-            }
-
-            if circuit.state == CircuitState.OPEN:
-                remaining = self.cooldown_seconds - (now - circuit.last_failure_time)
-                status["cooldown_remaining_seconds"] = max(0, remaining)
-
-            return status
+            return self._status_locked(provider_name)
 
     def get_all_status(self) -> Dict[str, Dict]:
         """Get status for all tracked providers."""
+        # Use the lock-free helper — calling the public get_status() here
+        # re-acquired the non-reentrant Lock and DEADLOCKED the whole circuit
+        # breaker (every later can_execute/record_* blocked forever).
         with self._lock:
             return {
-                name: self.get_status(name)
-                for name in self._circuits
+                name: self._status_locked(name)
+                for name in list(self._circuits)
             }
 
     def reset_provider(self, provider_name: str):
