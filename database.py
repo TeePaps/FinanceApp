@@ -41,9 +41,19 @@ from services.indexes import VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES
 
 def _get_connection(db_path: str) -> sqlite3.Connection:
     """Get a database connection with row factory enabled."""
-    conn = sqlite3.connect(db_path)
+    # 30s busy timeout + WAL: the background screener holds long write
+    # transactions (bulk upserts) while Flask request threads read/write
+    # concurrently. The 5s default and rollback-journal mode produced
+    # "database is locked" errors under that load; WAL lets readers proceed
+    # during a writer and the longer timeout absorbs write contention.
+    conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass  # e.g. read-only media; fall back to default journal
     return conn
 
 
@@ -1150,6 +1160,14 @@ def add_new_eps_years(ticker: str, eps_list: list) -> int:
 
     with get_db() as conn:
         cursor = conn.cursor()
+
+        # Ensure the sec_companies parent row exists first. eps_history has a
+        # FK to sec_companies and foreign_keys=ON; INSERT OR IGNORE does NOT
+        # suppress FK violations, so inserting EPS for a ticker with no parent
+        # row raised IntegrityError and lost the whole batch.
+        cursor.execute('''
+            INSERT OR IGNORE INTO sec_companies (ticker, updated) VALUES (?, ?)
+        ''', (ticker, datetime.now().isoformat()))
 
         for eps in eps_list:
             # Try to insert, ignore if year already exists

@@ -8,6 +8,7 @@ import threading
 from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.base import STATE_RUNNING, STATE_PAUSED
 import pytz
 
 import config
@@ -92,10 +93,14 @@ def get_status():
     job = _scheduler.get_job('auto_price_refresh')
     next_run = job.next_run_time if job else None
 
+    # APScheduler's `.running` is `state != STATE_STOPPED`, so it stays True
+    # while PAUSED — report the true actively-running state instead, and hide
+    # a stale next_run when paused.
+    is_active = _scheduler.state == STATE_RUNNING
     return {
         'enabled': config.SCHEDULER_ENABLED,
-        'running': _scheduler.running,
-        'next_run': next_run.isoformat() if next_run else None,
+        'running': is_active,
+        'next_run': next_run.isoformat() if (next_run and is_active) else None,
         'interval_minutes': config.PRICE_REFRESH_INTERVAL,
         'market_open': is_market_open()
     }
@@ -109,11 +114,13 @@ def toggle(enabled=None):
         return {'error': 'Scheduler not initialized'}
 
     if enabled is None:
-        # Toggle current state
-        if _scheduler.running:
-            _scheduler.pause()
-        else:
+        # Toggle current state. Check state explicitly — `.running` stays True
+        # while paused (state != STATE_STOPPED), so the old check could never
+        # resume a paused scheduler.
+        if _scheduler.state == STATE_PAUSED:
             _scheduler.resume()
+        else:
+            _scheduler.pause()
     elif enabled:
         _scheduler.resume()
     else:
