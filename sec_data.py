@@ -32,15 +32,29 @@ EPS_CACHE_DAYS = SEC_EPS_CACHE_DAYS
 sec_update_running = False
 sec_update_progress = {'current': 0, 'total': 0, 'ticker': '', 'status': 'idle'}
 last_sec_request = 0
+_rate_limit_lock = threading.Lock()
 
 
 def rate_limit():
-    """Ensure we don't exceed SEC rate limits"""
+    """Ensure we don't exceed SEC's 10 req/sec limit.
+
+    SEC fetches run concurrently from the background updater thread AND from
+    Flask request handlers, so the read-sleep-write of last_sec_request must
+    be atomic — otherwise two threads read the same timestamp, both decide
+    enough time has passed, and fire simultaneously, bursting past the limit
+    and risking a 10-minute SEC ban. Reserve the next slot under the lock,
+    then sleep (outside the lock so other threads queue in order).
+    """
     global last_sec_request
-    elapsed = time.time() - last_sec_request
-    if elapsed < SEC_RATE_LIMIT:
-        time.sleep(SEC_RATE_LIMIT - elapsed)
-    last_sec_request = time.time()
+    with _rate_limit_lock:
+        now = time.time()
+        wait = SEC_RATE_LIMIT - (now - last_sec_request)
+        # Reserve our slot: the next caller spaces off OUR scheduled time,
+        # not the current clock, so N threads serialize to N*SEC_RATE_LIMIT.
+        scheduled = now + wait if wait > 0 else now
+        last_sec_request = scheduled
+    if wait > 0:
+        time.sleep(wait)
 
 
 # --- Metadata ---
@@ -299,9 +313,13 @@ def fetch_company_eps(ticker, cik):
                 return None
 
             # Sanity check and correction for EPS values
-            # Some companies (e.g., HAL) have XBRL filing errors where EPS is 1,000,000x too high
-            MAX_REASONABLE_EPS = 1000  # Berkshire A shares can have high EPS
-            LIKELY_SCALE_ERROR_MIN = 100000  # Values above this are likely scale errors
+            # Some companies (e.g., HAL) have XBRL filing errors where EPS is 1,000,000x too high.
+            # The two thresholds are now contiguous: anything below the scale-error floor is
+            # KEPT (Berkshire A shares legitimately post EPS in the tens of thousands — the old
+            # 1000 cap silently dropped exactly those years and biased the 8-year average), and
+            # only values in the 1M-scale-error band are corrected/rejected.
+            LIKELY_SCALE_ERROR_MIN = 100000  # Values at/above this are likely 1M scale errors
+            MAX_REASONABLE_EPS = LIKELY_SCALE_ERROR_MIN  # Keep everything below the scale-error floor
 
             def correct_eps_value(eps_val):
                 """Attempt to correct obviously wrong EPS values"""
@@ -577,21 +595,30 @@ def fetch_shares_outstanding(ticker):
         data = _fetch_companyfacts(cik)
         if not data:
             return None
-        us_gaap = data.get('facts', {}).get('us-gaap', {})
+        facts = data.get('facts', {})
+        us_gaap = facts.get('us-gaap', {})
+        dei = facts.get('dei', {})
 
         # Concepts in priority order — different filers use different ones.
+        # Each is paired with its XBRL namespace: EntityCommonStockShares-
+        # Outstanding is a cover-page `dei` concept, NOT us-gaap, so the old
+        # us-gaap-only lookup could never find it (dead fallback). For filers
+        # missing us-gaap CommonStockSharesOutstanding the code then wrongly
+        # fell through to the diluted weighted-average count.
         candidate_fields = [
-            'CommonStockSharesOutstanding',
-            'EntityCommonStockSharesOutstanding',
-            'WeightedAverageNumberOfDilutedSharesOutstanding',
+            ('us-gaap', 'CommonStockSharesOutstanding'),
+            ('dei', 'EntityCommonStockSharesOutstanding'),
+            ('us-gaap', 'WeightedAverageNumberOfDilutedSharesOutstanding'),
         ]
+        namespaces = {'us-gaap': us_gaap, 'dei': dei}
 
         # Collect ALL records (not just 10-K) so we get the freshest snapshot.
         records = []
         field_used = None
-        for field in candidate_fields:
-            if field in us_gaap:
-                shares_records = us_gaap[field].get('units', {}).get('shares', [])
+        for ns, field in candidate_fields:
+            ns_facts = namespaces.get(ns, {})
+            if field in ns_facts:
+                shares_records = ns_facts[field].get('units', {}).get('shares', [])
                 if shares_records:
                     records = shares_records
                     field_used = field
