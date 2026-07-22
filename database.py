@@ -668,116 +668,84 @@ def get_valuation(ticker: str) -> Optional[Dict]:
         return None
 
 
-def update_valuation(ticker: str, valuation: Dict):
-    """Update valuation for a single ticker."""
-    ticker = ticker.upper()
-    valuation['ticker'] = ticker
-    valuation['updated'] = datetime.now().isoformat()
+# Whitelist of writable valuations columns — _upsert_valuation builds its SQL
+# from this tuple, never from caller-supplied keys.
+_VALUATION_COLUMNS = (
+    'company_name', 'current_price', 'price_source', 'eps_avg', 'eps_years',
+    'eps_source', 'annual_dividend', 'estimated_value', 'price_vs_value',
+    'fifty_two_week_high', 'fifty_two_week_low', 'off_high_pct',
+    'price_change_1m', 'price_change_3m', 'in_selloff', 'selloff_severity',
+)
 
+
+def _upsert_valuation(cursor, ticker: str, valuation: Dict, now: str):
+    """
+    Upsert a valuations row, touching ONLY the columns present in `valuation`.
+
+    Omitted keys leave existing values untouched; keys explicitly set to None
+    still null their column. This makes partial writes (price-only, EPS-only,
+    dividend-only) safe — the old fixed-column upsert overwrote every omitted
+    column with NULL, which repeatedly wiped cached EPS/dividend/52-week data.
+    """
+    cols = [c for c in _VALUATION_COLUMNS if c in valuation]
+    values = []
+    for c in cols:
+        v = valuation[c]
+        if c == 'in_selloff':
+            v = 1 if v else 0
+        values.append(v)
+
+    insert_cols = ['ticker'] + cols + ['updated']
+    placeholders = ', '.join('?' * len(insert_cols))
+    set_clause = ', '.join(f"{c} = excluded.{c}" for c in cols + ['updated'])
+    cursor.execute(
+        f'''INSERT INTO valuations ({', '.join(insert_cols)})
+            VALUES ({placeholders})
+            ON CONFLICT(ticker) DO UPDATE SET {set_clause}''',
+        [ticker] + values + [now],
+    )
+
+
+def update_valuation(ticker: str, valuation: Dict):
+    """Update valuation for a single ticker (only the keys provided)."""
+    ticker = ticker.upper()
+    now = datetime.now().isoformat()
+    with get_db() as conn:
+        _upsert_valuation(conn.cursor(), ticker, valuation, now)
+
+
+def update_price_cache(ticker: str, price: float, source: Optional[str] = None):
+    """
+    Update ONLY the cached price fields for a ticker.
+
+    The orchestrator's price cache must use this instead of
+    update_valuation()/bulk_update_valuations(): those are full-row upserts
+    that overwrite every omitted column with NULL, so caching a price through
+    them silently wiped the ticker's EPS, dividend, fair value, and 52-week
+    data on every cache-miss price fetch.
+    """
+    ticker = ticker.upper()
+    now = datetime.now().isoformat()
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO valuations (ticker, company_name, current_price, price_source, eps_avg, eps_years,
-                                   eps_source, annual_dividend, estimated_value, price_vs_value,
-                                   fifty_two_week_high, fifty_two_week_low, off_high_pct,
-                                   price_change_1m, price_change_3m, in_selloff, selloff_severity, updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO valuations (ticker, current_price, price_source, updated)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(ticker) DO UPDATE SET
-                company_name = excluded.company_name,
                 current_price = excluded.current_price,
                 price_source = excluded.price_source,
-                eps_avg = excluded.eps_avg,
-                eps_years = excluded.eps_years,
-                eps_source = excluded.eps_source,
-                annual_dividend = excluded.annual_dividend,
-                estimated_value = excluded.estimated_value,
-                price_vs_value = excluded.price_vs_value,
-                fifty_two_week_high = excluded.fifty_two_week_high,
-                fifty_two_week_low = excluded.fifty_two_week_low,
-                off_high_pct = excluded.off_high_pct,
-                price_change_1m = excluded.price_change_1m,
-                price_change_3m = excluded.price_change_3m,
-                in_selloff = excluded.in_selloff,
-                selloff_severity = excluded.selloff_severity,
                 updated = excluded.updated
-        ''', (
-            ticker,
-            valuation.get('company_name'),
-            valuation.get('current_price'),
-            valuation.get('price_source'),
-            valuation.get('eps_avg'),
-            valuation.get('eps_years'),
-            valuation.get('eps_source'),
-            valuation.get('annual_dividend'),
-            valuation.get('estimated_value'),
-            valuation.get('price_vs_value'),
-            valuation.get('fifty_two_week_high'),
-            valuation.get('fifty_two_week_low'),
-            valuation.get('off_high_pct'),
-            valuation.get('price_change_1m'),
-            valuation.get('price_change_3m'),
-            1 if valuation.get('in_selloff') else 0,
-            valuation.get('selloff_severity'),
-            valuation['updated']
-        ))
+        ''', (ticker, price, source, now))
 
 
 def bulk_update_valuations(valuations: Dict[str, Dict]):
-    """Bulk update multiple valuations at once."""
+    """Bulk update multiple valuations at once (only the keys provided per row)."""
     now = datetime.now().isoformat()
 
     with get_db() as conn:
         cursor = conn.cursor()
-
         for ticker, valuation in valuations.items():
-            ticker = ticker.upper()
-            valuation['ticker'] = ticker
-            valuation['updated'] = now
-
-            cursor.execute('''
-                INSERT INTO valuations (ticker, company_name, current_price, price_source, eps_avg, eps_years,
-                                       eps_source, annual_dividend, estimated_value, price_vs_value,
-                                       fifty_two_week_high, fifty_two_week_low, off_high_pct,
-                                       price_change_1m, price_change_3m, in_selloff, selloff_severity, updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(ticker) DO UPDATE SET
-                    company_name = excluded.company_name,
-                    current_price = excluded.current_price,
-                    price_source = excluded.price_source,
-                    eps_avg = excluded.eps_avg,
-                    eps_years = excluded.eps_years,
-                    eps_source = excluded.eps_source,
-                    annual_dividend = excluded.annual_dividend,
-                    estimated_value = excluded.estimated_value,
-                    price_vs_value = excluded.price_vs_value,
-                    fifty_two_week_high = excluded.fifty_two_week_high,
-                    fifty_two_week_low = excluded.fifty_two_week_low,
-                    off_high_pct = excluded.off_high_pct,
-                    price_change_1m = excluded.price_change_1m,
-                    price_change_3m = excluded.price_change_3m,
-                    in_selloff = excluded.in_selloff,
-                    selloff_severity = excluded.selloff_severity,
-                    updated = excluded.updated
-            ''', (
-                ticker,
-                valuation.get('company_name'),
-                valuation.get('current_price'),
-                valuation.get('price_source'),
-                valuation.get('eps_avg'),
-                valuation.get('eps_years'),
-                valuation.get('eps_source'),
-                valuation.get('annual_dividend'),
-                valuation.get('estimated_value'),
-                valuation.get('price_vs_value'),
-                valuation.get('fifty_two_week_high'),
-                valuation.get('fifty_two_week_low'),
-                valuation.get('off_high_pct'),
-                valuation.get('price_change_1m'),
-                valuation.get('price_change_3m'),
-                1 if valuation.get('in_selloff') else 0,
-                valuation.get('selloff_severity'),
-                valuation['updated']
-            ))
+            _upsert_valuation(cursor, ticker.upper(), valuation, now)
 
 
 def get_valuations_for_index(index_name: str) -> List[Dict]:

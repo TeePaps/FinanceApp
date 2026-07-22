@@ -108,11 +108,12 @@ def api_holdings_analysis():
         }
         enriched_holdings[ticker] = enriched
 
-        # Check if this is a sell candidate
+        # Check if this is a sell candidate — only positions actually held;
+        # fully-sold tickers (0 shares) were showing up as "Consider Selling".
         is_overvalued = price_vs_value is not None and price_vs_value > 10
         has_big_gain = gain_pct is not None and gain_pct > 30
 
-        if is_overvalued or has_big_gain:
+        if (is_overvalued or has_big_gain) and holding.get('shares', 0) > 0:
             reasons = []
             if is_overvalued:
                 reasons.append(f"Trading {price_vs_value:.0f}% above estimated value")
@@ -129,7 +130,7 @@ def api_holdings_analysis():
                 'price_vs_value': price_vs_value,
                 'estimated_value': estimated_value,
                 'reasons': reasons,
-                'priority': (price_vs_value or 0) + (gain_pct or 0) / 2
+                'priority': ((price_vs_value or 0) + (gain_pct or 0)) / 2
             })
 
     # Sort sell candidates by priority

@@ -23,7 +23,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import database as db
 from services.providers import init_providers, get_orchestrator
-from services.valuation import get_split_adjusted_eps_history, compute_estimated_value
+from services.valuation import (
+    get_split_adjusted_eps_history, compute_estimated_value,
+    average_split_adjusted_eps,
+)
 
 
 def main():
@@ -45,11 +48,11 @@ def main():
             no_eps_history += 1
             continue
 
-        use = hist[:8]
-        eps_avg = round(
-            sum(h['eps'] for h in use if h.get('eps') is not None) / len(use),
-            2,
-        )
+        raw_avg, years_used = average_split_adjusted_eps(hist)
+        if raw_avg is None:
+            no_eps_history += 1
+            continue
+        eps_avg = round(raw_avg, 2)
 
         # Always refresh dividends — that's half the bug.
         div_result = orch.fetch_dividends(ticker)
@@ -81,7 +84,7 @@ def main():
         db.bulk_update_valuations({ticker: {
             **row,
             'eps_avg': eps_avg,
-            'eps_years': len(use),
+            'eps_years': years_used,
             'eps_source': 'sec_cache',
             'annual_dividend': annual_div,
             'estimated_value': estimated_value,

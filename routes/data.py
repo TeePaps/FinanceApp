@@ -229,11 +229,20 @@ def api_screener_update_dividends():
 
                     existing = data_manager.load_valuations().get('valuations', {}).get(ticker, {})
                     if existing:
-                        eps_avg = existing.get('eps_avg', 0)
+                        # Use the canonical helper so the sanity rules and the
+                        # configured multiplier apply, and recompute
+                        # price_vs_value so it stays consistent with the new
+                        # estimated_value instead of carrying the stale one.
+                        from services.valuation import compute_estimated_value
+                        estimated_value, price_vs_value = compute_estimated_value(
+                            existing.get('eps_avg'), annual_dividend,
+                            existing.get('current_price')
+                        )
                         updates[ticker] = {
                             **existing,
                             'annual_dividend': round(annual_dividend, 2),
-                            'estimated_value': round((eps_avg + annual_dividend) * 10, 2) if eps_avg else None,
+                            'estimated_value': estimated_value,
+                            'price_vs_value': price_vs_value,
                             'updated': datetime.now().isoformat()
                         }
                         if (i + 1) % 50 == 0:

@@ -11,7 +11,9 @@ Handles:
 from flask import Blueprint, jsonify, request
 from datetime import datetime, timedelta
 import data_manager
-from services.holdings import calculate_holdings, get_transactions
+from services.holdings import (
+    calculate_holdings, calculate_fifo_cost_basis, get_transactions, get_stocks,
+)
 from services.stock_utils import fetch_multiple_prices
 from config import PRICE_CACHE_DURATION
 
@@ -78,65 +80,138 @@ def api_prices():
 # The blueprint version was removed due to response format differences
 
 
+def _parse_date(date_str):
+    """Parse YYYY-MM-DD to a date; None for missing/unparseable."""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return None
+
+
 @summary_bp.route('/profit-timeline')
 def api_profit_timeline():
-    """Get timeline of realized profits."""
-    transactions = get_transactions()
+    """
+    Realized profit (FIFO) within a date range.
 
-    # Get date range from query params
+    Response shape must match renderProfitTimeline() in static/app.js:
+    {date_range: {start, end}, totals: {profit, revenue, sales_count},
+     by_ticker, by_month, sales}. The previous blueprint version returned a
+    different shape ({timeline, totals.gain}), which crashed the tab.
+    """
     start_date = request.args.get('start')
     end_date = request.args.get('end')
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
 
-    # Filter to completed sells
-    sells = [t for t in transactions if t['action'] == 'sell' and t.get('gain_pct')]
+    stocks = {s['ticker']: s for s in get_stocks()}
+    transactions = get_transactions()
 
-    # Apply date filter if provided
-    if start_date:
-        sells = [t for t in sells if t.get('date', '') >= start_date]
-    if end_date:
-        sells = [t for t in sells if t.get('date', '') <= end_date]
+    # FIFO basis for every sell. All sells must be processed in order
+    # (basis depends on earlier sells), so compute first and filter the
+    # reporting window afterwards. Buys count only when confirmed (done).
+    txns_by_ticker = {}
+    for txn in transactions:
+        status = (txn.get('status') or '').lower()
+        if txn['action'] == 'buy' and status != 'done':
+            continue
+        txns_by_ticker.setdefault(txn['ticker'], []).append(txn)
 
-    # Sort by date
-    sells.sort(key=lambda x: x.get('date', ''))
+    sell_basis = {}
+    for ticker, txns in txns_by_ticker.items():
+        basis, _lots = calculate_fifo_cost_basis(ticker, txns)
+        sell_basis.update(basis)
 
-    # Calculate monthly totals
-    monthly_totals = {}
-    for txn in sells:
-        date = txn.get('date', '')
-        if len(date) >= 7:
-            month = date[:7]  # YYYY-MM
-            if month not in monthly_totals:
-                monthly_totals[month] = {'gain': 0, 'count': 0}
+    sales_in_range = []
+    total_profit = 0
+    total_revenue = 0
+    by_ticker = {}
+    by_month = {}
 
-            shares = int(txn.get('shares', 0))
-            price = float(txn.get('price', 0))
-            gain_pct = float(txn.get('gain_pct', 0))
+    for txn in transactions:
+        if txn['action'] != 'sell':
+            continue
+        if (txn.get('status') or '').lower() != 'done':
+            continue
 
-            # Estimate gain (price * shares * gain_pct / (100 + gain_pct))
-            total_sale = shares * price
-            cost_basis = total_sale / (1 + gain_pct / 100)
-            gain = total_sale - cost_basis
+        txn_date = _parse_date(txn.get('date'))
+        if not txn_date:
+            continue
+        if start and txn_date < start:
+            continue
+        if end and txn_date > end:
+            continue
 
-            monthly_totals[month]['gain'] += gain
-            monthly_totals[month]['count'] += 1
+        ticker = txn['ticker']
+        shares = int(txn['shares']) if txn['shares'] else 0
+        price = float(txn['price']) if txn['price'] else 0
+        revenue = shares * price
+        cost = sell_basis.get(txn['id'], {}).get('cost_basis', 0)
+        profit = revenue - cost
 
-    # Convert to sorted list
-    timeline = [
-        {'month': k, 'gain': round(v['gain'], 2), 'transactions': v['count']}
-        for k, v in sorted(monthly_totals.items())
-    ]
+        total_profit += profit
+        total_revenue += revenue
 
-    # Calculate totals
-    total_gain = sum(m['gain'] for m in timeline)
-    total_transactions = sum(m['transactions'] for m in timeline)
+        if ticker not in by_ticker:
+            by_ticker[ticker] = {
+                'ticker': ticker,
+                'name': stocks.get(ticker, {}).get('name', ticker),
+                'shares_sold': 0,
+                'revenue': 0,
+                'profit': 0,
+                'sales': []
+            }
+        by_ticker[ticker]['shares_sold'] += shares
+        by_ticker[ticker]['revenue'] += revenue
+        by_ticker[ticker]['profit'] += profit
+        by_ticker[ticker]['sales'].append({
+            'date': txn['date'],
+            'shares': shares,
+            'price': price,
+            'revenue': revenue,
+            'profit': round(profit, 2)
+        })
+
+        month_key = txn_date.strftime('%Y-%m')
+        if month_key not in by_month:
+            by_month[month_key] = {'month': month_key, 'profit': 0, 'revenue': 0, 'sales_count': 0}
+        by_month[month_key]['profit'] += profit
+        by_month[month_key]['revenue'] += revenue
+        by_month[month_key]['sales_count'] += 1
+
+        sales_in_range.append({
+            'date': txn['date'],
+            'ticker': ticker,
+            'shares': shares,
+            'price': price,
+            'profit': round(profit, 2)
+        })
+
+    sales_in_range.sort(key=lambda x: x['date'])
+    by_ticker_list = sorted(by_ticker.values(), key=lambda x: x['profit'], reverse=True)
+    for t in by_ticker_list:
+        t['revenue'] = round(t['revenue'], 2)
+        t['profit'] = round(t['profit'], 2)
+
+    by_month_list = sorted(by_month.values(), key=lambda x: x['month'])
+    for m in by_month_list:
+        m['profit'] = round(m['profit'], 2)
+        m['revenue'] = round(m['revenue'], 2)
 
     return jsonify({
-        'timeline': timeline,
-        'totals': {
-            'gain': round(total_gain, 2),
-            'transactions': total_transactions
+        'date_range': {
+            'start': start_date or 'all time',
+            'end': end_date or 'now'
         },
-        'transactions': sells
+        'totals': {
+            'profit': round(total_profit, 2),
+            'revenue': round(total_revenue, 2),
+            'sales_count': len(sales_in_range)
+        },
+        'by_ticker': by_ticker_list,
+        'by_month': by_month_list,
+        'sales': sales_in_range
     })
 
 
@@ -148,17 +223,31 @@ def api_performance():
     valuations_data = data_manager.load_valuations()
     all_valuations = valuations_data.get('valuations', {})
 
-    # Calculate realized gains from completed sells
+    # Realized gains from completed sells, FIFO. (Back-computing cost from the
+    # stored gain_pct loses precision — gain_pct is rounded to whole percents —
+    # and disagreed with /api/summary and /api/profit-timeline by ~$150.)
+    txns_by_ticker = {}
+    for txn in transactions:
+        status = (txn.get('status') or '').lower()
+        if txn['action'] == 'buy' and status != 'done':
+            continue
+        txns_by_ticker.setdefault(txn['ticker'], []).append(txn)
+
+    sell_basis = {}
+    for ticker, txns in txns_by_ticker.items():
+        basis, _lots = calculate_fifo_cost_basis(ticker, txns)
+        sell_basis.update(basis)
+
     realized_gain = 0
     for txn in transactions:
-        if txn['action'] == 'sell' and txn.get('gain_pct'):
-            shares = int(txn.get('shares', 0))
-            price = float(txn.get('price', 0))
-            gain_pct = float(txn.get('gain_pct', 0))
-
-            total_sale = shares * price
-            cost_basis = total_sale / (1 + gain_pct / 100)
-            realized_gain += total_sale - cost_basis
+        if txn['action'] != 'sell':
+            continue
+        if (txn.get('status') or '').lower() != 'done':
+            continue
+        shares = int(txn['shares']) if txn['shares'] else 0
+        price = float(txn['price']) if txn['price'] else 0
+        cost = sell_basis.get(txn['id'], {}).get('cost_basis', 0)
+        realized_gain += shares * price - cost
 
     # Calculate unrealized gains
     unrealized_gain = 0
