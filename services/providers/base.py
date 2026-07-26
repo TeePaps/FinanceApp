@@ -245,6 +245,28 @@ class BaseProvider(ABC):
         return 0
 
     @property
+    def request_timeout(self) -> float:
+        """This provider's own per-request timeout, in seconds.
+
+        The orchestrator uses it as a floor for its call timeout so it never
+        abandons a request the provider is still legitimately waiting on.
+        0 means "no opinion, use the orchestrator default".
+        """
+        return 0
+
+    @property
+    def self_rate_limited(self) -> bool:
+        """Whether this provider paces its own outbound requests.
+
+        When True the orchestrator does NOT apply its own pre-call sleep: the
+        provider owns pacing. SEC providers need this - sec_data applies a
+        thread-safe limiter around every actual HTTP request, so the
+        orchestrator's sleep doubled the spacing and, worse, slept even when
+        the call was going to be served from cache without any request.
+        """
+        return False
+
+    @property
     def supports_batch(self) -> bool:
         """Whether this provider supports batch requests for multiple tickers."""
         return False

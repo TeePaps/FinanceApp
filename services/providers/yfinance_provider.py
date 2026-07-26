@@ -5,8 +5,10 @@ Wraps yfinance library to provide prices, EPS, and dividends through
 the standard provider interface.
 """
 
+import threading
 import time
 import math
+from collections import OrderedDict
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 
@@ -14,6 +16,63 @@ import pandas as pd
 import yfinance as yf
 
 import config
+
+
+# yfinance caches fetched frames (history, dividends, splits, info) ON THE
+# Ticker INSTANCE. Every provider method here used to build its own
+# yf.Ticker, so the dividend provider and the split provider each triggered a
+# separate full-history download for the same symbol moments apart, and the
+# same happened for repeated .info scrapes. Sharing a short-lived instance per
+# symbol collapses those into one download.
+_TICKER_MEMO = OrderedDict()
+_TICKER_MEMO_LOCK = threading.Lock()
+_TICKER_MEMO_MAX = 32
+_TICKER_MEMO_TTL = 300  # seconds
+
+
+def get_ticker(symbol: str):
+    """Return a shared yf.Ticker for `symbol`, reusing recent instances."""
+    symbol = symbol.upper()
+    now = time.time()
+    with _TICKER_MEMO_LOCK:
+        entry = _TICKER_MEMO.get(symbol)
+        if entry and now - entry[0] <= _TICKER_MEMO_TTL:
+            _TICKER_MEMO.move_to_end(symbol)
+            return entry[1]
+
+        stock = yf.Ticker(symbol)
+        _TICKER_MEMO[symbol] = (now, stock)
+        _TICKER_MEMO.move_to_end(symbol)
+        while len(_TICKER_MEMO) > _TICKER_MEMO_MAX:
+            _TICKER_MEMO.popitem(last=False)
+        return stock
+
+
+def clear_ticker_memo():
+    """Drop all memoized yf.Ticker instances (used by force-refresh paths)."""
+    with _TICKER_MEMO_LOCK:
+        _TICKER_MEMO.clear()
+
+
+def _dividends_for_period(stock, period: str):
+    """Dividend events over `period`, without downloading full history.
+
+    `Ticker.dividends` is a period='max' fetch under the hood. When only a
+    recent window is needed, pulling actions for that window transfers a small
+    fraction of the data. Falls back to `.dividends` if the narrow call fails.
+    """
+    try:
+        hist = stock.history(period=period, actions=True, auto_adjust=False)
+        if hist is not None and 'Dividends' in hist.columns:
+            series = hist['Dividends']
+            return series[series > 0]
+    except Exception:
+        pass
+
+    try:
+        return stock.dividends
+    except Exception:
+        return None
 
 
 def _last_close(data, ticker: str) -> Optional[float]:
@@ -96,7 +155,7 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
         ticker = ticker.upper()
 
         try:
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
 
             # Try fast_info first (fastest)
             try:
@@ -254,7 +313,7 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
         ticker = ticker.upper()
 
         try:
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
             hist = stock.history(period=period)
 
             if hist is None or hist.empty or 'Close' not in hist.columns:
@@ -306,16 +365,26 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                 if price_1m_ago and price_1m_ago > 0:
                     change_1m_pct = ((current_price - price_1m_ago) / price_1m_ago) * 100
 
-            # Fetch 52-week high/low from stock info
+            # 52-week high/low. fast_info exposes these directly; the full
+            # .info quoteSummary scrape is the heaviest and most rate-limited
+            # yfinance call, and two scalars do not justify it.
             fifty_two_week_high = None
             fifty_two_week_low = None
             try:
-                info = stock.info
-                if info and isinstance(info, dict):
-                    fifty_two_week_high = info.get('fiftyTwoWeekHigh')
-                    fifty_two_week_low = info.get('fiftyTwoWeekLow')
+                fast = stock.fast_info
+                fifty_two_week_high = fast.get('yearHigh')
+                fifty_two_week_low = fast.get('yearLow')
             except Exception:
                 pass  # Graceful degradation - still return price data
+
+            if fifty_two_week_high is None:
+                try:
+                    info = stock.info
+                    if info and isinstance(info, dict):
+                        fifty_two_week_high = info.get('fiftyTwoWeekHigh')
+                        fifty_two_week_low = info.get('fiftyTwoWeekLow')
+                except Exception:
+                    pass
 
             historical_data = HistoricalPriceData(
                 ticker=ticker,
@@ -567,7 +636,7 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
         ticker = ticker.upper()
 
         try:
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
             info = stock.info
 
             if not info or not isinstance(info, dict):
@@ -633,7 +702,7 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
             # Import thresholds from config
             from config import SELLOFF_VOLUME_SEVERE, SELLOFF_VOLUME_HIGH, SELLOFF_VOLUME_MODERATE
 
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
 
             # Get 30 days of history for monthly calculation
             hist = stock.history(period='1mo')
@@ -645,11 +714,15 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
                     error=f"No historical data available for {ticker}"
                 )
 
-            # Get average volume from info (20-day average)
-            info = stock.info
-            avg_volume = info.get('averageVolume', 0) or info.get('averageDailyVolume10Day', 0)
-            if not avg_volume or avg_volume == 0:
-                # Calculate from history if not available
+            # Average volume. The 1-month history above already contains what
+            # we need, so derive it from that rather than paying for a full
+            # .info quoteSummary scrape to read one field.
+            avg_volume = 0
+            try:
+                avg_volume = stock.fast_info.get('threeMonthAverageVolume') or 0
+            except Exception:
+                avg_volume = 0
+            if not avg_volume:
                 avg_volume = hist['Volume'].mean()
 
             # Calculate daily price changes
@@ -774,7 +847,7 @@ class YFinanceEPSProvider(EPSProvider):
         ticker = ticker.upper()
 
         try:
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
             income_stmt = stock.income_stmt
 
             if income_stmt is None or income_stmt.empty:
@@ -834,11 +907,11 @@ class YFinanceEPSProvider(EPSProvider):
                     error="No valid EPS values found"
                 )
 
-            # Get company name
-            try:
-                company_name = stock.info.get('shortName', ticker)
-            except Exception:
-                company_name = ticker
+            # Company name is cosmetic here and the EPS record is keyed by
+            # ticker anyway, so it does not justify a full .info scrape - the
+            # heaviest yfinance call - on the EPS path. Callers that need a
+            # display name use fetch_stock_info.
+            company_name = ticker
 
             eps_data = EPSData(
                 ticker=ticker,
@@ -882,15 +955,21 @@ class YFinanceDividendProvider(DividendProvider):
 
     @property
     def rate_limit(self) -> float:
-        return 0.2
+        # Single pacing authority for dividend fetches: the screener no longer
+        # adds its own fixed sleep on top of this.
+        return config.YAHOO_DIVIDEND_RATE_LIMIT
 
     def fetch_dividends(self, ticker: str) -> ProviderResult:
         """Fetch dividend history for a ticker."""
         ticker = ticker.upper()
 
         try:
-            stock = yf.Ticker(ticker)
-            dividends = stock.dividends
+            stock = get_ticker(ticker)
+            # `Ticker.dividends` resolves to a period='max' history download -
+            # decades of daily bars fetched to read at most a handful of
+            # dividend events, 99% of which are then discarded by the 12-month
+            # filter below. Ask for the window we actually use.
+            dividends = _dividends_for_period(stock, '1y')
 
             if dividends is None or dividends.empty:
                 # No dividends - this is valid (stock doesn't pay dividends)
@@ -962,14 +1041,15 @@ class YFinanceSplitProvider(SplitProvider):
 
     @property
     def rate_limit(self) -> float:
-        return 0.2
+        # Single pacing authority for split fetches (see dividend provider).
+        return config.YAHOO_SPLIT_RATE_LIMIT
 
     def fetch_splits(self, ticker: str) -> ProviderResult:
         """Fetch split history for a ticker."""
         ticker = ticker.upper()
 
         try:
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
             splits = stock.splits
 
             splits_list = []
@@ -1028,7 +1108,7 @@ class YFinanceAnalystEstimateProvider(AnalystEstimateProvider):
     def fetch_analyst_estimates(self, ticker: str) -> ProviderResult:
         ticker = ticker.upper()
         try:
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
             hist = None
             # yfinance has shipped this under both .earnings_history (attribute)
             # and .get_earnings_history() (method) over time.
@@ -1134,7 +1214,7 @@ class YFinanceSharesOutstandingProvider(SharesOutstandingProvider):
     def fetch_shares_outstanding(self, ticker: str) -> ProviderResult:
         ticker = ticker.upper()
         try:
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
             info = {}
             try:
                 info = stock.info or {}
@@ -1169,16 +1249,20 @@ class YFinanceSharesOutstandingProvider(SharesOutstandingProvider):
             )
 
 
-def fetch_yearly_dividends(ticker: str) -> Dict[int, float]:
+def fetch_yearly_dividends(ticker: str, period: str = '3y') -> Dict[int, float]:
     """
     Helper: return {calendar_year: sum_of_dividends_paid_that_year} from yfinance.
 
     Used by the Star Scoring system to detect dividend-growth year-over-year
     without needing to extend the DividendProvider interface.
+
+    Only the current and prior calendar years are ever read, so this fetches a
+    short window by default rather than `Ticker.dividends`, which downloads the
+    company's entire price history to extract a handful of dividend events.
     """
     try:
-        stock = yf.Ticker(ticker.upper())
-        dividends = stock.dividends
+        stock = get_ticker(ticker)
+        dividends = _dividends_for_period(stock, period)
         if dividends is None or dividends.empty:
             return {}
         by_year: Dict[int, float] = {}

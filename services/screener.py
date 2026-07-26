@@ -24,7 +24,10 @@ import data_manager
 # to avoid circular imports (database -> services.indexes -> services -> screener -> data_manager)
 from config import (
     PE_RATIO_MULTIPLIER, FAILURE_THRESHOLD,
-    SCREENER_DIVIDEND_BACKOFF, SCREENER_TICKER_PAUSE, SCREENER_PRICE_DELAY
+    SCREENER_DIVIDEND_BACKOFF, SCREENER_TICKER_PAUSE, SCREENER_PRICE_DELAY,
+    STALENESS_DIVIDEND_FRESH_DAYS, DIVIDEND_FULL_SWEEP_DAYS,
+    FIFTY_TWO_WEEK_REFRESH_DAYS, FIFTY_TWO_WEEK_RETRY_DAYS,
+    COMPANY_NAME_RETRY_DAYS
 )
 from logger import log, log_error
 from services.providers import get_orchestrator
@@ -150,6 +153,189 @@ def _reconcile_delistings(all_tickers, priced_tickers):
             )
 
 
+def _needs_history_refresh():
+    """Should this run re-download the 3-month price history batch?
+
+    The 1m/3m change percentages derived from that history move once per
+    trading day, but the scheduled quick update runs every 15 minutes during
+    market hours - so the whole universe's 3-month OHLC was being downloaded
+    ~26 times a day to recompute values that could not have changed. Refresh
+    only when the stored history predates the most recent market close.
+    """
+    from services.utils import last_market_close
+
+    stamp = db.get_metadata('last_history_update')
+    if not stamp:
+        return True
+    try:
+        return datetime.fromisoformat(stamp) < last_market_close()
+    except (ValueError, TypeError):
+        return True
+
+
+def _repair_company_names(tickers, existing_valuations, orchestrator, enabled=True):
+    """Resolve display names for tickers still stored as their own symbol.
+
+    Returns {ticker: resolved_name}. This used to run inline in the quick
+    update's build loop, firing a per-ticker .info fetch every 15 minutes for
+    every ticker whose name would not resolve - the same failures retried ~26
+    times a day forever. Now it runs at most once per trading day and backs off
+    tickers that recently failed.
+    """
+    if not enabled:
+        return {}
+
+    candidates = [
+        t for t in tickers
+        if (existing_valuations.get(t) or {}).get('company_name', t) == t
+    ]
+    if not candidates:
+        return {}
+
+    checks = db.get_fetch_checks('company_name', candidates)
+    retry_cutoff = datetime.now() - timedelta(days=COMPANY_NAME_RETRY_DAYS)
+
+    pending = []
+    for ticker in candidates:
+        stamp = (checks.get(ticker) or {}).get('checked_at')
+        if stamp:
+            try:
+                if datetime.fromisoformat(stamp) > retry_cutoff:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        pending.append(ticker)
+
+    if not pending:
+        return {}
+
+    activity_log.log("info", "screener",
+                     f"Resolving {len(pending)} missing company names...")
+
+    resolved, failed = {}, []
+    for ticker in pending:
+        if not _running:
+            break
+        try:
+            info_result = orchestrator.fetch_stock_info(ticker)
+            name = info_result.data.company_name if (
+                info_result.success and info_result.data) else None
+            if name and name != ticker:
+                resolved[ticker] = name
+            else:
+                failed.append(ticker)
+        except Exception:
+            failed.append(ticker)
+
+    db.record_fetch_checks('company_name', list(resolved.keys()), ok=True)
+    db.record_fetch_checks('company_name', failed, ok=False)
+    return resolved
+
+
+# Persist dividends every N tickers so an interrupted phase keeps its work.
+DIVIDEND_FLUSH_EVERY = 50
+
+# Run the SEC frames bulk pre-pass when at least this many tickers have no
+# stored EPS. Below it, the per-company path is cheaper than ~16 frame requests.
+EPS_FRAMES_PREPASS_MIN_MISSING = 25
+
+
+def _eps_frames_prepass(tickers):
+    """Fill EPS gaps in bulk from the SEC frames API before the per-ticker loop.
+
+    A cold start otherwise downloads one multi-megabyte companyfacts document
+    per company, serialized behind the SEC rate limit. Frames answer the same
+    question for every filer at once.
+    """
+    try:
+        existing = db.get_existing_eps_years(tickers)
+        missing = [t for t in tickers if not existing.get(t)]
+        if len(missing) < EPS_FRAMES_PREPASS_MIN_MISSING:
+            return
+
+        activity_log.log("info", "screener",
+                         f"Phase 1a: bulk EPS via SEC frames for {len(missing)} tickers without data...")
+
+        def _frames_progress(done, total):
+            _progress['ticker'] = f'Bulk SEC EPS (frames) {done}/{total}...'
+
+        import sec_data
+        stats = sec_data.refresh_eps_from_frames(
+            tickers=missing, progress_callback=_frames_progress)
+        activity_log.log(
+            "success", "screener",
+            f"✓ Phase 1a: {stats['rows_written']} EPS rows for "
+            f"{stats['tickers_touched']} tickers in {stats['requests']} requests")
+    except Exception as e:
+        log_error("SEC frames pre-pass failed", e)
+
+
+def _flush_dividends(dividend_data):
+    """Persist accumulated dividend results with a column-scoped write.
+
+    Only the dividend columns are touched, so this cannot disturb prices, EPS,
+    or fair values that other phases own. Safe to call repeatedly - already
+    flushed tickers are simply rewritten with the same values.
+    """
+    if not dividend_data:
+        return
+    try:
+        data_manager.bulk_update_valuations({
+            ticker: {
+                'annual_dividend': payload['annual_dividend'],
+            }
+            for ticker, payload in dividend_data.items()
+        })
+    except Exception as e:
+        log_error("Dividend flush failed", e)
+
+
+def _dividend_full_sweep_due():
+    """Is a forced full-universe dividend refresh due?
+
+    Selective refresh keeps ordinary runs cheap, but a periodic unconditional
+    sweep preserves the original safety property: a dividend that was silently
+    wrong (rather than merely old) still gets corrected on a known cadence.
+    """
+    stamp = db.get_metadata('last_dividend_full_sweep')
+    if not stamp:
+        return True
+    try:
+        return datetime.now() - datetime.fromisoformat(stamp) >= timedelta(
+            days=DIVIDEND_FULL_SWEEP_DAYS)
+    except (ValueError, TypeError):
+        return True
+
+
+def _tickers_needing_dividends(tickers, existing_valuations):
+    """Select tickers whose dividend data has aged past the freshness window.
+
+    Dividends change roughly quarterly, so refetching all ~500 of them on every
+    full run was pure waste. A ticker is refetched when it has never been
+    stamped, when its own stamp is older than STALENESS_DIVIDEND_FRESH_DAYS, or
+    when the periodic full sweep is due.
+    """
+    if _dividend_full_sweep_due():
+        db.set_metadata('last_dividend_full_sweep', datetime.now().isoformat())
+        activity_log.log("info", "screener",
+                         "Phase 2: periodic full dividend sweep - refreshing all tickers")
+        return list(tickers)
+
+    cutoff = datetime.now() - timedelta(days=STALENESS_DIVIDEND_FRESH_DAYS)
+    needing = []
+    for ticker in tickers:
+        stamp = (existing_valuations.get(ticker) or {}).get('dividend_updated')
+        if not stamp:
+            needing.append(ticker)
+            continue
+        try:
+            if datetime.fromisoformat(stamp) < cutoff:
+                needing.append(ticker)
+        except (ValueError, TypeError):
+            needing.append(ticker)
+    return needing
+
+
 def save_index_data(index_name, data):
     """Save index tickers to database."""
     if index_name not in VALID_INDICES or index_name == 'all':
@@ -165,16 +351,14 @@ def load_excluded_tickers():
 
 
 def record_ticker_failures(failed_tickers, successful_tickers):
-    """Record ticker failures and clear successes."""
-    newly_excluded = []
-    for ticker in failed_tickers:
-        db.record_ticker_failure(ticker)
-        failure = db.get_ticker_failure(ticker)
-        if failure and failure.get('failure_count', 0) >= FAILURE_THRESHOLD:
-            newly_excluded.append(ticker)
-    for ticker in successful_tickers:
-        db.clear_ticker_failure(ticker)
-    return newly_excluded
+    """Record ticker failures and clear successes.
+
+    One transaction for the whole set: the per-ticker version cost an upsert
+    plus a read for every failure and a delete for every success, i.e. one to
+    two connections per ticker across the entire universe on every run.
+    """
+    return db.record_ticker_failures_bulk(
+        failed_tickers, successful_tickers, threshold=FAILURE_THRESHOLD)
 
 
 # calculate_valuation() now imported from services.valuation
@@ -247,6 +431,20 @@ def run_screener(index_name='all'):
     existing_hits = 0
     orchestrator = get_orchestrator()
 
+    # Bulk pre-pass: when a lot of tickers have no stored EPS at all (a cold
+    # start, or a newly enabled index), fill them from the SEC frames API -
+    # ~2 requests per year for the ENTIRE universe instead of one multi-MB
+    # companyfacts download per company. Whatever frames can't supply still
+    # falls through to the per-company path below.
+    _eps_frames_prepass(tickers)
+
+    # Preload eps_history and split_history for the whole run in two queries.
+    # get_split_adjusted_eps_history() otherwise opens two connections and runs
+    # two queries per call, and this phase calls it up to twice per ticker.
+    # The eps map is refreshed for tickers whose SEC fetch writes new rows.
+    eps_history_map = db.get_eps_history_bulk(tickers)
+    splits_map = db.get_splits_bulk(tickers)
+
     for i, t in enumerate(tickers):
         if i % 50 == 0:
             _progress['current'] = i
@@ -259,7 +457,12 @@ def run_screener(index_name='all'):
             # Read split-adjusted history from the eps_history table — the fresh
             # SEC fetch just persisted the latest raw values, so this picks them up
             # and applies split-adjustment in one pass (e.g. BKNG's 25:1 split).
-            adjusted = get_split_adjusted_eps_history(t)
+            # A live fetch just rewrote this ticker's rows, so re-read them
+            # rather than trusting the preloaded map for this one ticker.
+            if not sec_result.cached:
+                eps_history_map[t] = db.get_eps_history(t)
+            adjusted = get_split_adjusted_eps_history(
+                t, eps_history_map=eps_history_map, splits_map=splits_map)
             if not adjusted:
                 # Provider returned data but the table wasn't populated for some
                 # reason — fall back to the raw fetched list (un-adjusted).
@@ -281,7 +484,8 @@ def run_screener(index_name='all'):
         # Fallback 1: SEC EPS cached in eps_history table from a prior successful fetch.
         # Prevents a transient SEC outage from overwriting good SEC data with stale
         # yfinance values via the existing-valuations fallback below.
-        cached_history = get_split_adjusted_eps_history(t)
+        cached_history = get_split_adjusted_eps_history(
+            t, eps_history_map=eps_history_map, splits_map=splits_map)
         cached_avg, cached_years = average_split_adjusted_eps(cached_history)
         if cached_avg is not None:
             eps_results[t] = {
@@ -314,13 +518,23 @@ def run_screener(index_name='all'):
         _running = False
         return
 
-    # Phase 2: Dividends — always refresh on a full screener run.
-    # The previous cache-skip logic (kept dividends if cached and <4mo old)
-    # let stale dividends linger and silently corrupted fair-value calculations
-    # (e.g. PGR cached $4.90 vs actual $13.90). run_quick_price_update and
-    # run_smart_update remain cache-aware for speed.
-    tickers_needing_dividends = list(tickers)
+    # Phase 2: Dividends — refresh those whose per-ticker stamp has aged out.
+    #
+    # This phase used to refetch EVERY ticker on EVERY full run because nothing
+    # recorded per-ticker dividend freshness; only a global metadata key
+    # existed. That was deliberate: an earlier cache-skip let stale dividends
+    # linger and corrupted fair values (e.g. PGR cached $4.90 vs actual
+    # $13.90). The dividend_updated column now makes selective refresh safe -
+    # a row is only skipped if IT was refreshed within the freshness window,
+    # not because some other ticker was. A periodic full sweep still runs (see
+    # _dividend_full_sweep_due) so nothing can drift indefinitely.
+    tickers_needing_dividends = _tickers_needing_dividends(tickers, existing_valuations)
     dividend_data = {}
+
+    skipped_dividends = len(tickers) - len(tickers_needing_dividends)
+    if skipped_dividends > 0:
+        activity_log.log("info", "screener",
+                         f"Phase 2: {skipped_dividends} dividends still fresh - skipping")
 
     if tickers_needing_dividends:
         log.info(f"Screener Phase 2: Fetching dividends for {len(tickers_needing_dividends)} tickers...")
@@ -378,7 +592,19 @@ def run_screener(index_name='all'):
                             }
             except Exception:
                 pass
-            time.sleep(backoff_delay)
+            # No screener-side sleep here: the orchestrator already paces this
+            # provider (yfinance dividend rate_limit). The old fixed 0.3s slept
+            # unconditionally - including after cache skips, immediate failures
+            # and circuit-open skips - stacking on top of that limiter.
+
+            # Flush periodically so a cancel or crash mid-phase keeps the
+            # dividends already fetched instead of discarding tens of minutes
+            # of network work (nothing was persisted until Phase 4).
+            if dividend_data and (i + 1) % DIVIDEND_FLUSH_EVERY == 0:
+                _flush_dividends(dividend_data)
+
+        if dividend_data:
+            _flush_dividends(dividend_data)
 
         _progress['current'] = len(tickers_needing_dividends)
         log.info(f"Screener Phase 2 complete: found dividends for {dividend_count} tickers")
@@ -397,8 +623,13 @@ def run_screener(index_name='all'):
     split_cache_days = get_provider_config().split_cache_days
     split_freshness_cutoff = (datetime.now() - timedelta(days=split_cache_days)).isoformat()
 
+    # One query for the whole universe instead of two connections per ticker,
+    # and it consults split_checks so tickers that have simply never split
+    # count as checked rather than being re-fetched every run.
+    last_checked_map = db.get_split_last_checked_bulk(tickers)
+
     def _needs_split_refresh(ticker):
-        last = db.get_split_history_last_updated(ticker)
+        last = last_checked_map.get(ticker)
         return not last or last < split_freshness_cutoff
 
     tickers_needing_splits = [t for t in tickers if _needs_split_refresh(t)]
@@ -412,6 +643,7 @@ def run_screener(index_name='all'):
 
         splits_found = 0
         orchestrator = get_orchestrator()
+        checked_tickers = []
 
         for i, ticker in enumerate(tickers_needing_splits):
             if not _running:
@@ -426,9 +658,15 @@ def run_screener(index_name='all'):
                     if result.data.splits:
                         db.upsert_splits(ticker, result.data.splits, source=result.source or 'unknown')
                         splits_found += 1
+                    # Remember the negative answer too. Without this, the ~30%
+                    # of the universe that has never split left no trace and
+                    # was re-fetched on every run despite the 7-day policy.
+                    checked_tickers.append(ticker)
             except Exception:
                 pass
-            time.sleep(SCREENER_DIVIDEND_BACKOFF)
+
+        if checked_tickers:
+            db.record_split_checks(checked_tickers)
 
         _progress['current'] = len(tickers_needing_splits)
         log.info(f"Screener Phase 2b complete: persisted splits for {splits_found} tickers")
@@ -736,12 +974,25 @@ def run_quick_price_update(index_name='all'):
 
     updated_count = 0
     try:
-        activity_log.log("info", "screener", f"Phase 1: Fetching 3mo history...")
         orchestrator = get_orchestrator()
-        history_results = orchestrator.fetch_price_history_batch(tickers, period='3mo')
-        activity_log.log("success", "screener", f"✓ 3mo history: {len(history_results)} tickers downloaded")
 
-        if not history_results:
+        # The 3-month history is only needed once per trading day (see
+        # _needs_history_refresh). Intraday runs do the cheap real-time pass
+        # only and keep the day's stored 1m/3m percentages.
+        fetched_history = _needs_history_refresh()
+        history_results = {}
+
+        if fetched_history:
+            activity_log.log("info", "screener", f"Phase 1: Fetching 3mo history...")
+            history_results = orchestrator.fetch_price_history_batch(tickers, period='3mo')
+            activity_log.log("success", "screener", f"✓ 3mo history: {len(history_results)} tickers downloaded")
+            if history_results:
+                db.set_metadata('last_history_update', datetime.now().isoformat())
+        else:
+            activity_log.log("info", "screener",
+                             "Phase 1: 3mo history already current for this session - skipped")
+
+        if fetched_history and not history_results:
             _progress['status'] = 'complete'
             _running = False
             return
@@ -784,9 +1035,18 @@ def run_quick_price_update(index_name='all'):
         except Exception as e:
             activity_log.log("warning", "screener", f"Real-time prices failed: {str(e)[:50]}")
 
-        # All price sources consulted — delisting bookkeeping
-        _reconcile_delistings(tickers,
-                              {t for t, p in current_prices_dict.items() if p and p > 0})
+        # All price sources consulted — delisting bookkeeping.
+        # Only when the history batch actually ran: it is the broader of the two
+        # sources, so scoring strikes on a real-time-only pass would delist any
+        # ticker the real-time providers don't cover after three 15-minute runs.
+        if fetched_history:
+            _reconcile_delistings(tickers,
+                                  {t for t, p in current_prices_dict.items() if p and p > 0})
+
+        # Name repair is a once-a-day maintenance chore, not per-cycle work:
+        # tie it to the same daily gate as the history batch.
+        repaired_names = _repair_company_names(
+            tickers, existing_valuations, orchestrator, enabled=fetched_history)
 
         activity_log.log("info", "screener", f"Phase 3: Building valuations...")
         valuations_batch = {}
@@ -828,16 +1088,10 @@ def run_quick_price_update(index_name='all'):
                         if sec_company_name and sec_company_name != ticker:
                             company_name = sec_company_name
 
-                # Try to refresh bad company names (where company_name == ticker)
-                if company_name == ticker:
-                    try:
-                        info_result = orchestrator.fetch_stock_info(ticker)
-                        if info_result.success and info_result.data:
-                            fetched_name = info_result.data.company_name
-                            if fetched_name and fetched_name != ticker:
-                                company_name = fetched_name
-                    except Exception:
-                        pass
+                # Names resolved above by _repair_company_names (rate-limited
+                # and backed off), rather than a live .info fetch per ticker
+                # per 15-minute cycle.
+                company_name = repaired_names.get(ticker, company_name)
 
                 off_high_pct = None
                 if fifty_two_week_high and fifty_two_week_high > 0:
@@ -847,8 +1101,12 @@ def run_quick_price_update(index_name='all'):
                     eps_avg, annual_dividend, current_price
                 )
 
-                pc_3m = price_change_3m.get(ticker) if ticker in price_change_3m.index else None
-                pc_1m = price_change_1m.get(ticker) if ticker in price_change_1m.index else None
+                # Fall back to the stored percentages when this run skipped the
+                # history batch, so an intraday pass never blanks them out.
+                pc_3m = (price_change_3m.get(ticker) if ticker in price_change_3m.index
+                         else existing.get('price_change_3m'))
+                pc_1m = (price_change_1m.get(ticker) if ticker in price_change_1m.index
+                         else existing.get('price_change_1m'))
 
                 in_selloff = False
                 selloff_severity = 'none'
@@ -940,8 +1198,25 @@ def run_smart_update(index_name='all'):
 
     activity_log.log("info", "screener", f"Smart Update: {len(missing_tickers)} new + {len(existing_tickers)} existing tickers")
 
-    # Phase 1: Fetch full valuations for missing tickers
-    activity_log.log("info", "screener", f"Phase 1: Fetching full data for {len(missing_tickers)} new tickers...")
+    # Phase 1: Fetch full valuations for missing tickers.
+    # Prices come from ONE batched call for the whole missing set; only the
+    # genuinely per-ticker work (EPS/dividends/splits inside calculate_valuation)
+    # stays in the loop. Previously every new ticker cost ~7 serial network
+    # calls plus a fixed 0.5s sleep.
+    if missing_tickers:
+        activity_log.log("info", "screener", f"Phase 1: Fetching full data for {len(missing_tickers)} new tickers...")
+        try:
+            # Warms the price cache so calculate_valuation's price lookup is a
+            # cache hit rather than a per-ticker provider round trip.
+            get_orchestrator().fetch_prices(missing_tickers, skip_cache=True)
+        except Exception as e:
+            activity_log.log("warning", "screener",
+                             f"Batch price warm-up failed: {str(e)[:50]}")
+
+    # Rows this run actually modifies, so the final write touches only those.
+    modified_valuations = {}
+
+    new_successes, new_failures = [], []
     for i, ticker in enumerate(missing_tickers):
         if not _running:
             _progress['status'] = 'cancelled'
@@ -958,17 +1233,26 @@ def run_smart_update(index_name='all'):
         valuation = calculate_valuation(ticker)
         if valuation and valuation.get('current_price', 0) > 0:
             data['valuations'][ticker] = valuation
-            db.record_price_successes([ticker])
-            if (i + 1) % 10 == 0:
+            modified_valuations[ticker] = valuation
+            new_successes.append(ticker)
+            if (i + 1) % 100 == 0:
                 save_index_data(index_name, data)
         else:
             # One strike — a single failed fetch must not permanently
             # delist a brand-new ticker (nothing ever retried them).
-            db.record_price_failures([ticker], threshold=FAILURE_THRESHOLD)
+            new_failures.append(ticker)
 
-        time.sleep(SCREENER_TICKER_PAUSE)
+        # No fixed sleep: the orchestrator's per-provider rate limiter already
+        # paces every network call calculate_valuation makes.
 
-    activity_log.log("success", "screener", f"✓ Phase 1: New tickers processed")
+    # Batched delist bookkeeping instead of one to two connections per ticker.
+    if new_successes:
+        db.record_price_successes(new_successes)
+    if new_failures:
+        db.record_price_failures(new_failures, threshold=FAILURE_THRESHOLD)
+
+    if missing_tickers:
+        activity_log.log("success", "screener", f"✓ Phase 1: New tickers processed")
 
     # Phase 2: Quick price update for existing tickers
     if _running and existing_tickers:
@@ -1058,7 +1342,7 @@ def run_smart_update(index_name='all'):
                             in_selloff = True
                             selloff_severity = 'recent'
 
-                        data['valuations'][ticker] = {
+                        row = {
                             **existing,
                             'ticker': ticker,
                             'current_price': round(current_price, 2),
@@ -1072,6 +1356,8 @@ def run_smart_update(index_name='all'):
                             'selloff_severity': selloff_severity,
                             'updated': datetime.now().isoformat()
                         }
+                        data['valuations'][ticker] = row
+                        modified_valuations[ticker] = row
                     except Exception:
                         continue
 
@@ -1084,14 +1370,20 @@ def run_smart_update(index_name='all'):
             except Exception:
                 pass
 
-    if data.get('valuations'):
-        data_manager.bulk_update_valuations(data['valuations'])
+    # Write ONLY the rows this run actually changed. Passing the whole loaded
+    # dict re-upserted every row in the index - stamping `updated` on thousands
+    # of untouched tickers, which both wasted the write and falsified per-row
+    # freshness for every staleness check that reads it.
+    if modified_valuations:
+        data_manager.bulk_update_valuations(modified_valuations)
 
     if index_name != 'all':
         save_index_data(index_name, data)
 
     total_duration = time.time() - start_time
-    activity_log.log("success", "screener", f"✓ Smart Update complete in {total_duration:.1f}s")
+    activity_log.log("success", "screener",
+                     f"✓ Smart Update complete in {total_duration:.1f}s "
+                     f"({len(modified_valuations)} rows written)")
     log.info(f"=== SMART UPDATE COMPLETE for '{index_name}' in {total_duration:.1f}s ===")
 
     # Update staleness metadata
@@ -1387,15 +1679,43 @@ def _fetch_52_week_data(tickers, progress_callback=None):
     # Get existing valuations to check which tickers need 52-week data
     existing_valuations = data_manager.load_valuations().get('valuations', {})
 
-    # Filter to tickers that don't have 52-week data
+    # Select tickers to fetch. Previously this took every ticker with no stored
+    # high - which meant tickers that had FAILED were retried on every run
+    # (including every 15-minute scheduled refresh) with no backoff, while
+    # tickers that succeeded were never refreshed again even years later.
+    checks = db.get_fetch_checks('52w', tickers)
+    now = datetime.now()
+    refresh_cutoff = now - timedelta(days=FIFTY_TWO_WEEK_REFRESH_DAYS)
+    retry_cutoff = now - timedelta(days=FIFTY_TWO_WEEK_RETRY_DAYS)
+
+    def _checked_at(ticker):
+        stamp = (checks.get(ticker) or {}).get('checked_at')
+        if not stamp:
+            return None
+        try:
+            return datetime.fromisoformat(stamp)
+        except (ValueError, TypeError):
+            return None
+
     tickers_needing_data = []
     for ticker in tickers:
         existing = existing_valuations.get(ticker, {})
-        if not existing.get('fifty_two_week_high'):
+        has_value = bool(existing.get('fifty_two_week_high'))
+        checked_at = _checked_at(ticker)
+        last_ok = (checks.get(ticker) or {}).get('ok')
+
+        if has_value:
+            # Refresh on a cadence: a 52-week high genuinely moves over time.
+            if checked_at is None or checked_at < refresh_cutoff:
+                tickers_needing_data.append(ticker)
+        else:
+            # No value yet. Back off if we tried recently and it failed.
+            if checked_at is not None and not last_ok and checked_at > retry_cutoff:
+                continue
             tickers_needing_data.append(ticker)
 
     if not tickers_needing_data:
-        activity_log.log("info", "screener", "All tickers already have 52-week data")
+        activity_log.log("info", "screener", "52-week data current for all tickers")
         return results
 
     activity_log.log("info", "screener", f"Fetching 52-week data for {len(tickers_needing_data)} tickers...")
@@ -1404,6 +1724,7 @@ def _fetch_52_week_data(tickers, progress_callback=None):
     _progress['current'] = 0
     _progress['total'] = len(tickers_needing_data)
 
+    attempted = []
     for i, ticker in enumerate(tickers_needing_data):
         if not _running:
             activity_log.log("info", "screener", "52-week fetch cancelled")
@@ -1412,10 +1733,7 @@ def _fetch_52_week_data(tickers, progress_callback=None):
         _progress['current'] = i + 1
         _progress['ticker'] = f"52-week: {ticker}"
 
-        # Rate limiting - delay between calls
-        if i > 0:
-            time.sleep(0.5)
-
+        attempted.append(ticker)
         try:
             info_result = orchestrator.fetch_stock_info(ticker)
             if info_result.success and info_result.data:
@@ -1430,6 +1748,16 @@ def _fetch_52_week_data(tickers, progress_callback=None):
         except Exception as e:
             activity_log.log("warning", "screener", f"52-week fetch failed for {ticker}: {str(e)[:30]}")
             continue
+
+    # Record what we attempted so successes refresh on a cadence and failures
+    # back off, rather than every failing ticker being retried on every run.
+    # (The orchestrator's provider rate limiter paces the loop above; the old
+    # fixed 0.5s sleep per ticker stacked on top of it.)
+    if attempted:
+        succeeded = [t for t in attempted if t in results]
+        failed = [t for t in attempted if t not in results]
+        db.record_fetch_checks('52w', succeeded, ok=True)
+        db.record_fetch_checks('52w', failed, ok=False)
 
     # Update database with 52-week data
     if results:

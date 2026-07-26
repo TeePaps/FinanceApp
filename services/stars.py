@@ -15,11 +15,15 @@ Missing data → criterion unearned (0 stars), never an error. Stars are
 persisted to the `star_ratings` table for fast tab loads.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Set
 
 import database as db
-from config import DEBT_TO_CAPITAL_THRESHOLD
+from config import (
+    DEBT_TO_CAPITAL_THRESHOLD,
+    BALANCE_SHEET_REFRESH_DAYS, SHARES_OUTSTANDING_REFRESH_DAYS,
+    ANALYST_ESTIMATE_REFRESH_DAYS, STALENESS_DIVIDEND_FRESH_DAYS,
+)
 from services.activity_log import activity_log
 from services.providers import get_orchestrator
 from services.providers.yfinance_provider import fetch_yearly_dividends
@@ -44,15 +48,50 @@ def _holdings_ticker_set() -> Set[str]:
 # Criterion 1: Earnings Beat
 # -----------------------------------------------------------------------------
 
+def _get_analyst_estimate(ticker: str, force: bool = False) -> Optional[Dict]:
+    """Consensus/actual EPS for a ticker, served from cache when fresh.
+
+    These only change when a company reports, but were fetched live from
+    yfinance for every ticker on every star run and again for every Company
+    Profile view. Cached in the analyst_estimates table with a TTL.
+    """
+    if not force:
+        cached = db.get_analyst_estimate(ticker)
+        if cached and _is_fresh(cached.get('fetched_at'), ANALYST_ESTIMATE_REFRESH_DAYS):
+            return cached
+
+    try:
+        result = get_orchestrator().fetch_analyst_estimates(ticker)
+    except Exception:
+        return db.get_analyst_estimate(ticker)
+
+    if not result.success or not result.data:
+        # Fall back to whatever we already had rather than losing it.
+        return db.get_analyst_estimate(ticker)
+
+    data = result.data
+    record = {
+        'eps_actual': data.eps_actual,
+        'eps_estimate': data.eps_estimate,
+        'period_end': getattr(data, 'period_end', None),
+        'source': result.source,
+    }
+    try:
+        db.save_analyst_estimate(ticker, record['eps_actual'], record['eps_estimate'],
+                                 record['period_end'], record['source'])
+    except Exception:
+        pass
+    return record
+
+
 def _check_earnings_beat(ticker: str) -> bool:
     """Star earned when most recent reported EPS > prior consensus estimate."""
     try:
-        orch = get_orchestrator()
-        result = orch.fetch_analyst_estimates(ticker)
-        if not result.success or not result.data:
+        record = _get_analyst_estimate(ticker)
+        if not record:
             return False
-        actual = result.data.eps_actual
-        estimate = result.data.eps_estimate
+        actual = record.get('eps_actual')
+        estimate = record.get('eps_estimate')
         if actual is None or estimate is None:
             return False
         return actual > estimate
@@ -246,9 +285,55 @@ def _snapshot_today(ticker: str, valuation: Dict, yearly_dividends: Dict[int, fl
         db.snapshot_dividend_year(ticker, current_year - 1, prior_year_div)
 
 
-def _refresh_balance_sheet(ticker: str):
-    """Fetch + persist the latest balance sheet. Silent on failure."""
+def _is_fresh(stamp: Optional[str], max_age_days: int) -> bool:
+    """Is an ISO timestamp younger than max_age_days?"""
+    if not stamp:
+        return False
     try:
+        return datetime.now() - datetime.fromisoformat(stamp) < timedelta(days=max_age_days)
+    except (ValueError, TypeError):
+        return False
+
+
+def _get_yearly_dividends(ticker: str, force: bool = False) -> Dict[int, float]:
+    """Calendar-year dividend totals, served from stored history when fresh.
+
+    Only the current and prior year are ever consulted, and both are persisted
+    by _snapshot_today. Refetching the series for every ticker on every star
+    run duplicated work the screener's dividend phase had already done.
+    """
+    if not force:
+        checks = db.get_fetch_checks('yearly_dividends', [ticker])
+        stamp = (checks.get(ticker.upper()) or {}).get('checked_at')
+        if _is_fresh(stamp, STALENESS_DIVIDEND_FRESH_DAYS):
+            stored = db.get_dividend_history(ticker)
+            current_year = datetime.now().year
+            # Only trust the cache if it actually covers the years we compare.
+            if stored and current_year - 1 in stored:
+                return stored
+
+    yearly = fetch_yearly_dividends(ticker)
+    db.record_fetch_checks('yearly_dividends', [ticker], ok=bool(yearly))
+    if not yearly:
+        # Preserve whatever history we already have rather than returning {}.
+        return db.get_dividend_history(ticker) or {}
+    return yearly
+
+
+def _refresh_balance_sheet(ticker: str, force: bool = False):
+    """Fetch + persist the latest balance sheet. Silent on failure.
+
+    Balance-sheet figures come from 10-K/10-Q filings and change quarterly at
+    most, but this ran unconditionally for every ticker on every star run -
+    downloading the ticker's full SEC companyfacts document each time. The
+    stored `updated` stamp now gates it.
+    """
+    try:
+        if not force:
+            existing = db.get_balance_sheet(ticker)
+            if existing and _is_fresh(existing.get('updated'), BALANCE_SHEET_REFRESH_DAYS):
+                return
+
         result = get_orchestrator().fetch_balance_sheet(ticker)
         if not result.success or not result.data:
             return
@@ -272,18 +357,38 @@ def _refresh_balance_sheet(ticker: str):
         pass
 
 
-def _refresh_shares_outstanding(ticker: str):
-    """Fetch + persist shares-outstanding history. Silent on failure."""
+def _refresh_shares_outstanding(ticker: str, force: bool = False):
+    """Fetch + persist shares-outstanding history. Silent on failure.
+
+    Only the share-buyback criterion reads this, and that criterion only
+    applies to holdings - so the caller restricts it to held tickers. Gated on
+    a stored check stamp because the underlying SEC data changes quarterly.
+    """
     try:
+        if not force:
+            checks = db.get_fetch_checks('shares_outstanding', [ticker])
+            stamp = (checks.get(ticker.upper()) or {}).get('checked_at')
+            if _is_fresh(stamp, SHARES_OUTSTANDING_REFRESH_DAYS):
+                return
+
         result = get_orchestrator().fetch_shares_outstanding(ticker)
+        db.record_fetch_checks('shares_outstanding', [ticker],
+                               ok=bool(result.success and result.data))
         if not result.success or not result.data:
             return
+
+        # Batch the history rows into one transaction instead of opening a
+        # connection and committing per row (a single filer can carry decades
+        # of entries).
+        rows = []
         for entry in result.data.history or []:
             date = entry.get('date')
             shares = entry.get('shares')
             if not date or shares is None:
                 continue
-            db.snapshot_shares_outstanding(ticker, date, shares, source=entry.get('source'))
+            rows.append((date, shares, entry.get('source')))
+        if rows:
+            db.snapshot_shares_outstanding_bulk(ticker, rows)
     except Exception:
         pass
 
@@ -364,12 +469,19 @@ def calculate_all_star_ratings(tickers=None, progress_callback=None) -> int:
         valuation = valuations.get(ticker, {})
         is_holding = ticker in holdings
 
-        # Refresh external data sources (writes to balance_sheet + shares_outstanding_history)
+        # Refresh external data sources (writes to balance_sheet + shares_outstanding_history).
+        # Both are staleness-gated; shares outstanding is fetched only for
+        # holdings because the buyback criterion is the sole reader and it is
+        # holdings-only, yet this used to pull decades of SEC share history for
+        # every ticker in the universe.
         _refresh_balance_sheet(ticker)
-        _refresh_shares_outstanding(ticker)
+        if is_holding:
+            _refresh_shares_outstanding(ticker)
 
-        # Pull yfinance dividend history once (needed for criteria 2 + 3)
-        yearly_divs = fetch_yearly_dividends(ticker)
+        # Yearly dividend totals (needed for criteria 2 + 3), staleness-gated:
+        # this used to re-download the ticker's dividend series on every run,
+        # duplicating what the screener's dividend phase had just fetched.
+        yearly_divs = _get_yearly_dividends(ticker)
 
         first_buy = db.get_first_buy_date(ticker) if is_holding else None
 
@@ -398,8 +510,31 @@ def calculate_all_star_ratings(tickers=None, progress_callback=None) -> int:
     if ratings_batch:
         db.bulk_update_star_ratings(ratings_batch)
 
+    _prune_history_tables(holdings)
+
     activity_log.log("success", "stars", f"Star ratings computed for {processed} tickers")
     return processed
+
+
+def _prune_history_tables(holdings: Set[str]):
+    """Apply retention to the append-only tables this phase writes.
+
+    valuation_history gains a row per ticker per run-day forever, and
+    shares_outstanding_history stores a filer's entire reported share history -
+    while the readers of both need only a couple of rows each. Without this
+    they grow without bound for the lifetime of the database.
+    """
+    try:
+        first_buys = {t: db.get_first_buy_date(t) for t in holdings}
+        removed_shares = db.prune_shares_outstanding_history(first_buys)
+        removed_valuations = db.prune_valuation_history()
+        if removed_shares or removed_valuations:
+            activity_log.log(
+                "info", "stars",
+                f"Retention: pruned {removed_valuations} valuation-history and "
+                f"{removed_shares} shares-history rows")
+    except Exception as e:
+        activity_log.log("warning", "stars", f"History pruning skipped: {str(e)[:60]}")
 
 
 # -----------------------------------------------------------------------------
@@ -441,20 +576,19 @@ def _fmt_shares(v):
 
 
 def _explain_earnings_beat(ticker):
-    try:
-        result = get_orchestrator().fetch_analyst_estimates(ticker)
-    except Exception:
-        result = None
-    if not result or not result.success or not result.data:
+    # Cache-first (see _get_analyst_estimate) - this used to fire a live
+    # yfinance call on every Company Profile view.
+    record = _get_analyst_estimate(ticker)
+    if not record:
         return {
             'earned': False,
             'summary': None,
             'note': 'No analyst estimate data available',
             'values': {},
         }
-    actual = result.data.eps_actual
-    estimate = result.data.eps_estimate
-    period = result.data.period_end
+    actual = record.get('eps_actual')
+    estimate = record.get('eps_estimate')
+    period = record.get('period_end')
     if actual is None or estimate is None:
         return {
             'earned': False,
@@ -698,7 +832,9 @@ def explain_stars(ticker: str, valuation_override: Optional[Dict] = None) -> Dic
         valuation = cached
     is_holding = ticker in _holdings_ticker_set()
     first_buy = db.get_first_buy_date(ticker) if is_holding else None
-    yearly_divs = fetch_yearly_dividends(ticker)
+    # Cache-first: opening a Company Profile used to trigger a fresh dividend
+    # download even though the star phase had already fetched the same series.
+    yearly_divs = _get_yearly_dividends(ticker)
 
     criteria_rows = [
         {'num': 1, 'key': 'earnings_beat',       'name': 'Earnings Beat',

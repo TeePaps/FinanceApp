@@ -330,8 +330,10 @@ function initTickerAutocomplete() {
     const dropdown = document.getElementById('ticker-autocomplete');
     if (!input || !dropdown) return;
 
-    // Fetch ticker list for autocomplete
-    fetch('/api/all-tickers')
+    // Fetch ticker list for autocomplete. Only the symbol and name are used
+    // for matching, so request just those two columns rather than the full
+    // Data Sets payload (which this used to download in its entirety).
+    fetch('/api/all-tickers?fields=ticker,company_name')
         .then(res => res.json())
         .then(data => {
             tickerCache = data.tickers || [];
@@ -439,10 +441,11 @@ function selectAutocompleteItem(ticker) {
 
 document.addEventListener('DOMContentLoaded', function() {
     loadStocks();
-    loadHoldings();
-    loadSummary();
     setupForms();
     initTheme();
+    // restoreTabFromHash() shows a tab, and showTab() loads that tab's data.
+    // Calling loadHoldings()/loadSummary() here as well meant the initial tab
+    // fetched its data twice on every page load.
     restoreTabFromHash();
     loadGlobalLastUpdated();
     loadStalenessDashboard();
@@ -450,7 +453,10 @@ document.addEventListener('DOMContentLoaded', function() {
     loadIndices();  // Populate index dropdowns from API
 });
 
-// Handle browser back/forward buttons
+// Handle browser back/forward buttons.
+// showTab() writes the hash itself, which fires this event, so without the
+// guard in restoreTabFromHash() every tab switch re-ran the tab's loaders and
+// fetched all of its data a second time.
 window.addEventListener('hashchange', function() {
     restoreTabFromHash();
 });
@@ -573,13 +579,17 @@ async function loadStalenessDashboard() {
     }
 }
 
-// Restore tab from URL hash on page load/refresh
+// Restore tab from URL hash on page load/refresh.
+// Always resolves to a tab (defaulting to 'summary') so showTab() is the one
+// place that decides what the initial view loads.
 function restoreTabFromHash() {
     const hash = window.location.hash.slice(1); // Remove the #
     const validTabs = ['summary', 'holdings', 'profit', 'add', 'research', 'screener', 'recommendations', 'datasets'];
-    if (hash && validTabs.includes(hash)) {
-        showTab(hash);
-    }
+    const target = hash && validTabs.includes(hash) ? hash : 'summary';
+    // Already showing it (we got here from showTab's own hash write) - the
+    // data has just been loaded, so don't load it all over again.
+    if (target === activeTab) return;
+    showTab(target);
 }
 
 // Theme toggle
@@ -605,7 +615,13 @@ function updateThemeIcon(theme) {
 }
 
 // Tab navigation
+// The tab currently displayed, so the hashchange handler can tell a real
+// navigation from the echo of showTab's own hash write.
+let activeTab = null;
+
 function showTab(tabName) {
+    activeTab = tabName;
+
     // Hide all tabs
     document.querySelectorAll('.tab-content').forEach(tab => {
         tab.classList.remove('active');
@@ -1910,8 +1926,10 @@ function resetRefreshButton() {
 
 function reloadCurrentView() {
     const nowTab = window.location.hash.slice(1) || 'summary';
+    // Reached after an update run, so any cached screener payload is stale.
+    invalidateScreenerCache();
     if (nowTab === 'screener') {
-        loadScreener();
+        loadScreener({ force: true });
     } else if (nowTab === 'datasets') {
         loadDatasets();
     } else if (nowTab === 'research') {
@@ -2729,16 +2747,40 @@ function changeIndex(indexName) {
     loadScreener();
 }
 
-async function loadScreener() {
+// Screener payloads keyed by index. Switching indexes (or returning to the
+// tab) used to re-download the whole universe every time; render the cached
+// copy immediately, then refresh in the background so the view stays current.
+const screenerCache = new Map();
+
+async function loadScreener(options = {}) {
+    const indexName = currentIndex;
+    const cached = screenerCache.get(indexName);
+
+    if (cached && !options.force) {
+        renderScreener(cached);
+    }
+
     try {
-        const response = await fetch(`/api/screener?index=${currentIndex}`);
+        const response = await fetch(`/api/screener?index=${indexName}`);
         const data = await response.json();
-        renderScreener(data);
-        checkScreenerProgress();
-        loadSecStatus();
+        screenerCache.set(indexName, data);
+
+        // Only paint if the user hasn't switched indexes while we waited.
+        if (currentIndex === indexName) {
+            renderScreener(data);
+            checkScreenerProgress();
+        }
+        // loadSecStatus() used to run here on every index switch, and
+        // renderSecStatus discards the response entirely - it belongs to the
+        // datasets view, which loads it itself.
     } catch (error) {
         console.error('Error loading screener:', error);
     }
+}
+
+// Screener runs change the underlying data, so drop the cached payloads.
+function invalidateScreenerCache() {
+    screenerCache.clear();
 }
 
 function renderScreener(data) {
@@ -3229,7 +3271,8 @@ async function checkScreenerProgress() {
             // This prevents infinite loop when status is already 'complete'
             if (wasScreenerRunning && progress.status === 'complete') {
                 wasScreenerRunning = false;
-                loadScreener();
+                invalidateScreenerCache();
+                loadScreener({ force: true });
             }
         }
     } catch (error) {

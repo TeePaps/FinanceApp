@@ -30,6 +30,31 @@ def api_sec_status():
     })
 
 
+@sec_bp.route('/sec/eps-frames', methods=['POST'])
+def api_sec_eps_frames():
+    """Bulk-fill missing annual EPS using the SEC XBRL frames API.
+
+    One request per concept per year covers every filer, replacing a
+    per-company companyfacts crawl. Gap-filling only - years already stored
+    from per-company data are left untouched.
+
+    Body (all optional): {"tickers": [...], "years": 8}
+    """
+    import sec_data
+
+    req_data = request.get_json(silent=True) or {}
+    tickers = req_data.get('tickers')
+    years = req_data.get('years')
+
+    if not tickers:
+        tickers = list(data_manager.load_valuations().get('valuations', {}).keys())
+    if not tickers:
+        return jsonify({'success': False, 'error': 'No tickers to update'}), 400
+
+    stats = sec_data.refresh_eps_from_frames(tickers=tickers, years=years)
+    return jsonify({'success': True, **stats})
+
+
 @sec_bp.route('/sec/update', methods=['POST'])
 def api_sec_update():
     """Start SEC data update for tickers."""

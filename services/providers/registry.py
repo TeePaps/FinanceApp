@@ -224,6 +224,19 @@ class DataOrchestrator:
         """Get the circuit breaker instance."""
         return get_circuit_breaker()
 
+    def _provider_timeout(self, provider: BaseProvider) -> float:
+        """Timeout budget for one call to `provider`.
+
+        A provider whose own request timeout exceeds the orchestrator default
+        gets the larger value: SEC allows 30s per request but the orchestrator
+        gave up at 10s, so large companyfacts downloads were abandoned in
+        flight - the bytes were still transferred, the result thrown away, and
+        the provider charged a circuit-breaker failure for succeeding slowly.
+        """
+        default = self.config.provider_timeout_seconds
+        own = getattr(provider, 'request_timeout', 0) or 0
+        return max(default, own)
+
     def _execute_with_timeout(
         self,
         func: Callable,
@@ -307,9 +320,8 @@ class DataOrchestrator:
         # Parse timestamp and check if still valid
         try:
             updated = datetime.fromisoformat(updated_str)
-            max_age = self._get_cache_max_age(DataType.PRICE)
 
-            if datetime.now() - updated < max_age:
+            if self._price_is_current(updated):
                 return ProviderResult(
                     success=True,
                     data=current_price,
@@ -322,6 +334,24 @@ class DataOrchestrator:
 
         return None
 
+    def _price_is_current(self, updated: datetime) -> bool:
+        """Is a price written at `updated` still the latest price?
+
+        Inside market hours the TTL governs. Outside them prices cannot change
+        until the next open, so anything captured after the most recent close
+        stays current however long the app sits idle - which is what stopped
+        overnight and weekend page loads from re-fetching the whole universe
+        every hour for values that were guaranteed identical.
+        """
+        from services.utils import is_market_open, last_market_close
+
+        now = datetime.now()
+
+        if not is_market_open() and updated >= last_market_close():
+            return True
+
+        return now - updated < self._get_cache_max_age(DataType.PRICE)
+
     def _save_price_to_cache(self, ticker: str, price: float, source: str):
         """Save price to database cache.
 
@@ -331,6 +361,21 @@ class DataOrchestrator:
         """
         import database as db
         db.update_price_cache(ticker, price, source)
+
+    def _save_prices_to_cache(self, prices: Dict[str, tuple]):
+        """Save many prices in ONE transaction.
+
+        Column-scoped like _save_price_to_cache, but batched: the per-ticker
+        version opened a connection and committed for every ticker in a batch
+        fetch.
+
+        Args:
+            prices: {ticker: (price, source)}
+        """
+        if not prices:
+            return
+        import database as db
+        db.bulk_update_price_cache(prices)
 
     def _get_cached(self, data_type: DataType, ticker: str) -> Optional[ProviderResult]:
         """Get cached data - stub for EPS/dividend (not database cached yet)."""
@@ -350,6 +395,12 @@ class DataOrchestrator:
 
     def _rate_limit(self, provider: BaseProvider):
         """Apply rate limiting for a provider."""
+        # Providers that pace themselves own their spacing entirely. Applying
+        # this sleep too meant SEC calls were throttled twice (halving usable
+        # throughput) and that even a pure cache hit paid a sleep.
+        if getattr(provider, 'self_rate_limited', False):
+            return
+
         if provider.rate_limit <= 0:
             return
 
@@ -408,7 +459,8 @@ class DataOrchestrator:
 
                 # Execute with timeout
                 result = self._execute_with_timeout(
-                    lambda p=provider, t=ticker: p.fetch_price(t)
+                    lambda p=provider, t=ticker: p.fetch_price(t),
+                    timeout_seconds=self._provider_timeout(provider)
                 )
 
                 if result.success:
@@ -532,22 +584,43 @@ class DataOrchestrator:
                         except ImportError:
                             pass
 
-                    # Use longer timeout for batch (scales with ticker count)
-                    batch_timeout = self.config.provider_timeout_seconds * max(1, len(remaining) // 50)
-                    batch_results = self._execute_with_timeout(
-                        lambda p=provider, t=remaining: p.fetch_prices(t),
-                        timeout_seconds=batch_timeout
-                    )
-
+                    # Chunk the request rather than passing the entire ticker
+                    # list into ONE timed call. Providers chunk internally with
+                    # inter-chunk sleeps, so a whole-universe fetch could run
+                    # for minutes inside a single future - and a timeout at the
+                    # last chunk discarded every result already downloaded.
+                    # Chunking here means a stall costs one chunk, and it makes
+                    # config.batch_size live instead of dead configuration.
+                    batch_size = max(1, self.config.batch_size or 100)
                     success_count = 0
-                    for ticker, result in batch_results.items():
-                        if result.success and result.data is not None:
-                            results[ticker] = result.data
-                            sources[ticker] = provider.name
-                            self._save_price_to_cache(ticker, result.data, provider.name)
-                            if ticker in remaining:
-                                remaining.remove(ticker)
-                            success_count += 1
+
+                    for chunk in [remaining[i:i + batch_size]
+                                  for i in range(0, len(remaining), batch_size)]:
+                        chunk_timeout = self.config.provider_timeout_seconds * max(
+                            1, len(chunk) // 50)
+                        try:
+                            batch_results = self._execute_with_timeout(
+                                lambda p=provider, t=chunk: p.fetch_prices(t),
+                                timeout_seconds=chunk_timeout
+                            )
+                        except TimeoutError:
+                            # Keep the chunks that already landed; the next
+                            # provider in the chain retries what's left.
+                            continue
+
+                        to_cache = {}
+                        for ticker, result in batch_results.items():
+                            if result.success and result.data is not None:
+                                results[ticker] = result.data
+                                sources[ticker] = provider.name
+                                to_cache[ticker] = (result.data, provider.name)
+                                success_count += 1
+
+                        # One transaction per chunk instead of a connection +
+                        # commit per ticker.
+                        self._save_prices_to_cache(to_cache)
+
+                    remaining = [t for t in remaining if t not in results]
 
                     # Log batch results - only log for large batches (screener operations)
                     if len(tickers) > 5:
@@ -571,17 +644,19 @@ class DataOrchestrator:
                     still_remaining = []
                     success_count = 0
                     attempted = len(remaining)  # what THIS provider tries (post-cache)
+                    to_cache = {}
 
                     for ticker in remaining:
                         try:
                             result = self._execute_with_timeout(
-                                lambda p=provider, t=ticker: p.fetch_price(t)
+                                lambda p=provider, t=ticker: p.fetch_price(t),
+                                timeout_seconds=self._provider_timeout(provider)
                             )
 
                             if result.success and result.data is not None:
                                 results[ticker] = result.data
                                 sources[ticker] = provider.name
-                                self._save_price_to_cache(ticker, result.data, provider.name)
+                                to_cache[ticker] = (result.data, provider.name)
                                 success_count += 1
                             else:
                                 still_remaining.append(ticker)
@@ -593,6 +668,7 @@ class DataOrchestrator:
 
                         self._rate_limit(provider)
 
+                    self._save_prices_to_cache(to_cache)
                     remaining = still_remaining
 
                     # Record overall success/failure
@@ -662,7 +738,8 @@ class DataOrchestrator:
 
                 # Execute with timeout
                 result = self._execute_with_timeout(
-                    lambda p=provider, t=ticker: p.fetch_eps(t)
+                    lambda p=provider, t=ticker: p.fetch_eps(t),
+                    timeout_seconds=self._provider_timeout(provider)
                 )
 
                 if result.success:
@@ -729,7 +806,8 @@ class DataOrchestrator:
 
                 # Execute with timeout
                 result = self._execute_with_timeout(
-                    lambda p=provider, t=ticker: p.fetch_dividends(t)
+                    lambda p=provider, t=ticker: p.fetch_dividends(t),
+                    timeout_seconds=self._provider_timeout(provider)
                 )
 
                 if result.success:
@@ -847,7 +925,8 @@ class DataOrchestrator:
                 self._rate_limit(provider)
 
                 result = self._execute_with_timeout(
-                    lambda p=provider, t=ticker: p.fetch_splits(t)
+                    lambda p=provider, t=ticker: p.fetch_splits(t),
+                    timeout_seconds=self._provider_timeout(provider)
                 )
 
                 if result.success:
@@ -904,7 +983,8 @@ class DataOrchestrator:
 
                 # Execute with timeout
                 result = self._execute_with_timeout(
-                    lambda p=provider, t=ticker: p.fetch_stock_info(t)
+                    lambda p=provider, t=ticker: p.fetch_stock_info(t),
+                    timeout_seconds=self._provider_timeout(provider)
                 )
 
                 if result.success:
@@ -965,7 +1045,8 @@ class DataOrchestrator:
 
                 # Execute with timeout
                 result = self._execute_with_timeout(
-                    lambda p=provider, t=ticker: p.fetch_selloff(t)
+                    lambda p=provider, t=ticker: p.fetch_selloff(t),
+                    timeout_seconds=self._provider_timeout(provider)
                 )
 
                 if result.success:
@@ -1030,7 +1111,8 @@ class DataOrchestrator:
 
                 # Execute with timeout
                 result = self._execute_with_timeout(
-                    lambda p=provider, t=ticker, per=period: p.fetch_price_history(t, per)
+                    lambda p=provider, t=ticker, per=period: p.fetch_price_history(t, per),
+                    timeout_seconds=self._provider_timeout(provider)
                 )
 
                 if result.success:
@@ -1148,7 +1230,8 @@ class DataOrchestrator:
                     for ticker in remaining:
                         try:
                             result = self._execute_with_timeout(
-                                lambda p=provider, t=ticker, per=period: p.fetch_price_history(t, per)
+                                lambda p=provider, t=ticker, per=period: p.fetch_price_history(t, per),
+                                timeout_seconds=self._provider_timeout(provider)
                             )
 
                             if result.success:

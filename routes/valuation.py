@@ -19,25 +19,100 @@ from datetime import datetime, timedelta
 valuation_bp = Blueprint('valuation', __name__, url_prefix='/api')
 
 
+# Computed valuation payloads, keyed by ticker: {ticker: (computed_at, payload)}.
+#
+# Deliberately memoizes the FULL calculate_valuation() result rather than
+# serving the stored valuations row - the row lacks eps_data, split_warning,
+# selloff, formula and several other keys the Company Profile page renders, so
+# returning it would change the response shape. Bounded and short-lived; the
+# point is to collapse repeat views of the same ticker (and every view while
+# the market is closed), each of which otherwise re-ran the whole provider
+# chain for values that cannot have changed.
+_VALUATION_MEMO = {}
+_VALUATION_MEMO_LOCK = threading.Lock()
+_VALUATION_MEMO_MAX = 64
+
+
+def _valuation_still_current(computed_at):
+    """Same freshness rule as the orchestrator's price cache."""
+    from config import PRICE_CACHE_DURATION
+
+    try:
+        from services.utils import is_market_open, last_market_close
+        if not is_market_open() and computed_at >= last_market_close():
+            return True
+    except Exception:
+        pass
+
+    return datetime.now() - computed_at < timedelta(seconds=PRICE_CACHE_DURATION)
+
+
+def _fresh_cached_valuation(ticker):
+    """Return a recently computed valuation payload, or None."""
+    with _VALUATION_MEMO_LOCK:
+        entry = _VALUATION_MEMO.get(ticker)
+    if not entry:
+        return None
+
+    computed_at, payload = entry
+    if not _valuation_still_current(computed_at):
+        with _VALUATION_MEMO_LOCK:
+            _VALUATION_MEMO.pop(ticker, None)
+        return None
+    return payload
+
+
+def _remember_valuation(ticker, payload):
+    with _VALUATION_MEMO_LOCK:
+        _VALUATION_MEMO[ticker] = (datetime.now(), payload)
+        while len(_VALUATION_MEMO) > _VALUATION_MEMO_MAX:
+            _VALUATION_MEMO.pop(next(iter(_VALUATION_MEMO)))
+
+
+def invalidate_valuation_memo(ticker=None):
+    """Drop memoized payloads (after a refresh or a screener run)."""
+    with _VALUATION_MEMO_LOCK:
+        if ticker:
+            _VALUATION_MEMO.pop(ticker.upper(), None)
+        else:
+            _VALUATION_MEMO.clear()
+
+
 @valuation_bp.route('/valuation/<ticker>')
 def api_valuation(ticker):
     """Calculate stock valuation using EPS and dividend formula.
+
+    Cache-first: clicking a screener row used to re-derive the valuation from
+    several live provider calls even though the row had just been rendered
+    from stored data. A cached row whose price is still within the price TTL
+    is served directly; pass ?refresh=1 to force a recalculation.
 
     Also lazy-writes the result to the cache so the Stars tab and the
     /api/stars/<ticker>/explanation endpoint see the same data. New / stale
     tickers no longer display "missing X" rows on the Company Profile page.
     """
-    result = calculate_valuation(ticker.upper())
+    ticker = ticker.upper()
+    force = request.args.get('refresh') in ('1', 'true', 'yes')
+
+    if force:
+        invalidate_valuation_memo(ticker)
+    else:
+        cached = _fresh_cached_valuation(ticker)
+        if cached is not None:
+            return jsonify(cached)
+
+    result = calculate_valuation(ticker)
     # Lazy-write cache: only if we got real values (don't poison cache with errors)
     if (isinstance(result, dict)
             and not result.get('error')
             and result.get('current_price') is not None
             and result.get('estimated_value') is not None):
         try:
-            data_manager.update_valuation(ticker.upper(), result)
+            data_manager.update_valuation(ticker, result)
         except Exception:
             # Never fail the read because the cache write failed.
             pass
+        _remember_valuation(ticker, result)
     return jsonify(result)
 
 

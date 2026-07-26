@@ -170,11 +170,21 @@ def save_single_valuation(ticker: str, valuation: Dict):
     db.update_valuation(ticker, update_data)
 
 
-def get_valuations_for_index(index_name: str, index_tickers: List[str] = None) -> List[Dict]:
-    """Get valuations for tickers in a specific index."""
+def get_valuations_for_index(index_name: str, index_tickers: List[str] = None,
+                             all_valuations: Dict = None) -> List[Dict]:
+    """Get valuations for tickers in a specific index.
+
+    Args:
+        index_name: index identifier
+        index_tickers: optional ticker list to filter by
+        all_valuations: optional pre-loaded {ticker: valuation} map. Callers
+            that loop over several indexes should load the table once and pass
+            it in - otherwise this reloads the whole valuations table per
+            index, which is what made /api/data-status do 6-9 full scans in a
+            single request.
+    """
     if index_tickers:
-        # Filter by provided ticker list
-        all_vals = db.get_all_valuations()
+        all_vals = all_valuations if all_valuations is not None else db.get_all_valuations()
         return [all_vals[t] for t in index_tickers if t in all_vals]
     return db.get_valuations_for_index(index_name)
 
@@ -254,13 +264,11 @@ def get_index_data(index_name: str = 'all') -> Dict:
     if index_name not in VALID_INDICES:
         index_name = 'all'
 
-    # Always load from centralized valuations storage
-    valuations_data = load_valuations()
-    all_valuations = valuations_data.get('valuations', {})
-    last_updated = valuations_data.get('last_updated')
-
     # Special handling for 'all' - combine all indexes
     if index_name == 'all':
+        valuations_data = load_valuations()
+        all_valuations = valuations_data.get('valuations', {})
+        last_updated = valuations_data.get('last_updated')
         all_tickers = get_all_unique_tickers()
         # Filter to the active/enabled universe like the per-index branch —
         # the valuations table still holds rows for delisted / disabled /
@@ -291,12 +299,9 @@ def get_index_data(index_name: str = 'all') -> Dict:
     # Get index display names
     name, short_name = INDEX_NAMES.get(index_name, (index_name, index_name))
 
-    # Filter centralized valuations to only include this index's tickers
-    index_tickers = set(tickers)
-    filtered_valuations = {
-        ticker: val for ticker, val in all_valuations.items()
-        if ticker in index_tickers
-    }
+    # Fetch only this index's valuations by key, instead of loading the whole
+    # table and filtering it in Python.
+    filtered_valuations = db.get_valuations_for_tickers(tickers)
 
     # Per-index freshness: the max 'updated' among THIS index's rows, not the
     # global MAX (which made a stale index look fresh whenever any other
@@ -312,7 +317,7 @@ def get_index_data(index_name: str = 'all') -> Dict:
         'short_name': short_name,
         'tickers': tickers,
         'valuations': filtered_valuations,
-        'last_updated': index_updated if index_updated else last_updated
+        'last_updated': index_updated
     }
 
     return sanitize_for_json(result)

@@ -39,6 +39,23 @@ PUBLIC_DB_PATH = os.path.join(BASE_DIR, 'data_public', 'public.db')
 from services.indexes import VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES
 
 
+# journal_mode is a persistent property of the database FILE, not of a
+# connection, so it only needs setting once per file. It used to be issued on
+# every connection open - and this app opens one per DB call, tens of thousands
+# per screener run - where it takes locks and returns a row for no benefit.
+_WAL_APPLIED = set()
+
+
+def _apply_wal_once(conn: sqlite3.Connection, db_path: str):
+    if db_path in _WAL_APPLIED:
+        return
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass  # e.g. read-only media; fall back to default journal
+    _WAL_APPLIED.add(db_path)
+
+
 def _get_connection(db_path: str) -> sqlite3.Connection:
     """Get a database connection with row factory enabled."""
     # 30s busy timeout + WAL: the background screener holds long write
@@ -50,10 +67,12 @@ def _get_connection(db_path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
-    try:
-        conn.execute("PRAGMA journal_mode = WAL")
-    except sqlite3.OperationalError:
-        pass  # e.g. read-only media; fall back to default journal
+    # NORMAL is the standard pairing with WAL: transactions still survive an
+    # application crash, only a full OS/power loss can lose the most recent
+    # commits - an acceptable trade for rebuildable market data, and it removes
+    # an fsync from every one of the app's many small write transactions.
+    conn.execute("PRAGMA synchronous = NORMAL")
+    _apply_wal_once(conn, db_path)
     return conn
 
 
@@ -207,6 +226,45 @@ def _init_public_database():
             )
         ''')
 
+        # Records that a ticker's splits were checked, INCLUDING when the answer
+        # was "no splits". Freshness used to be inferred from split_history
+        # rows alone, so the ~30% of the universe that has never split was
+        # re-fetched on every run because a negative result left no trace.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS split_checks (
+                ticker TEXT PRIMARY KEY,
+                checked_at TEXT NOT NULL
+            )
+        ''')
+
+        # Cached consensus/actual EPS for the earnings-beat star. Previously
+        # re-fetched from yfinance for every ticker on every star run and for
+        # every Company Profile view, despite only changing at earnings.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS analyst_estimates (
+                ticker TEXT PRIMARY KEY,
+                eps_actual REAL,
+                eps_estimate REAL,
+                period_end TEXT,
+                source TEXT,
+                fetched_at TEXT NOT NULL
+            )
+        ''')
+
+        # Generic "we looked, and this is what happened" log, keyed by kind
+        # (e.g. '52w', 'company_name'). Lets maintenance phases back off after
+        # a failure and refresh on a cadence after a success, instead of
+        # retrying every known-failing ticker on every single run.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS fetch_checks (
+                ticker TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                checked_at TEXT NOT NULL,
+                ok INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (ticker, kind)
+            )
+        ''')
+
         # CIK Mapping table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS cik_mapping (
@@ -339,6 +397,14 @@ def _init_public_database():
             cursor.execute('ALTER TABLE valuations ADD COLUMN price_updated TEXT')
             cursor.execute('UPDATE valuations SET price_updated = updated '
                            'WHERE price_updated IS NULL AND current_price IS NOT NULL')
+        # Same reasoning for dividends: without a per-ticker timestamp the
+        # screener had to refetch dividends for the entire universe on every
+        # full run, because a global "last dividend update" key can't tell
+        # which rows are actually stale. Dividends change ~quarterly.
+        if 'dividend_updated' not in existing_columns:
+            cursor.execute('ALTER TABLE valuations ADD COLUMN dividend_updated TEXT')
+            cursor.execute('UPDATE valuations SET dividend_updated = updated '
+                           'WHERE dividend_updated IS NULL AND annual_dividend IS NOT NULL')
 
         # Add delisted column to tickers if it doesn't exist
         cursor.execute('PRAGMA table_info(tickers)')
@@ -778,6 +844,11 @@ def _upsert_valuation(cursor, ticker: str, valuation: Dict, now: str):
     if 'current_price' in valuation:
         trailing_cols.append('price_updated')
         trailing_vals.append(now)
+    # Same for dividends, so the screener can skip tickers whose dividend was
+    # refreshed recently instead of refetching the whole universe every run.
+    if 'annual_dividend' in valuation:
+        trailing_cols.append('dividend_updated')
+        trailing_vals.append(now)
 
     insert_cols = ['ticker'] + cols + trailing_cols
     placeholders = ', '.join('?' * len(insert_cols))
@@ -821,6 +892,69 @@ def update_price_cache(ticker: str, price: float, source: Optional[str] = None):
                 updated = excluded.updated,
                 price_updated = excluded.price_updated
         ''', (ticker, price, source, now, now))
+
+
+def get_valuations_for_tickers(tickers: List[str], columns: str = '*') -> Dict[str, Dict]:
+    """Get valuation rows for a specific set of tickers.
+
+    Callers that need a handful of tickers (a holdings view, one index) used to
+    load the ENTIRE valuations table and filter in Python. This keys off the
+    primary index instead. Chunked to stay under SQLite's parameter limit.
+
+    Args:
+        tickers: ticker symbols to fetch
+        columns: optional column projection (must include `ticker`)
+    """
+    if not tickers:
+        return {}
+
+    wanted = sorted({t.upper() for t in tickers})
+    out: Dict[str, Dict] = {}
+    chunk_size = 900
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        for i in range(0, len(wanted), chunk_size):
+            chunk = wanted[i:i + chunk_size]
+            placeholders = ','.join('?' * len(chunk))
+            cursor.execute(
+                f'SELECT {columns} FROM valuations WHERE ticker IN ({placeholders})',
+                chunk)
+            for row in cursor.fetchall():
+                record = dict(row)
+                record['in_selloff'] = bool(record.get('in_selloff'))
+                out[record['ticker']] = record
+
+    return out
+
+
+def bulk_update_price_cache(prices: Dict[str, tuple]):
+    """Update ONLY the cached price fields for many tickers in one transaction.
+
+    The orchestrator's batch price path called update_price_cache() per ticker,
+    which opens a connection, runs a single-row upsert, commits (fsync) and
+    closes - hundreds of write transactions for one batch fetch.
+
+    Args:
+        prices: {ticker: (price, source)}
+    """
+    if not prices:
+        return
+    now = datetime.now().isoformat()
+    rows = [
+        (ticker.upper(), price, source, now, now)
+        for ticker, (price, source) in prices.items()
+    ]
+    with get_db() as conn:
+        conn.cursor().executemany('''
+            INSERT INTO valuations (ticker, current_price, price_source, updated, price_updated)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET
+                current_price = excluded.current_price,
+                price_source = excluded.price_source,
+                updated = excluded.updated,
+                price_updated = excluded.price_updated
+        ''', rows)
 
 
 def bulk_update_valuations(valuations: Dict[str, Dict]):
@@ -944,28 +1078,52 @@ def get_latest_valuation_timestamp() -> Optional[str]:
         return row['latest'] if row else None
 
 
-def get_orphan_tickers() -> List[str]:
+def get_orphan_tickers(include_disabled_indexes: bool = False) -> List[str]:
     """
     Get tickers that have valuations but are not active members of any index.
 
     An orphan is a ticker with a valuation record where:
     - It has no entries in ticker_indexes at all, OR
     - All its ticker_indexes entries have active=0
+
+    Args:
+        include_disabled_indexes: also treat tickers whose only active
+            memberships are in DISABLED indexes as orphans. set_index_enabled()
+            leaves ticker_indexes.active=1, so those rows are otherwise
+            unreachable by pruning and accumulate forever. Off by default
+            because re-enabling the index would then require refetching them -
+            the automatic screener prune keeps the conservative definition and
+            only an explicit user action opts in.
     """
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT v.ticker FROM valuations v
-            WHERE NOT EXISTS (
+    if include_disabled_indexes:
+        predicate = '''
+            NOT EXISTS (
+                SELECT 1 FROM ticker_indexes ti
+                JOIN indexes i ON i.name = ti.index_name
+                WHERE ti.ticker = v.ticker
+                  AND ti.active = 1
+                  AND COALESCE(i.enabled, 1) = 1
+            )
+        '''
+    else:
+        predicate = '''
+            NOT EXISTS (
                 SELECT 1 FROM ticker_indexes ti
                 WHERE ti.ticker = v.ticker AND ti.active = 1
             )
+        '''
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f'''
+            SELECT v.ticker FROM valuations v
+            WHERE {predicate}
             ORDER BY v.ticker
         ''')
         return [row['ticker'] for row in cursor.fetchall()]
 
 
-def remove_orphan_valuations() -> Dict:
+def remove_orphan_valuations(include_disabled_indexes: bool = False) -> Dict:
     """
     Remove valuations for tickers that are not active members of any index.
 
@@ -977,7 +1135,7 @@ def remove_orphan_valuations() -> Dict:
 
     Returns dict with counts of removed records.
     """
-    orphans = get_orphan_tickers()
+    orphans = get_orphan_tickers(include_disabled_indexes=include_disabled_indexes)
     if not orphans:
         return {'orphans_found': 0, 'valuations_removed': 0, 'eps_removed': 0,
                 'sec_companies_removed': 0, 'ticker_indexes_removed': 0, 'tickers_removed': 0}
@@ -999,6 +1157,22 @@ def remove_orphan_valuations() -> Dict:
             DELETE FROM sec_companies WHERE ticker IN ({','.join('?' * len(orphans))})
         ''', orphans)
         sec_count = cursor.rowcount
+
+        # Delete the remaining per-ticker tables. These have no FK cascade, so
+        # orphan cleanup used to leave their rows behind forever - the data
+        # kept accumulating for tickers the app no longer tracks at all.
+        placeholders = ','.join('?' * len(orphans))
+        related_count = 0
+        for table in ('star_ratings', 'valuation_history', 'dividend_history',
+                      'shares_outstanding_history', 'split_history',
+                      'balance_sheet', 'split_checks', 'fetch_checks',
+                      'analyst_estimates'):
+            try:
+                cursor.execute(
+                    f'DELETE FROM {table} WHERE ticker IN ({placeholders})', orphans)
+                related_count += cursor.rowcount
+            except sqlite3.OperationalError:
+                pass  # Table not present in this schema version
 
         # Delete valuations for orphans
         cursor.execute(f'''
@@ -1028,13 +1202,186 @@ def remove_orphan_valuations() -> Dict:
             'eps_removed': eps_count,
             'sec_companies_removed': sec_count,
             'ticker_indexes_removed': ti_count,
-            'tickers_removed': tickers_count
+            'tickers_removed': tickers_count,
+            'related_rows_removed': related_count
         }
+
+
+def prune_valuation_history(keep_recent_days: int = 35) -> int:
+    """Trim valuation_history to monthly granularity beyond a recent window.
+
+    The table grows one row per ticker per run-day forever, but its only
+    reader wants a single row from roughly a year ago. Keep every row inside
+    the recent window and the first snapshot of each month before it.
+
+    Returns the number of rows removed.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM valuation_history
+            WHERE snapshot_date < date('now', ?)
+              AND snapshot_date NOT IN (
+                  SELECT MIN(snapshot_date) FROM valuation_history
+                  GROUP BY ticker, substr(snapshot_date, 1, 7)
+              )
+        ''', (f'-{int(keep_recent_days)} days',))
+        return cursor.rowcount
+
+
+def prune_shares_outstanding_history(first_buy_dates: Dict[str, str] = None) -> int:
+    """Trim shares_outstanding_history to the rows its readers actually use.
+
+    The buyback criterion needs the newest row and the newest row at or before
+    the ticker's first buy date. A single SEC filer can report decades of
+    share counts, all of which were being stored for every ticker.
+
+    Args:
+        first_buy_dates: {ticker: 'YYYY-MM-DD'} from the PRIVATE database.
+            Passed in rather than joined - transactions live in a different
+            database file, so this cannot be a single SQL statement.
+
+    Returns the number of rows removed.
+    """
+    first_buy_dates = {k.upper(): v for k, v in (first_buy_dates or {}).items() if v}
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Rows to keep: newest per ticker...
+        cursor.execute('''
+            SELECT ticker, MAX(as_of_date) AS keep_date
+            FROM shares_outstanding_history GROUP BY ticker
+        ''')
+        keep = {(row['ticker'], row['keep_date']) for row in cursor.fetchall()}
+
+        # ...plus the newest row at or before each holding's first buy date.
+        for ticker, first_buy in first_buy_dates.items():
+            cursor.execute('''
+                SELECT MAX(as_of_date) AS keep_date
+                FROM shares_outstanding_history
+                WHERE ticker = ? AND as_of_date <= ?
+            ''', (ticker, first_buy))
+            row = cursor.fetchone()
+            if row and row['keep_date']:
+                keep.add((ticker, row['keep_date']))
+
+        cursor.execute('SELECT ticker, as_of_date FROM shares_outstanding_history')
+        doomed = [(r['ticker'], r['as_of_date']) for r in cursor.fetchall()
+                  if (r['ticker'], r['as_of_date']) not in keep]
+
+        if not doomed:
+            return 0
+
+        cursor.executemany(
+            'DELETE FROM shares_outstanding_history WHERE ticker = ? AND as_of_date = ?',
+            doomed)
+        return len(doomed)
 
 
 # =============================================================================
 # SEC Company Operations
 # =============================================================================
+
+def get_existing_eps_years(tickers=None) -> Dict[str, set]:
+    """Return {ticker: {years already stored}} from eps_history."""
+    wanted = {t.upper() for t in tickers} if tickers is not None else None
+    out: Dict[str, set] = {}
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT ticker, year FROM eps_history')
+        for row in cursor.fetchall():
+            if wanted is None or row['ticker'] in wanted:
+                out.setdefault(row['ticker'], set()).add(row['year'])
+    return out
+
+
+def fill_eps_history_gaps(rows: List[Dict]) -> int:
+    """Insert EPS rows for (ticker, year) pairs that don't exist yet.
+
+    Used by the SEC frames bulk path. Deliberately gap-filling rather than
+    replacing: per-company companyfacts data is richer (it carries the filing
+    date and a preferred concept), so frames data must never overwrite it -
+    it only covers years we don't have.
+
+    Each row: {ticker, year, eps, period_start, period_end, eps_type, filed}
+    Requires the parent sec_companies row to exist (FK).
+
+    Returns the number of rows inserted.
+    """
+    if not rows:
+        return 0
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Parent rows must exist for the eps_history FK.
+        tickers = sorted({r['ticker'].upper() for r in rows})
+        now = datetime.now().isoformat()
+        cursor.executemany('''
+            INSERT INTO sec_companies (ticker, cik, company_name, sec_no_eps, updated)
+            VALUES (?, ?, ?, 0, ?)
+            ON CONFLICT(ticker) DO NOTHING
+        ''', [(t, None, t, now) for t in tickers])
+
+        cursor.executemany('''
+            INSERT INTO eps_history
+                (ticker, year, eps, filed, period_start, period_end, eps_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker, year) DO NOTHING
+        ''', [(
+            r['ticker'].upper(), r['year'], r.get('eps'), r.get('filed'),
+            r.get('period_start'), r.get('period_end'), r.get('eps_type'),
+        ) for r in rows])
+
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else len(rows)
+
+
+def get_eps_history_bulk(tickers=None) -> Dict[str, List[Dict]]:
+    """Load EPS history for many tickers in one query.
+
+    The per-ticker getter opens its own connection; the screener called it up
+    to three times per ticker per run.
+    """
+    wanted = {t.upper() for t in tickers} if tickers is not None else None
+    out: Dict[str, List[Dict]] = {}
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ticker, year, eps, filed, period_start, period_end, eps_type
+            FROM eps_history
+            ORDER BY ticker, year DESC
+        ''')
+        for row in cursor.fetchall():
+            record = dict(row)
+            t = record.pop('ticker')
+            if wanted is not None and t not in wanted:
+                continue
+            # Same row shape as get_eps_history() so callers are interchangeable.
+            out.setdefault(t, []).append(record)
+    return out
+
+
+def get_splits_bulk(tickers=None) -> Dict[str, List[Dict]]:
+    """Load split history for many tickers in one query (newest first)."""
+    wanted = {t.upper() for t in tickers} if tickers is not None else None
+    out: Dict[str, List[Dict]] = {}
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ticker, split_date AS date, split_ratio AS ratio, source, fetched_at
+            FROM split_history
+            ORDER BY ticker, split_date DESC
+        ''')
+        for row in cursor.fetchall():
+            record = dict(row)
+            t = record.pop('ticker')
+            if wanted is not None and t not in wanted:
+                continue
+            # Same row shape as get_splits() so callers are interchangeable.
+            out.setdefault(t, []).append(record)
+    return out
+
 
 def get_eps_history(ticker: str) -> List[Dict]:
     """Get EPS history for a ticker directly from eps_history table.
@@ -1274,13 +1621,133 @@ def get_splits(ticker: str, since_date: Optional[str] = None) -> List[Dict]:
 
 
 def get_split_history_last_updated(ticker: str) -> Optional[str]:
-    """Get the most recent split fetched_at timestamp for a ticker."""
+    """Get the most recent time a ticker's splits were checked.
+
+    Considers both stored split rows and the split_checks marker, so a ticker
+    that has simply never split still counts as recently checked.
+    """
     ticker = ticker.upper()
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT MAX(fetched_at) AS latest FROM split_history WHERE ticker = ?', (ticker,))
         row = cursor.fetchone()
-        return row['latest'] if row else None
+        latest = row['latest'] if row else None
+
+        cursor.execute('SELECT checked_at FROM split_checks WHERE ticker = ?', (ticker,))
+        row = cursor.fetchone()
+        checked = row['checked_at'] if row else None
+
+    candidates = [t for t in (latest, checked) if t]
+    return max(candidates) if candidates else None
+
+
+def get_split_last_checked_bulk(tickers=None) -> Dict[str, str]:
+    """Bulk version of get_split_history_last_updated.
+
+    One pass over both tables instead of two connections and two queries per
+    ticker, which is what the screener's per-ticker freshness gate was doing
+    across the whole universe.
+    """
+    result: Dict[str, str] = {}
+    wanted = {t.upper() for t in tickers} if tickers is not None else None
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT ticker, MAX(fetched_at) AS latest FROM split_history GROUP BY ticker')
+        for row in cursor.fetchall():
+            if row['latest']:
+                result[row['ticker']] = row['latest']
+
+        cursor.execute('SELECT ticker, checked_at FROM split_checks')
+        for row in cursor.fetchall():
+            existing = result.get(row['ticker'])
+            if row['checked_at'] and (not existing or row['checked_at'] > existing):
+                result[row['ticker']] = row['checked_at']
+
+    if wanted is not None:
+        return {k: v for k, v in result.items() if k in wanted}
+    return result
+
+
+def get_analyst_estimate(ticker: str) -> Optional[Dict]:
+    """Get the cached analyst estimate/actual pair for a ticker."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM analyst_estimates WHERE ticker = ?', (ticker.upper(),))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def save_analyst_estimate(ticker: str, eps_actual, eps_estimate,
+                          period_end=None, source=None):
+    """Cache an analyst estimate/actual pair."""
+    with get_db() as conn:
+        conn.cursor().execute('''
+            INSERT INTO analyst_estimates
+                (ticker, eps_actual, eps_estimate, period_end, source, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET
+                eps_actual = excluded.eps_actual,
+                eps_estimate = excluded.eps_estimate,
+                period_end = excluded.period_end,
+                source = excluded.source,
+                fetched_at = excluded.fetched_at
+        ''', (ticker.upper(), eps_actual, eps_estimate, period_end, source,
+              datetime.now().isoformat()))
+
+
+def get_fetch_checks(kind: str, tickers=None) -> Dict[str, Dict]:
+    """Return {ticker: {'checked_at': str, 'ok': bool}} for one check kind."""
+    wanted = {t.upper() for t in tickers} if tickers is not None else None
+    out: Dict[str, Dict] = {}
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT ticker, checked_at, ok FROM fetch_checks WHERE kind = ?', (kind,))
+        for row in cursor.fetchall():
+            if wanted is None or row['ticker'] in wanted:
+                out[row['ticker']] = {
+                    'checked_at': row['checked_at'],
+                    'ok': bool(row['ok']),
+                }
+    return out
+
+
+def record_fetch_checks(kind: str, tickers: List[str], ok: bool):
+    """Record the outcome of a maintenance fetch for a batch of tickers.
+
+    One connection and one executemany, so recording attempts across the whole
+    universe costs a single transaction rather than one per ticker.
+    """
+    if not tickers:
+        return
+    now = datetime.now().isoformat()
+    rows = [(t.upper(), kind, now, 1 if ok else 0) for t in tickers]
+    with get_db() as conn:
+        conn.cursor().executemany('''
+            INSERT INTO fetch_checks (ticker, kind, checked_at, ok)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(ticker, kind) DO UPDATE SET
+                checked_at = excluded.checked_at,
+                ok = excluded.ok
+        ''', rows)
+
+
+def record_split_checks(tickers: List[str]):
+    """Mark tickers as having had their splits checked (even if none found).
+
+    One connection and one executemany for the whole batch.
+    """
+    if not tickers:
+        return
+    now = datetime.now().isoformat()
+    rows = [(t.upper(), now) for t in tickers]
+    with get_db() as conn:
+        conn.cursor().executemany('''
+            INSERT INTO split_checks (ticker, checked_at)
+            VALUES (?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET checked_at = excluded.checked_at
+        ''', rows)
 
 
 # =============================================================================
@@ -1353,6 +1820,23 @@ def get_latest_filing_year(ticker: str) -> Optional[int]:
 # CIK Mapping Operations
 # =============================================================================
 
+def get_cik_mapping_last_updated() -> Optional[str]:
+    """Latest `updated` timestamp across the CIK mapping (one aggregate query)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT MAX(updated) as latest FROM cik_mapping')
+        row = cursor.fetchone()
+        return row['latest'] if row else None
+
+
+def get_cik_mapping_count() -> int:
+    """Number of rows in the CIK mapping."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) as n FROM cik_mapping')
+        return cursor.fetchone()['n']
+
+
 def get_cik_mapping() -> Dict:
     """Get all CIK mappings."""
     with get_db() as conn:
@@ -1390,7 +1874,11 @@ def save_cik_mapping(data: Dict):
 
 
 def get_cik_for_ticker(ticker: str) -> Optional[str]:
-    """Get CIK for a specific ticker."""
+    """Get CIK for a specific ticker via the primary-key index.
+
+    sec_data.get_cik_for_ticker routes through this instead of materializing
+    all ~12,000 cik_mapping rows into a dict on every single lookup.
+    """
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT cik FROM cik_mapping WHERE ticker = ?', (ticker.upper(),))
@@ -1433,6 +1921,52 @@ def clear_ticker_failure(ticker: str):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('DELETE FROM ticker_failures WHERE ticker = ?', (ticker.upper(),))
+
+
+def record_ticker_failures_bulk(failed: List[str], succeeded: List[str],
+                                threshold: int = 3, reason: str = None) -> List[str]:
+    """Record failures and clear successes for many tickers in ONE transaction.
+
+    The per-ticker version cost 1-2 connections each (an upsert plus a read to
+    check the threshold, or a delete) across the whole universe every run.
+
+    Returns the tickers whose failure count has reached `threshold`.
+    """
+    if not failed and not succeeded:
+        return []
+
+    now = datetime.now().isoformat()
+    failed_u = [t.upper() for t in failed]
+    succeeded_u = [t.upper() for t in succeeded]
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        if failed_u:
+            cursor.executemany('''
+                INSERT INTO ticker_failures (ticker, failure_count, last_failure, reason)
+                VALUES (?, 1, ?, ?)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    failure_count = failure_count + 1,
+                    last_failure = excluded.last_failure,
+                    reason = COALESCE(excluded.reason, reason)
+            ''', [(t, now, reason) for t in failed_u])
+
+        if succeeded_u:
+            placeholders = ','.join('?' * len(succeeded_u))
+            cursor.execute(
+                f'DELETE FROM ticker_failures WHERE ticker IN ({placeholders})',
+                succeeded_u)
+
+        if not failed_u:
+            return []
+
+        placeholders = ','.join('?' * len(failed_u))
+        cursor.execute(
+            f'''SELECT ticker FROM ticker_failures
+                WHERE ticker IN ({placeholders}) AND failure_count >= ?''',
+            failed_u + [threshold])
+        return [row['ticker'] for row in cursor.fetchall()]
 
 
 def get_excluded_tickers(threshold: int = 3) -> List[str]:
@@ -2005,15 +2539,32 @@ def get_dividend_history(ticker: str) -> Dict[int, float]:
 
 def snapshot_shares_outstanding(ticker: str, as_of_date: str, shares: float, source: Optional[str] = None):
     """Record shares outstanding for a given date."""
+    snapshot_shares_outstanding_bulk(ticker, [(as_of_date, shares, source)])
+
+
+def snapshot_shares_outstanding_bulk(ticker: str, entries: List[tuple]):
+    """Record many shares-outstanding rows in ONE transaction.
+
+    A single SEC filer can report decades of share counts; writing them one
+    row per connection meant tens of thousands of separate write transactions
+    per star-rating run.
+
+    Args:
+        ticker: Stock ticker symbol
+        entries: iterable of (as_of_date, shares, source) tuples
+    """
+    if not entries:
+        return
+    ticker = ticker.upper()
+    rows = [(ticker, as_of_date, shares, source) for as_of_date, shares, source in entries]
     with get_public_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
+        conn.cursor().executemany('''
             INSERT INTO shares_outstanding_history (ticker, as_of_date, shares, source)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(ticker, as_of_date) DO UPDATE SET
                 shares = excluded.shares,
                 source = excluded.source
-        ''', (ticker.upper(), as_of_date, shares, source))
+        ''', rows)
 
 
 def get_shares_outstanding_history(ticker: str) -> List[Dict]:

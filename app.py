@@ -41,6 +41,10 @@ from services.indexes import (
 
 app = Flask(__name__)
 
+# Flask pretty-prints JSON while debug is on, which inflates every API response
+# by ~35-45% for no benefit to the SPA. Keep the debugger, drop the whitespace.
+app.json.compact = True
+
 # Blueprint registration enabled - routes now use database and proper response formats
 from routes import register_blueprints
 register_blueprints(app)
@@ -238,20 +242,33 @@ def save_sp500_data(data):
 
 @app.route('/api/orphans')
 def api_get_orphans():
-    """Get list of orphan tickers (valuations not in any active index)"""
+    """Get list of orphan tickers (valuations not in any active index).
+
+    Also reports how many additional rows belong only to DISABLED indexes -
+    those are prunable too, but only when explicitly requested.
+    """
     orphans = db.get_orphan_tickers()
+    with_disabled = db.get_orphan_tickers(include_disabled_indexes=True)
     return jsonify({
         'success': True,
         'count': len(orphans),
-        'tickers': orphans
+        'tickers': orphans,
+        'disabled_index_count': len(with_disabled) - len(orphans),
+        'total_prunable': len(with_disabled)
     })
 
 
 @app.route('/api/orphans/remove', methods=['POST'])
 def api_remove_orphans():
-    """Remove all orphan valuations and related data"""
-    result = db.remove_orphan_valuations()
-    log.info(f"Removed orphans: {result}")
+    """Remove all orphan valuations and related data.
+
+    Pass {"include_disabled_indexes": true} to also drop rows whose only
+    index memberships are in indexes the user has disabled.
+    """
+    payload = request.get_json(silent=True) or {}
+    include_disabled = bool(payload.get('include_disabled_indexes'))
+    result = db.remove_orphan_valuations(include_disabled_indexes=include_disabled)
+    log.info(f"Removed orphans (include_disabled={include_disabled}): {result}")
     return jsonify({
         'success': True,
         'removed': result
@@ -412,17 +429,32 @@ def parse_date(date_str):
 
 @app.route('/api/all-tickers')
 def api_all_tickers():
-    """Get all tickers with key details for the Data Sets table"""
+    """Get all tickers with key details for the Data Sets table.
+
+    Supports ?fields=ticker,company_name so the autocomplete can request the
+    two columns it needs instead of the full ~460 KB table.
+    """
+    requested = request.args.get('fields')
+    if requested:
+        wanted = {f.strip() for f in requested.split(',') if f.strip()}
+        wanted.add('ticker')
+    else:
+        wanted = None
+
     # Get all valuations
     all_valuations = data_manager.load_valuations().get('valuations', {})
 
-    # Get ticker status for index membership and SEC status
-    ticker_status = data_manager.load_ticker_status().get('tickers', {})
+    # Ticker status is only needed for the index/SEC columns; skip the load
+    # entirely when the caller didn't ask for them.
+    needs_status = wanted is None or bool(
+        wanted & {'indexes', 'sec_status', 'sec_checked'})
+    ticker_status = (
+        data_manager.load_ticker_status().get('tickers', {}) if needs_status else {})
 
     result = []
     for ticker, val in all_valuations.items():
         status = ticker_status.get(ticker, {})
-        result.append({
+        row = {
             'ticker': ticker,
             'company_name': val.get('company_name', ticker),
             'current_price': val.get('current_price'),
@@ -436,7 +468,8 @@ def api_all_tickers():
             'sec_status': status.get('sec_status', 'unknown'),
             'valuation_updated': val.get('updated'),
             'sec_checked': status.get('sec_checked')
-        })
+        }
+        result.append({k: v for k, v in row.items() if k in wanted} if wanted else row)
 
     # Sort by ticker
     result.sort(key=lambda x: x['ticker'])
@@ -804,17 +837,31 @@ def check_html_parser_dependencies():
 
 if __name__ == '__main__':
     import atexit
-    atexit.register(cleanup_providers)
 
-    # Check cross-platform dependencies
-    check_html_parser_dependencies()
+    # The Werkzeug reloader runs this module in TWO processes: a supervisor and
+    # the child that actually serves. Initializing providers and the scheduler
+    # in both makes every scheduled refresh fire twice - doubling external API
+    # volume and letting two processes write public.db concurrently.
+    # restart_server.py is already the restart mechanism here, so the reloader
+    # is off by default; set FINANCEAPP_RELOADER=1 to opt back in, in which case
+    # only the serving child runs the startup side effects.
+    use_reloader = os.environ.get('FINANCEAPP_RELOADER', '0') == '1'
+    is_serving_process = (
+        not use_reloader or os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
+    )
 
-    # Initialize market data providers
-    init_providers()
+    if is_serving_process:
+        atexit.register(cleanup_providers)
 
-    # Initialize background scheduler for auto-refresh
-    from services.scheduler import init_scheduler, shutdown as shutdown_scheduler
-    init_scheduler(app)
-    atexit.register(shutdown_scheduler)
+        # Check cross-platform dependencies
+        check_html_parser_dependencies()
 
-    app.run(debug=True, port=8080)
+        # Initialize market data providers
+        init_providers()
+
+        # Initialize background scheduler for auto-refresh
+        from services.scheduler import init_scheduler, shutdown as shutdown_scheduler
+        init_scheduler(app)
+        atexit.register(shutdown_scheduler)
+
+    app.run(debug=True, port=8080, use_reloader=use_reloader)
