@@ -70,7 +70,27 @@ os.makedirs(USER_DATA_DIR, exist_ok=True)
 # ============================================================================
 # Cache Settings
 # ============================================================================
-PRICE_CACHE_DURATION = _get('cache.price_cache_duration', 300)
+# The price TTL that is actually enforced lives in the provider config
+# (providers.price_cache_seconds, consumed by DataOrchestrator). This used to be
+# a second, disagreeing value (300s here vs 3600s there) that only the UI ever
+# read, so /api/prices reported a cache duration the app did not use. Derive it
+# instead so there is one source of truth; cache.price_cache_duration in
+# config.yaml is honoured only as a legacy override.
+def _price_cache_duration():
+    legacy = _get('cache.price_cache_duration')
+    if legacy is not None:
+        return legacy
+    try:
+        from services.providers.config import get_config as _get_provider_config
+        return _get_provider_config().price_cache_seconds
+    except Exception:
+        return 3600
+
+PRICE_CACHE_DURATION = _price_cache_duration()
+
+# Hours before valuation data is considered stale. The staleness dashboard uses
+# the STALENESS_* thresholds below; this remains for callers that want a single
+# coarse "is this row old" answer.
 STALE_DATA_HOURS = _get('cache.stale_data_hours', 24)
 
 # ============================================================================
@@ -163,6 +183,11 @@ YAHOO_BATCH_DELAY = _get('rate_limits.yahoo.batch_delay', 0.5)
 YAHOO_SINGLE_DELAY = _get('rate_limits.yahoo.single_delay', 0.3)
 YAHOO_CHUNK_DELAY = _get('rate_limits.yahoo.chunk_delay', 1.5)
 YAHOO_HISTORY_BATCH_DELAY = _get('rate_limits.yahoo.history_batch_delay', 0.5)
+# Orchestrator-enforced pacing for the dividend/split providers. The screener
+# used to sleep a fixed 0.3s per ticker on top of the orchestrator's limiter;
+# these values fold that into the single pacing authority.
+YAHOO_DIVIDEND_RATE_LIMIT = _get('rate_limits.yahoo.dividend_rate_limit', 0.5)
+YAHOO_SPLIT_RATE_LIMIT = _get('rate_limits.yahoo.split_rate_limit', 0.5)
 
 # ============================================================================
 # FMP Rate Limiting
@@ -178,6 +203,14 @@ SEC_RATE_LIMIT = _get('rate_limits.sec.rate_limit', 0.12)
 SEC_REQUEST_TIMEOUT = _get('rate_limits.sec.request_timeout', 30)
 SEC_CIK_CACHE_DAYS = _get('rate_limits.sec.cik_cache_days', 7)
 SEC_EPS_CACHE_DAYS = _get('rate_limits.sec.eps_cache_days', 1)
+
+# Filing-calendar-aware EPS staleness. Annual EPS cannot change until the next
+# 10-K is filed, so a flat 1-day TTL forced a full-universe companyfacts
+# re-download for data that changes once a year.
+SEC_EPS_FILING_LAG_DAYS = _get('rate_limits.sec.eps_filing_lag_days', 75)
+SEC_EPS_RECHECK_DAYS = _get('rate_limits.sec.eps_recheck_days', 30)
+SEC_EPS_MAX_AGE_DAYS = _get('rate_limits.sec.eps_max_age_days', 400)
+SEC_EPS_NO_DATA_RECHECK_DAYS = _get('rate_limits.sec.eps_no_data_recheck_days', 90)
 
 # ============================================================================
 # IBKR Rate Limiting
@@ -219,6 +252,27 @@ STALENESS_PRICE_FRESH_MINUTES = _get('staleness.price_fresh_minutes', 60)
 STALENESS_PRICE_STALE_HOURS = _get('staleness.price_stale_hours', 24)
 STALENESS_DIVIDEND_FRESH_DAYS = _get('staleness.dividend_fresh_days', 7)
 STALENESS_DIVIDEND_STALE_DAYS = _get('staleness.dividend_stale_days', 30)
+
+# How often the screener forces an unconditional full-universe dividend sweep,
+# regardless of per-ticker freshness. Selective refresh keeps normal runs cheap;
+# this preserves the guarantee that a silently-wrong dividend is still corrected
+# on a known cadence.
+DIVIDEND_FULL_SWEEP_DAYS = _get('staleness.dividend_full_sweep_days', 30)
+
+# 52-week high/low maintenance. Values were previously only ever fetched once
+# (never refreshed) while failed lookups were retried on every single run.
+FIFTY_TWO_WEEK_REFRESH_DAYS = _get('staleness.fifty_two_week_refresh_days', 7)
+FIFTY_TWO_WEEK_RETRY_DAYS = _get('staleness.fifty_two_week_retry_days', 1)
+
+# Back-off for company-name lookups that fail. The quick update used to retry
+# every unresolvable name on every 15-minute run.
+COMPANY_NAME_RETRY_DAYS = _get('staleness.company_name_retry_days', 7)
+
+# Star-rating inputs. All three come from quarterly filings or analyst updates,
+# but were re-fetched from the network for every ticker on every star run.
+BALANCE_SHEET_REFRESH_DAYS = _get('staleness.balance_sheet_refresh_days', 30)
+SHARES_OUTSTANDING_REFRESH_DAYS = _get('staleness.shares_outstanding_refresh_days', 30)
+ANALYST_ESTIMATE_REFRESH_DAYS = _get('staleness.analyst_estimate_refresh_days', 7)
 
 # ============================================================================
 # Fallback Data Sources (Optional)

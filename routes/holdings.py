@@ -8,6 +8,7 @@ Handles:
 
 from flask import Blueprint, jsonify
 import data_manager
+import database as db
 from services.holdings import calculate_holdings
 
 holdings_bp = Blueprint('holdings', __name__, url_prefix='/api')
@@ -64,9 +65,13 @@ def api_holdings():
 def api_holdings_analysis():
     """Get holdings with current prices, valuations, and sell recommendations."""
     holdings = calculate_holdings()
-    valuations_data = data_manager.load_valuations()
-    all_valuations = valuations_data.get('valuations', {})
-    last_updated = valuations_data.get('last_updated')
+    # Keyed to the held tickers rather than loading the whole valuations table
+    # to enrich a handful of rows.
+    all_valuations = db.get_valuations_for_tickers(list(holdings.keys()))
+    last_updated = max(
+        (v.get('updated') for v in all_valuations.values() if v.get('updated')),
+        default=None,
+    )
 
     # Enrich holdings with current price and valuation data
     enriched_holdings = {}

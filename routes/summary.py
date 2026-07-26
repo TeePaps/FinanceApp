@@ -11,6 +11,7 @@ Handles:
 from flask import Blueprint, jsonify, request
 from datetime import datetime, timedelta
 import data_manager
+import database as db
 from services.holdings import (
     calculate_holdings, calculate_fifo_cost_basis, get_transactions, get_stocks,
 )
@@ -27,8 +28,10 @@ def api_prices():
     tickers = [t for t, h in holdings.items() if h['shares'] > 0]
     prices = fetch_multiple_prices(tickers)
 
-    # Get cached valuations for updated timestamps
-    all_valuations = data_manager.load_valuations().get('valuations', {})
+    # Cached valuations for the `updated` timestamps. Keyed to the held
+    # tickers - this used to load the entire valuations table (~1,500 rows) to
+    # read one field for a handful of holdings.
+    all_valuations = db.get_valuations_for_tickers(tickers)
 
     # Calculate unrealized gains
     results = {}

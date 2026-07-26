@@ -8,7 +8,11 @@
 # Cache Settings
 # ============================================================================
 cache:
-  price_cache_duration: 300      # Seconds - how long to cache stock prices (5 min)
+  # The enforced price TTL lives in providers.price_cache_seconds (see the
+  # `providers:` section) - that is the value DataOrchestrator actually applies.
+  # config.PRICE_CACHE_DURATION now derives from it so the UI reports the real
+  # number. Uncomment below only to override both with a legacy fixed value.
+  # price_cache_duration: 300    # Seconds - how long to cache stock prices
   stale_data_hours: 24           # Hours before valuation data is considered stale
 
 # ============================================================================
@@ -100,6 +104,12 @@ rate_limits:
     single_delay: 0.3            # Seconds between single ticker requests
     chunk_delay: 1.5             # Delay between 50-ticker chunks
     history_batch_delay: 0.5     # Delay for price history batches
+    # Per-provider pacing enforced by the orchestrator's rate limiter, which is
+    # now the single pacing authority - the screener no longer adds its own
+    # fixed per-ticker sleep on top of these. Set to the previous *combined*
+    # pace so request rates are unchanged.
+    dividend_rate_limit: 0.5     # Seconds between dividend fetches
+    split_rate_limit: 0.5        # Seconds between split fetches
 
   # Financial Modeling Prep (FMP)
   fmp:
@@ -112,7 +122,15 @@ rate_limits:
     rate_limit: 0.12             # Minimum seconds between requests (10 req/sec limit)
     request_timeout: 30          # Timeout for SEC requests
     cik_cache_days: 7            # Days to cache CIK lookups
-    eps_cache_days: 1            # Days to cache EPS data
+    # Annual EPS only changes when a new 10-K lands, so freshness is keyed to
+    # the filing calendar rather than a flat TTL: a cached year is current
+    # until (next fiscal year end + filing_lag_days) has passed. These are the
+    # fallbacks used when a ticker has no usable fiscal-period data.
+    eps_cache_days: 1            # Legacy flat TTL - only used with force_flat_ttl
+    eps_filing_lag_days: 75      # Days after fiscal year end a 10-K is expected
+    eps_recheck_days: 30         # Re-probe interval when fiscal dates are unknown
+    eps_max_age_days: 400        # Hard ceiling - always refresh beyond this
+    eps_no_data_recheck_days: 90 # Re-probe interval for tickers SEC has no EPS for
 
   # Interactive Brokers
   ibkr:
@@ -201,4 +219,15 @@ staleness:
   price_fresh_minutes: 60        # Green: prices updated within this time
   price_stale_hours: 24          # Red: prices older than this
   dividend_fresh_days: 7         # Green: dividends updated within this time
+                                 # Also: skip per-ticker dividend refetch within
   dividend_stale_days: 30        # Red: dividends older than this
+  # Refresh policy (how often data is actually re-fetched), matched to how
+  # often each kind of data can change. See also rate_limits.sec.eps_* for the
+  # filing-calendar-aware EPS policy and providers.split_cache_days for splits.
+  dividend_full_sweep_days: 30   # Force an unconditional full dividend sweep
+  fifty_two_week_refresh_days: 7 # Refresh existing 52-week high/low after
+  fifty_two_week_retry_days: 1   # Back off failed 52-week lookups for
+  company_name_retry_days: 7     # Back off failed company-name lookups for
+  balance_sheet_refresh_days: 30      # Star input: quarterly filing data
+  shares_outstanding_refresh_days: 30 # Star input: quarterly filing data
+  analyst_estimate_refresh_days: 7    # Star input: consensus estimates

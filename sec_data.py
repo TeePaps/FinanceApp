@@ -11,6 +11,7 @@ Data is stored in the following tables:
 import os
 import time
 import requests
+from collections import OrderedDict
 from datetime import datetime, timedelta
 import threading
 
@@ -18,11 +19,44 @@ import threading
 import database as db
 from config import (
     SEC_RATE_LIMIT, SEC_REQUEST_TIMEOUT,
-    SEC_CIK_CACHE_DAYS, SEC_EPS_CACHE_DAYS
+    SEC_CIK_CACHE_DAYS, SEC_EPS_CACHE_DAYS,
+    SEC_EPS_FILING_LAG_DAYS, SEC_EPS_RECHECK_DAYS, SEC_EPS_MAX_AGE_DAYS,
+    SEC_EPS_NO_DATA_RECHECK_DAYS
 )
 
 # SEC requires User-Agent with contact info
 SEC_HEADERS = {'User-Agent': 'FinanceApp contact@example.com'}
+
+
+def _build_sec_session():
+    """One pooled, retrying HTTPS session for all SEC traffic.
+
+    Every SEC call used a bare requests.get(), so each one paid a fresh TCP +
+    TLS handshake and rebuilt an SSL context from the certifi bundle - for a
+    full-universe EPS refresh that is hundreds of handshakes against a host we
+    talk to continuously. A Session keeps the connection alive and adds
+    backoff for SEC's rate-limit responses.
+    """
+    session = requests.Session()
+    session.headers.update(SEC_HEADERS)
+    try:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(['GET']),
+        )
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=retry)
+        session.mount('https://', adapter)
+    except Exception:
+        pass  # Plain session still beats a new connection per request
+    return session
+
+
+_SEC_SESSION = _build_sec_session()
 
 # Use config values (aliased for backward compatibility)
 CIK_CACHE_DAYS = SEC_CIK_CACHE_DAYS
@@ -94,7 +128,7 @@ def update_cik_mapping():
     try:
         rate_limit()
         url = "https://www.sec.gov/files/company_tickers.json"
-        response = requests.get(url, headers=SEC_HEADERS, timeout=SEC_REQUEST_TIMEOUT)
+        response = _SEC_SESSION.get(url, timeout=SEC_REQUEST_TIMEOUT)
 
         if response.status_code == 200:
             raw_data = response.json()
@@ -122,25 +156,42 @@ def update_cik_mapping():
     return load_cik_mapping()
 
 
+# Freshness of the CIK mapping is a property of the whole table, so it is
+# checked once per process window rather than on every ticker lookup.
+_CIK_FRESHNESS_CHECKED_AT = 0.0
+_CIK_FRESHNESS_TTL = 300  # seconds
+
+
+def _ensure_cik_mapping_fresh():
+    """Refresh the ticker->CIK table if it has aged out.
+
+    Checked at most once per _CIK_FRESHNESS_TTL: this used to run on every
+    single-ticker lookup, and each check loaded all ~12,000 mapping rows plus
+    a MAX() scan.
+    """
+    global _CIK_FRESHNESS_CHECKED_AT
+
+    if time.time() - _CIK_FRESHNESS_CHECKED_AT < _CIK_FRESHNESS_TTL:
+        return
+    _CIK_FRESHNESS_CHECKED_AT = time.time()
+
+    latest = db.get_cik_mapping_last_updated()
+    if not latest:
+        if db.get_cik_mapping_count() == 0:
+            update_cik_mapping()
+        return
+
+    try:
+        if datetime.now() - datetime.fromisoformat(latest) > timedelta(days=CIK_CACHE_DAYS):
+            update_cik_mapping()
+    except (ValueError, TypeError):
+        update_cik_mapping()
+
+
 def get_cik_for_ticker(ticker):
     """Get CIK for a ticker, updating mapping if needed"""
-    mapping = load_cik_mapping()
-
-    # Check if mapping needs refresh
-    if mapping.get('updated'):
-        try:
-            updated = datetime.fromisoformat(mapping['updated'])
-            if datetime.now() - updated > timedelta(days=CIK_CACHE_DAYS):
-                mapping = update_cik_mapping()
-        except (ValueError, TypeError):
-            mapping = update_cik_mapping()
-    elif not mapping.get('tickers'):
-        mapping = update_cik_mapping()
-
-    ticker_info = mapping.get('tickers', {}).get(ticker.upper())
-    if ticker_info:
-        return ticker_info['cik']
-    return None
+    _ensure_cik_mapping_fresh()
+    return db.get_cik_for_ticker(ticker)
 
 
 # --- Company EPS Data (now stored in database) ---
@@ -156,14 +207,30 @@ def save_company_cache(ticker, data):
 
 
 def fetch_company_eps(ticker, cik):
-    """Fetch EPS data from SEC EDGAR for a company"""
-    try:
-        rate_limit()
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        response = requests.get(url, headers=SEC_HEADERS, timeout=SEC_REQUEST_TIMEOUT)
+    """Fetch EPS data from SEC EDGAR for a company. Returns the data or None."""
+    data, _status = _fetch_company_eps_with_status(ticker, cik)
+    return data
 
-        if response.status_code == 200:
-            data = response.json()
+
+def _fetch_company_eps_with_status(ticker, cik):
+    """Fetch EPS data from SEC EDGAR, reporting WHY it came back empty.
+
+    Returns (data, status) where status is one of:
+      'ok'      - EPS extracted
+      'no_eps'  - SEC answered, but this filer publishes no usable annual EPS
+      'error'   - transport/HTTP failure, nothing learned about the company
+
+    The distinction matters for caching: 'no_eps' is a durable fact worth
+    persisting so the ticker isn't re-downloaded every run, while 'error' must
+    not be recorded as knowledge.
+    """
+    try:
+        # Shared with the other companyfacts parsers via the per-CIK memo, so
+        # the document is downloaded once per ticker rather than once per
+        # parser (see _fetch_companyfacts).
+        data = _fetch_companyfacts(cik)
+
+        if data is not None:
             us_gaap = data.get('facts', {}).get('us-gaap', {})
 
             # EPS fields to extract, in order of preference (most specific to least)
@@ -310,7 +377,7 @@ def fetch_company_eps(ticker, cik):
                             })
 
             if not all_eps_data:
-                return None
+                return None, 'no_eps'
 
             # Sanity check and correction for EPS values
             # Some companies (e.g., HAL) have XBRL filing errors where EPS is 1,000,000x too high.
@@ -353,17 +420,20 @@ def fetch_company_eps(ticker, cik):
             # Sort by year descending
             sorted_eps = sorted(annual_eps.values(), key=lambda x: x['year'], reverse=True)
 
+            if not sorted_eps:
+                return None, 'no_eps'
+
             return {
                 'ticker': ticker,
                 'cik': cik,
                 'company_name': data.get('entityName', ticker),
                 'eps_history': sorted_eps[:8],  # Keep up to 8 years max
                 'updated': datetime.now().isoformat()
-            }
+            }, 'ok'
     except Exception as e:
         print(f"[SEC] Error fetching EPS for {ticker}: {e}")
 
-    return None
+    return None, 'error'
 
 
 def fetch_company_metrics(ticker, cik):
@@ -373,12 +443,11 @@ def fetch_company_metrics(ticker, cik):
     and annual dividend data.
     """
     try:
-        rate_limit()
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        response = requests.get(url, headers=SEC_HEADERS, timeout=SEC_REQUEST_TIMEOUT)
+        # Same companyfacts document as the EPS/balance-sheet/shares parsers;
+        # routed through the shared memo instead of its own download.
+        data = _fetch_companyfacts(cik)
 
-        if response.status_code == 200:
-            data = response.json()
+        if data is not None:
             us_gaap = data.get('facts', {}).get('us-gaap', {})
 
             def get_annual_values(field_name, unit='USD'):
@@ -470,14 +539,71 @@ def fetch_company_metrics(ticker, cik):
     return None
 
 
-def _fetch_companyfacts(cik):
-    """Internal: fetch raw companyfacts JSON for a CIK. Respects rate limit."""
+# Short-lived memo of the raw companyfacts document, keyed by CIK.
+#
+# The same multi-megabyte document is needed by four different parsers (EPS,
+# metrics, balance sheet, shares outstanding). The star phase in particular
+# calls fetch_balance_sheet and fetch_shares_outstanding back-to-back for the
+# same ticker, so the identical document was downloaded and JSON-parsed twice
+# per ticker per run. Parsed documents are large, so the memo is deliberately
+# tiny - it exists to collapse the burst of calls for ONE ticker, not to hold
+# the universe. TTL bounds staleness within a long-running screener pass.
+_COMPANYFACTS_MEMO = OrderedDict()
+_COMPANYFACTS_MEMO_LOCK = threading.Lock()
+_COMPANYFACTS_MEMO_MAX = 4
+_COMPANYFACTS_MEMO_TTL = 300  # seconds
+
+
+def _companyfacts_from_memo(cik):
+    with _COMPANYFACTS_MEMO_LOCK:
+        entry = _COMPANYFACTS_MEMO.get(cik)
+        if not entry:
+            return None
+        cached_at, payload = entry
+        if time.time() - cached_at > _COMPANYFACTS_MEMO_TTL:
+            _COMPANYFACTS_MEMO.pop(cik, None)
+            return None
+        _COMPANYFACTS_MEMO.move_to_end(cik)
+        return payload
+
+
+def _companyfacts_to_memo(cik, payload):
+    if payload is None:
+        return
+    with _COMPANYFACTS_MEMO_LOCK:
+        _COMPANYFACTS_MEMO[cik] = (time.time(), payload)
+        _COMPANYFACTS_MEMO.move_to_end(cik)
+        while len(_COMPANYFACTS_MEMO) > _COMPANYFACTS_MEMO_MAX:
+            _COMPANYFACTS_MEMO.popitem(last=False)
+
+
+def clear_companyfacts_memo():
+    """Drop the in-process companyfacts memo (used by force-refresh paths)."""
+    with _COMPANYFACTS_MEMO_LOCK:
+        _COMPANYFACTS_MEMO.clear()
+
+
+def _fetch_companyfacts(cik, use_memo=True):
+    """Internal: fetch raw companyfacts JSON for a CIK. Respects rate limit.
+
+    Serves a recently fetched copy when one is in the memo, so the several
+    parsers that each need this document for the same ticker share one
+    download instead of issuing their own.
+    """
+    if use_memo:
+        cached = _companyfacts_from_memo(cik)
+        if cached is not None:
+            return cached
+
     rate_limit()
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    response = requests.get(url, headers=SEC_HEADERS, timeout=SEC_REQUEST_TIMEOUT)
+    response = _SEC_SESSION.get(url, timeout=SEC_REQUEST_TIMEOUT)
     if response.status_code != 200:
         return None
-    return response.json()
+
+    payload = response.json()
+    _companyfacts_to_memo(cik, payload)
+    return payload
 
 
 def _latest_annual_value(us_gaap, field_names, unit='USD'):
@@ -661,6 +787,138 @@ def fetch_shares_outstanding(ticker):
         return None
 
 
+# --- Bulk EPS via the XBRL frames API ---
+
+# Concepts tried per year, most specific first. The first concept that reports
+# a value for a company wins, matching the per-company extraction order.
+_FRAME_CONCEPTS = (
+    ('EarningsPerShareDiluted', 'Diluted EPS'),
+    ('EarningsPerShareBasic', 'Basic EPS'),
+)
+
+
+def fetch_eps_frame(concept, year):
+    """Fetch one XBRL frame: annual EPS for EVERY filer in one request.
+
+    https://data.sec.gov/api/xbrl/frames/us-gaap/{concept}/USD-per-shares/CY{year}.json
+    returns ~5,500 companies in a single ~800 KB response, versus one
+    multi-megabyte companyfacts download per company.
+
+    Returns {cik_int: {'eps', 'period_start', 'period_end'}} or {} on failure.
+    """
+    url = (f"https://data.sec.gov/api/xbrl/frames/us-gaap/{concept}"
+           f"/USD-per-shares/CY{year}.json")
+    try:
+        rate_limit()
+        response = _SEC_SESSION.get(url, timeout=SEC_REQUEST_TIMEOUT)
+        if response.status_code != 200:
+            return {}
+        payload = response.json()
+    except Exception as e:
+        print(f"[SEC] frames fetch failed for {concept} CY{year}: {e}")
+        return {}
+
+    out = {}
+    for entry in payload.get('data', []):
+        cik = entry.get('cik')
+        val = entry.get('val')
+        if cik is None or val is None:
+            continue
+        out[int(cik)] = {
+            'eps': val,
+            'period_start': entry.get('start'),
+            'period_end': entry.get('end'),
+        }
+    return out
+
+
+def refresh_eps_from_frames(tickers=None, years=None, progress_callback=None):
+    """Fill missing annual EPS for many tickers using the frames API.
+
+    Replaces a per-company companyfacts crawl (one multi-MB download each,
+    serialized behind the SEC rate limit) with roughly 2 requests per year -
+    about 16 requests for an 8-year window, regardless of universe size.
+
+    Gap-filling only: years already stored from per-company data are left
+    alone, since those carry the filing date and preferred concept. Frames
+    responses have no `filed` field, so rows written here record None for it.
+
+    Args:
+        tickers: restrict to these tickers (default: everything with a CIK)
+        years: number of years back to cover (default RECOMMENDED_EPS_YEARS)
+        progress_callback: optional callable(done, total) for UI progress
+
+    Returns a stats dict.
+    """
+    from config import RECOMMENDED_EPS_YEARS
+
+    years = years or RECOMMENDED_EPS_YEARS
+    _ensure_cik_mapping_fresh()
+
+    # cik(int) -> ticker, restricted to tickers we actually track.
+    mapping = db.get_cik_mapping().get('tickers', {})
+    wanted = {t.upper() for t in tickers} if tickers is not None else None
+    cik_to_ticker = {}
+    for ticker, info in mapping.items():
+        if wanted is not None and ticker.upper() not in wanted:
+            continue
+        try:
+            cik_to_ticker[int(info['cik'])] = ticker.upper()
+        except (TypeError, ValueError, KeyError):
+            continue
+
+    if not cik_to_ticker:
+        return {'requests': 0, 'rows_written': 0, 'tickers_touched': 0, 'years': 0}
+
+    existing = db.get_existing_eps_years(list(cik_to_ticker.values()))
+
+    current_year = datetime.now().year
+    # The most recent full fiscal year is normally last year; go back `years`.
+    target_years = list(range(current_year - 1, current_year - 1 - years, -1))
+
+    rows = []
+    requests_made = 0
+    total_steps = len(target_years) * len(_FRAME_CONCEPTS)
+    done_steps = 0
+
+    for year in target_years:
+        seen_this_year = set()
+        for concept, label in _FRAME_CONCEPTS:
+            frame = fetch_eps_frame(concept, year)
+            requests_made += 1
+            done_steps += 1
+            if progress_callback:
+                try:
+                    progress_callback(done_steps, total_steps)
+                except Exception:
+                    pass
+
+            for cik, record in frame.items():
+                ticker = cik_to_ticker.get(cik)
+                if not ticker or ticker in seen_this_year:
+                    continue
+                if year in existing.get(ticker, set()):
+                    continue  # per-company data already covers this year
+                seen_this_year.add(ticker)
+                rows.append({
+                    'ticker': ticker,
+                    'year': year,
+                    'eps': record['eps'],
+                    'filed': None,
+                    'period_start': record.get('period_start'),
+                    'period_end': record.get('period_end'),
+                    'eps_type': f'{label} (frames)',
+                })
+
+    written = db.fill_eps_history_gaps(rows) if rows else 0
+    return {
+        'requests': requests_made,
+        'rows_written': written,
+        'tickers_touched': len({r['ticker'] for r in rows}),
+        'years': len(target_years),
+    }
+
+
 def get_sec_metrics(ticker):
     """Get SEC metrics for a ticker (fetches fresh each time for now)"""
     ticker = ticker.upper()
@@ -670,32 +928,131 @@ def get_sec_metrics(ticker):
     return fetch_company_metrics(ticker, cik)
 
 
-def get_sec_eps(ticker, log_source=True):
+def _next_expected_filing(cached):
+    """Date a newer 10-K could first plausibly exist for this cached company.
+
+    Derived from the latest cached fiscal period end: the next fiscal year ends
+    a year later, and the 10-K follows within SEC_EPS_FILING_LAG_DAYS. Returns
+    None when the cache has no usable period_end.
+    """
+    history = (cached or {}).get('eps_history') or []
+    period_end = None
+    for row in history:
+        # eps_history is ordered year DESC; take the newest row that has a date.
+        end = row.get('period_end') or row.get('end')
+        if end:
+            period_end = end
+            break
+
+    if not period_end:
+        return None
+
+    try:
+        fy_end = datetime.strptime(period_end, '%Y-%m-%d')
+    except (ValueError, TypeError):
+        return None
+
+    try:
+        next_fy_end = fy_end.replace(year=fy_end.year + 1)
+    except ValueError:
+        # Feb 29 fiscal year end — the following year isn't a leap year
+        next_fy_end = fy_end.replace(year=fy_end.year + 1, day=28)
+
+    return next_fy_end + timedelta(days=SEC_EPS_FILING_LAG_DAYS)
+
+
+def eps_cache_is_fresh(cached):
+    """Is this cached SEC EPS record still current?
+
+    Annual EPS only changes when a new 10-K is filed, so a flat one-day TTL
+    made every screener run re-download the whole universe's multi-megabyte
+    companyfacts documents for data that changes once a year. Freshness is
+    keyed to the filing calendar instead:
+
+    - before the next 10-K can plausibly exist -> fresh, whatever its age
+    - after that date -> fresh only if we have already re-checked since it
+      passed (so a company that files late is retried, not hammered)
+    - no fiscal dates at all -> fall back to a periodic re-probe
+    - tickers SEC has no EPS for -> long negative TTL instead of every run
+    - anything older than the hard ceiling -> always refresh, as a self-heal
+    """
+    if not cached or not cached.get('updated'):
+        return False
+
+    try:
+        updated = datetime.fromisoformat(cached['updated'])
+    except (ValueError, TypeError):
+        return False
+
+    now = datetime.now()
+    age = now - updated
+
+    # Self-heal ceiling: never trust a record indefinitely.
+    if age >= timedelta(days=SEC_EPS_MAX_AGE_DAYS):
+        return False
+
+    # Negative result: SEC has no EPS for this ticker. Re-probe occasionally
+    # instead of re-downloading companyfacts on every single run.
+    if cached.get('sec_no_eps'):
+        return age < timedelta(days=SEC_EPS_NO_DATA_RECHECK_DAYS)
+
+    expected = _next_expected_filing(cached)
+    if expected is None:
+        return age < timedelta(days=SEC_EPS_RECHECK_DAYS)
+
+    if now < expected:
+        return True
+
+    # The filing window has opened. Fresh only if this record was written
+    # after it opened (i.e. we already looked and there was nothing new).
+    return updated >= expected
+
+
+def get_sec_eps(ticker, log_source=True, force=False):
     """Get SEC EPS data for a ticker, using cache when available"""
     ticker = ticker.upper()
     cached = load_company_cache(ticker)
 
-    # Check if cache is fresh enough
-    if cached and cached.get('updated'):
-        try:
-            updated = datetime.fromisoformat(cached['updated'])
-            if datetime.now() - updated < timedelta(days=EPS_CACHE_DAYS):
-                # Using cached data - mark it so caller knows
-                cached['_from_cache'] = True
-                return cached
-        except (ValueError, TypeError):
-            pass
+    # Check if cache is fresh enough (filing-calendar aware)
+    if cached and not force and eps_cache_is_fresh(cached):
+        # Using cached data - mark it so caller knows
+        cached['_from_cache'] = True
+        return cached
 
     # Fetch fresh data from SEC API
     cik = get_cik_for_ticker(ticker)
     if not cik:
         return None
 
-    data = fetch_company_eps(ticker, cik)
+    data, status = _fetch_company_eps_with_status(ticker, cik)
     if data:
         data['_from_cache'] = False
         save_company_cache(ticker, data)
         return data
+
+    # SEC answered but has no usable EPS for this filer: persist that as a
+    # dated negative result so the next run doesn't re-download the whole
+    # companyfacts document to rediscover it. Previously nothing was written on
+    # this path, so `updated` never advanced and no-EPS tickers were re-fetched
+    # on every run forever. A transport error records nothing.
+    if status == 'no_eps':
+        record = dict(cached) if cached else {'ticker': ticker}
+        had_history = bool(record.get('eps_history'))
+        record.update({
+            'cik': cik,
+            'updated': datetime.now().isoformat(),
+        })
+        # Only flag sec_no_eps for a filer we have never had EPS for. If we hold
+        # history and SEC suddenly returns none, keep the history and just stamp
+        # the re-check date rather than blanking a good company.
+        if not had_history:
+            record['sec_no_eps'] = True
+            record['reason'] = record.get('reason') or 'No EPS data in SEC companyfacts'
+        record.pop('_from_cache', None)
+        try:
+            save_company_cache(ticker, record)
+        except Exception as e:
+            print(f"[SEC] Could not persist no-EPS marker for {ticker}: {e}")
 
     # Return stale cache if fetch failed
     if cached:
@@ -705,16 +1062,7 @@ def get_sec_eps(ticker, log_source=True):
 
 def is_cache_stale(ticker):
     """Check if a ticker's cache needs updating"""
-    cached = load_company_cache(ticker)
-    if not cached:
-        return True
-    if not cached.get('updated'):
-        return True
-    try:
-        updated = datetime.fromisoformat(cached['updated'])
-        return datetime.now() - updated >= timedelta(days=EPS_CACHE_DAYS)
-    except (ValueError, TypeError):
-        return True
+    return not eps_cache_is_fresh(load_company_cache(ticker))
 
 
 def has_cached_eps(ticker):
@@ -1108,7 +1456,7 @@ def fetch_10k_filings(ticker, cik):
     try:
         rate_limit()
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        response = requests.get(url, headers=SEC_HEADERS, timeout=SEC_REQUEST_TIMEOUT)
+        response = _SEC_SESSION.get(url, timeout=SEC_REQUEST_TIMEOUT)
 
         if response.status_code != 200:
             print(f"[SEC] Failed to fetch submissions for {ticker}: {response.status_code}")

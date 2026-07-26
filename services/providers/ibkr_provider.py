@@ -282,22 +282,52 @@ class IBKRPriceProvider(PriceProvider):
 
     def _create_stock_contract(self, ticker: str):
         """Create and qualify a stock contract for the given ticker."""
+        contracts = self._create_stock_contracts([ticker])
+        return contracts.get(ticker.upper())
+
+    def _create_stock_contracts(self, tickers: List[str]) -> Dict[str, object]:
+        """Create and qualify contracts for many tickers in ONE TWS round trip.
+
+        qualifyContracts accepts multiple contracts; qualifying one at a time
+        cost a synchronous request/response to TWS per symbol before the first
+        market-data request could even go out. Qualified contracts are also
+        memoized on the connection - conIds are stable, so repeat runs skip
+        qualification entirely.
+        """
         module = self._connection.module
         ib = self._connection.ib
         if module is None or ib is None:
-            return None
+            return {}
 
-        contract = module.Stock(ticker.upper(), 'SMART', 'USD')
+        symbols = [t.upper() for t in tickers]
+        cache = getattr(self._connection, '_contract_cache', None)
+        if cache is None:
+            cache = {}
+            setattr(self._connection, '_contract_cache', cache)
 
-        # Qualify the contract to get conId
+        out = {s: cache[s] for s in symbols if s in cache}
+        pending = [s for s in symbols if s not in cache]
+        if not pending:
+            return out
+
+        built = {s: module.Stock(s, 'SMART', 'USD') for s in pending}
+
         try:
-            qualified = ib.qualifyContracts(contract)
-            if qualified:
-                return qualified[0]
+            qualified = ib.qualifyContracts(*built.values())
+            for contract in qualified or []:
+                symbol = getattr(contract, 'symbol', '').upper()
+                if symbol in built:
+                    cache[symbol] = contract
+                    out[symbol] = contract
         except Exception:
             pass
 
-        return contract
+        # Anything TWS did not qualify still gets its unqualified contract, as
+        # before - but is NOT cached, so it is retried next time.
+        for symbol, contract in built.items():
+            out.setdefault(symbol, contract)
+
+        return out
 
     def _wait_for_market_data(self, ticker, timeout: float = MARKET_DATA_TIMEOUT) -> Optional[float]:
         """
@@ -423,10 +453,14 @@ class IBKRPriceProvider(PriceProvider):
         ticker_data = {}  # Maps ticker symbol to IB ticker object
 
         try:
+            # Qualify every contract in the batch up front (one round trip)
+            # instead of a serial TWS request per symbol inside the loop.
+            contracts = self._create_stock_contracts(tickers)
+
             # Request snapshot data for all tickers in batch
             for symbol in tickers:
                 try:
-                    contract = self._create_stock_contract(symbol)
+                    contract = contracts.get(symbol.upper())
                     if contract:
                         # Request market data with snapshot=True for auto-cancel
                         # Parameters: contract, genericTickList, snapshot, regulatorySnapshot

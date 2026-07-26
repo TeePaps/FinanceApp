@@ -12,6 +12,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from typing import Dict, List
+
+from config import SEC_REQUEST_TIMEOUT
 from .base import (
     EPSProvider, SplitProvider, BalanceSheetProvider, SharesOutstandingProvider,
     ProviderResult, EPSData, SplitData, SECMetricsData, FilingsData,
@@ -42,6 +44,17 @@ class SECEPSProvider(EPSProvider):
     @property
     def rate_limit(self) -> float:
         return 0.12  # SEC limit: 10 requests/second
+
+    @property
+    def self_rate_limited(self) -> bool:
+        # sec_data.rate_limit() throttles every actual SEC request already.
+        return True
+
+    @property
+    def request_timeout(self) -> float:
+        # companyfacts documents are multi-MB; don't abandon a download that
+        # SEC is still legitimately serving within its own timeout.
+        return SEC_REQUEST_TIMEOUT
 
     @property
     def is_authoritative(self) -> bool:
@@ -403,7 +416,18 @@ class SECSplitProvider(SplitProvider):
 
     @property
     def rate_limit(self) -> float:
-        return 0.12
+        return 0.12  # SEC limit: 10 requests/second
+
+    @property
+    def self_rate_limited(self) -> bool:
+        # sec_data.rate_limit() throttles every actual SEC request already.
+        return True
+
+    @property
+    def request_timeout(self) -> float:
+        # companyfacts documents are multi-MB; don't abandon a download that
+        # SEC is still legitimately serving within its own timeout.
+        return SEC_REQUEST_TIMEOUT
 
     @property
     def is_authoritative(self) -> bool:
@@ -439,7 +463,18 @@ class SECBalanceSheetProvider(BalanceSheetProvider):
 
     @property
     def rate_limit(self) -> float:
-        return 0.12
+        return 0.12  # SEC limit: 10 requests/second
+
+    @property
+    def self_rate_limited(self) -> bool:
+        # sec_data.rate_limit() throttles every actual SEC request already.
+        return True
+
+    @property
+    def request_timeout(self) -> float:
+        # companyfacts documents are multi-MB; don't abandon a download that
+        # SEC is still legitimately serving within its own timeout.
+        return SEC_REQUEST_TIMEOUT
 
     @property
     def is_authoritative(self) -> bool:
@@ -491,7 +526,18 @@ class SECSharesOutstandingProvider(SharesOutstandingProvider):
 
     @property
     def rate_limit(self) -> float:
-        return 0.12
+        return 0.12  # SEC limit: 10 requests/second
+
+    @property
+    def self_rate_limited(self) -> bool:
+        # sec_data.rate_limit() throttles every actual SEC request already.
+        return True
+
+    @property
+    def request_timeout(self) -> float:
+        # companyfacts documents are multi-MB; don't abandon a download that
+        # SEC is still legitimately serving within its own timeout.
+        return SEC_REQUEST_TIMEOUT
 
     @property
     def is_authoritative(self) -> bool:

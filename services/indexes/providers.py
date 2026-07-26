@@ -21,6 +21,35 @@ INDEX_CIRCUIT_COOLDOWN = 600  # seconds (10 min)
 from config import INDEX_PROVIDER_TIMEOUT
 
 
+def _build_index_session():
+    """Pooled, retrying session shared by all index-constituent providers.
+
+    These providers hit the same few hosts (Wikipedia, Slickcharts, iShares,
+    GitHub) repeatedly, each with a bare requests.get() that re-handshakes TLS
+    every time. A shared session also gives the fallback chain sane retry
+    behaviour on transient 5xx/429 responses.
+    """
+    session = requests.Session()
+    try:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        retry = Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(['GET']),
+        )
+        session.mount('https://', HTTPAdapter(pool_maxsize=4, max_retries=retry))
+        session.mount('http://', HTTPAdapter(pool_maxsize=4, max_retries=retry))
+    except Exception:
+        pass
+    return session
+
+
+_INDEX_SESSION = _build_index_session()
+
+
 # =============================================================================
 # Cross-Platform HTML Parser Detection
 # =============================================================================
@@ -189,7 +218,7 @@ class WikipediaIndexProvider(IndexProvider):
         url, table_idx, col_name = self.INDEX_CONFIG[index_id]
 
         try:
-            resp = requests.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
+            resp = _INDEX_SESSION.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
             resp.raise_for_status()
 
             tables = _read_html_safe(resp.text)
@@ -282,7 +311,7 @@ class SlickchartsIndexProvider(IndexProvider):
         url, col_name = self.INDEX_CONFIG[index_id]
 
         try:
-            resp = requests.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
+            resp = _INDEX_SESSION.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
             resp.raise_for_status()
 
             tables = _read_html_safe(resp.text)
@@ -374,7 +403,7 @@ class iSharesIndexProvider(IndexProvider):
         url, ticker_col = self.ETF_CONFIG[index_id]
 
         try:
-            resp = requests.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
+            resp = _INDEX_SESSION.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
             resp.raise_for_status()
 
             # iShares CSV has metadata rows at the top
@@ -481,7 +510,7 @@ class GitHubIndexProvider(IndexProvider):
         url, col_name, last_update = self.INDEX_CONFIG[index_id]
 
         try:
-            resp = requests.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
+            resp = _INDEX_SESSION.get(url, headers=self.HEADERS, timeout=INDEX_PROVIDER_TIMEOUT)
             resp.raise_for_status()
 
             df = pd.read_csv(StringIO(resp.text))

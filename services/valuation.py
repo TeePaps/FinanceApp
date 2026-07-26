@@ -18,7 +18,8 @@ from config import (
 )
 
 
-def get_split_adjusted_eps_history(ticker: str) -> List[Dict]:
+def get_split_adjusted_eps_history(ticker: str, eps_history_map: Dict = None,
+                                   splits_map: Dict = None) -> List[Dict]:
     """
     Return eps_history with EPS values adjusted for any splits that occurred
     AFTER each fiscal year. Adjusted values are on the SAME per-share basis as
@@ -40,10 +41,20 @@ def get_split_adjusted_eps_history(ticker: str) -> List[Dict]:
         on rows that were touched.
     """
     import database as db
-    history = db.get_eps_history(ticker)
+    # Callers that process many tickers can pass pre-loaded maps to avoid two
+    # connections + two queries per ticker (this runs up to three times per
+    # ticker per screener run).
+    if eps_history_map is not None:
+        history = eps_history_map.get(ticker.upper(), [])
+    else:
+        history = db.get_eps_history(ticker)
     if not history:
         return []
-    splits = db.get_splits(ticker)
+
+    if splits_map is not None:
+        splits = splits_map.get(ticker.upper(), [])
+    else:
+        splits = db.get_splits(ticker)
     if not splits:
         return [dict(row) for row in history]
 
@@ -210,7 +221,28 @@ def get_validated_eps(ticker):
     return [], 'none', validation_info
 
 
-def refresh_splits(ticker, orchestrator=None):
+def needs_split_refresh(ticker, last_checked=None):
+    """Is this ticker's split history older than the configured cache window?
+
+    Splits are rare corporate actions; split_cache_days governs how often we
+    look. Shared by the screener's splits phase and refresh_splits() so both
+    apply the same policy - previously only the screener had a gate, and every
+    single /api/valuation request fired a live split fetch.
+    """
+    import database as db
+    from services.providers import get_config as get_provider_config
+
+    if last_checked is None:
+        last_checked = db.get_split_history_last_updated(ticker.upper())
+    if not last_checked:
+        return True
+
+    cutoff = (datetime.now() - timedelta(
+        days=get_provider_config().split_cache_days)).isoformat()
+    return last_checked < cutoff
+
+
+def refresh_splits(ticker, orchestrator=None, force=False):
     """
     Fetch split history for a ticker from the provider chain and persist it.
 
@@ -218,21 +250,32 @@ def refresh_splits(ticker, orchestrator=None):
     Silently swallows fetch errors — this feature is informational and must
     not break the main valuation flow.
 
+    Skips the network entirely when the stored split data is still within
+    split_cache_days (pass force=True for an explicit user refresh).
+
     Args:
         ticker: Stock ticker symbol
         orchestrator: Optional DataOrchestrator (fetched lazily if None)
+        force: Ignore the freshness gate and always re-fetch
     """
     import database as db
     ticker = ticker.upper()
 
     try:
+        if not force and not needs_split_refresh(ticker):
+            return
+
         if orchestrator is None:
             from services.providers import get_orchestrator
             orchestrator = get_orchestrator()
 
         result = orchestrator.fetch_splits(ticker)
-        if result.success and result.data and result.data.splits:
-            db.upsert_splits(ticker, result.data.splits, source=result.source or 'unknown')
+        if result.success and result.data:
+            if result.data.splits:
+                db.upsert_splits(ticker, result.data.splits, source=result.source or 'unknown')
+            # Record the check either way, so a ticker that has simply never
+            # split is not re-fetched on every subsequent run.
+            db.record_split_checks([ticker])
     except Exception:
         pass
 

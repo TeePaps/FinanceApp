@@ -55,7 +55,11 @@ def api_data_status():
     orchestrator = get_orchestrator()
     sec_status = orchestrator.get_sec_cache_status()
 
-    # Index data status - use consolidated data
+    # Index data status - use consolidated data.
+    # Load the valuations table ONCE and reuse it for every index; this loop
+    # previously triggered a full table scan per index (6-9 per request).
+    all_valuations = db.get_all_valuations()
+
     indices = []
     for index_name in VALID_INDICES:
         try:
@@ -69,8 +73,9 @@ def api_data_status():
                 total_tickers = len(data.get('tickers', []))
                 index_tickers = data.get('tickers', [])
 
-            # Get valuations from consolidated storage
-            valuations = data_manager.get_valuations_for_index(index_name, index_tickers)
+            # Get valuations from consolidated storage (pre-loaded above)
+            valuations = data_manager.get_valuations_for_index(
+                index_name, index_tickers, all_valuations=all_valuations)
             valuations_count = len(valuations)
 
             # Count by EPS source
@@ -201,9 +206,13 @@ def api_screener_update_dividends():
             'phase': 'dividends', 'index': idx
         })
 
+        # Load the valuations table ONCE for the whole run. The per-ticker
+        # lookup below used to call load_valuations() inside the loop, so an
+        # N-ticker update read the entire table N times (O(N^2) row reads).
+        all_valuations = data_manager.load_valuations().get('valuations', {})
+
         if idx == 'all':
-            valuations = data_manager.load_valuations().get('valuations', {})
-            tickers = list(valuations.keys())
+            tickers = list(all_valuations.keys())
         else:
             tickers = list(data_manager.get_index_tickers(idx) or [])
 
@@ -227,7 +236,7 @@ def api_screener_update_dividends():
                     dividend_data_obj = result.data
                     annual_dividend = dividend_data_obj.annual_dividend
 
-                    existing = data_manager.load_valuations().get('valuations', {}).get(ticker, {})
+                    existing = all_valuations.get(ticker, {})
                     if existing:
                         # Use the canonical helper so the sanity rules and the
                         # configured multiplier apply, and recompute

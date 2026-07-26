@@ -16,6 +16,8 @@ Key characteristics:
 See: https://github.com/piotryordanov/defeatbeta-api
 """
 
+import functools
+import importlib.util
 from typing import Dict, List
 from datetime import datetime
 
@@ -25,13 +27,18 @@ from .base import (
 )
 
 
+@functools.lru_cache(maxsize=1)
 def _is_defeatbeta_available() -> bool:
-    """Check if defeatbeta-api package is installed."""
-    try:
-        import defeatbeta_api
-        return True
-    except ImportError:
-        return False
+    """Check if the defeatbeta-api package is installed.
+
+    Deliberately a spec lookup rather than a real import: importing
+    defeatbeta_api executes an nltk.download() and a Hugging Face lookup at
+    module scope, so probing availability - which init_providers() does for
+    every provider at startup - would block on two third-party network calls
+    and can raise non-ImportError exceptions when offline. The real import
+    happens lazily at first data use instead.
+    """
+    return importlib.util.find_spec('defeatbeta_api') is not None
 
 
 class DefeatBetaPriceProvider(PriceProvider):
@@ -119,12 +126,66 @@ class DefeatBetaPriceProvider(PriceProvider):
                 error=str(e)
             )
 
+    def _fetch_prices_batched(self, tickers: List[str]):
+        """One DuckDB query returning the latest close for every ticker.
+
+        Returns {ticker: ProviderResult} for the tickers found, or None if the
+        batched path is unavailable - in which case the caller falls back to
+        the per-ticker loop.
+        """
+        try:
+            from defeatbeta_api.data.ticker import Ticker
+
+            # The client exposes the shared DuckDB connection and the resolved
+            # parquet URL through any Ticker instance.
+            probe = Ticker(tickers[0])
+            conn = getattr(probe, 'conn', None) or getattr(probe, 'client', None)
+            query = getattr(conn, 'query', None) or getattr(conn, 'execute', None)
+            url = getattr(probe, 'stock_prices_url', None)
+            if query is None or not url:
+                return None
+
+            symbols = ", ".join("'" + t.replace("'", "''") + "'" for t in tickers)
+            sql = f"""
+                SELECT symbol, close FROM '{url}'
+                WHERE symbol IN ({symbols})
+                QUALIFY row_number() OVER (
+                    PARTITION BY symbol ORDER BY report_date DESC) = 1
+            """
+            frame = query(sql)
+            if hasattr(frame, 'df'):
+                frame = frame.df()
+            if frame is None or frame.empty:
+                return None
+
+            results = {}
+            for _, row in frame.iterrows():
+                symbol = str(row['symbol']).upper()
+                try:
+                    price = float(row['close'])
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    results[symbol] = ProviderResult(
+                        success=True, data=price, source=self.name)
+
+            for ticker in tickers:
+                if ticker not in results:
+                    results[ticker] = ProviderResult(
+                        success=False, data=None, source=self.name,
+                        error=f"No price data available for {ticker}")
+            return results
+
+        except Exception:
+            # Any shape mismatch in the third-party client: fall back quietly.
+            return None
+
     def fetch_prices(self, tickers: List[str]) -> Dict[str, ProviderResult]:
         """
         Batch fetch prices for multiple tickers.
 
-        DefeatBeta uses DuckDB which can efficiently query multiple symbols,
-        but the API is ticker-by-ticker. We loop but benefit from cached data.
+        Uses a single DuckDB query across all symbols when the client exposes
+        its connection, falling back to the per-ticker path otherwise.
         """
         tickers = [t.upper() for t in tickers]
         results = {}
@@ -152,8 +213,15 @@ class DefeatBetaPriceProvider(PriceProvider):
                 )
             return results
 
-        for ticker in tickers:
-            results[ticker] = self.fetch_price(ticker)
+        # Try one DuckDB query for the whole set. Looping fetch_price() ran a
+        # full remote parquet scan per ticker to read one closing price, which
+        # made supports_batch=True a claim the provider did not honour.
+        batched = self._fetch_prices_batched(tickers)
+        if batched is not None:
+            results.update(batched)
+        else:
+            for ticker in tickers:
+                results[ticker] = self.fetch_price(ticker)
 
         # Log results for larger batches
         if len(tickers) > 5:

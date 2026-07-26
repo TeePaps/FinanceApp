@@ -4,12 +4,11 @@ Provides automatic price refresh during US market hours.
 Can be enabled/disabled via config.yaml settings.
 """
 
+import os
 import threading
-from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.base import STATE_RUNNING, STATE_PAUSED
-import pytz
 
 import config
 from services import screener as screener_service
@@ -17,24 +16,49 @@ from services.activity_log import activity_log
 
 _scheduler = None
 
+# Held open for the process lifetime so the OS releases it automatically on
+# exit. A second process that fails to take it must not schedule anything.
+_lock_handle = None
 
-def is_market_open():
-    """Check if US stock market is currently open."""
-    tz = pytz.timezone(config.MARKET_TIMEZONE)
-    now = datetime.now(tz)
 
-    # Weekend check
-    if now.weekday() >= 5:
+def _acquire_singleton_lock():
+    """Take an exclusive cross-process lock so only one scheduler ever runs.
+
+    Two app processes (a stray server, or a reloader parent/child pair) would
+    otherwise each fire the refresh job, doubling external API calls and
+    writing public.db concurrently. Returns True if this process owns the lock.
+    """
+    global _lock_handle
+
+    try:
+        import fcntl
+    except ImportError:
+        # Non-POSIX platform: fall back to letting the scheduler start.
+        return True
+
+    lock_path = os.path.join(config.USER_DATA_DIR, 'scheduler.lock')
+    try:
+        os.makedirs(config.USER_DATA_DIR, exist_ok=True)
+        handle = open(lock_path, 'w')
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
         return False
 
-    # Parse market hours
-    start_h, start_m = map(int, config.MARKET_HOURS_START.split(':'))
-    end_h, end_m = map(int, config.MARKET_HOURS_END.split(':'))
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _lock_handle = handle
+    return True
 
-    market_open = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-    market_close = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
 
-    return market_open <= now <= market_close
+def is_market_open():
+    """Check if US stock market is currently open.
+
+    Delegates to services.utils so the scheduler and the price cache agree on
+    what "market hours" means - the cache uses the same window to decide that
+    an after-hours price cannot have changed.
+    """
+    from services.utils import is_market_open as _is_open
+    return _is_open()
 
 
 def auto_refresh_prices():
@@ -61,6 +85,11 @@ def init_scheduler(app=None):
 
     if not config.SCHEDULER_ENABLED:
         activity_log.log('info', 'scheduler', 'Background scheduler disabled in config')
+        return
+
+    if not _acquire_singleton_lock():
+        activity_log.log('warning', 'scheduler',
+            'Another process already owns the scheduler - not starting a second one')
         return
 
     _scheduler = BackgroundScheduler()
