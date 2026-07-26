@@ -582,10 +582,16 @@ async function loadStalenessDashboard() {
 // Restore tab from URL hash on page load/refresh.
 // Always resolves to a tab (defaulting to 'summary') so showTab() is the one
 // place that decides what the initial view loads.
+// Valid tab names, derived from the markup rather than hardcoded - a stale
+// list here silently redirects real tabs (stars, settings, logs) to summary.
+function getValidTabs() {
+    return Array.from(document.querySelectorAll('.tab-content[id$="-tab"]'))
+        .map(el => el.id.replace(/-tab$/, ''));
+}
+
 function restoreTabFromHash() {
     const hash = window.location.hash.slice(1); // Remove the #
-    const validTabs = ['summary', 'holdings', 'profit', 'add', 'research', 'screener', 'recommendations', 'datasets'];
-    const target = hash && validTabs.includes(hash) ? hash : 'summary';
+    const target = hash && getValidTabs().includes(hash) ? hash : 'summary';
     // Already showing it (we got here from showTab's own hash write) - the
     // data has just been loaded, so don't load it all over again.
     if (target === activeTab) return;
