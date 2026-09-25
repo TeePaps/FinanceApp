@@ -179,7 +179,7 @@ db.bulk_update_valuations({"AAPL": {...}, "GOOGL": {...}})
 ## Testing
 
 **No test suite exists.** When making changes:
-1. Run the app: `./venv/bin/python app.py`
+1. Restart the app: `python3 restart_server.py restart` (cross-platform; use `py` on Windows). This finds the venv itself, kills any existing server, starts a detached one, and health-checks `http://127.0.0.1:8080/healthz`. Check `logs/server.log` if it doesn't come up. (Windows: use `venv\\Scripts\\python.exe` instead of `./venv/bin/python` for the commands below.)
 2. Test the affected UI tab manually
 3. Check terminal for errors
 4. For provider changes, test with:

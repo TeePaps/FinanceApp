@@ -19,6 +19,7 @@ Usage:
 """
 
 import json
+import sys
 import time
 import threading
 from collections import deque
@@ -39,15 +40,32 @@ class ActivityLogManager:
     # Valid log levels for validation
     VALID_LEVELS = {DEBUG, INFO, SUCCESS, WARNING, ERROR}
 
-    # ANSI color codes for console output
-    COLORS = {
-        DEBUG: '\033[90m',      # Gray
-        INFO: '\033[94m',       # Blue
-        SUCCESS: '\033[92m',    # Green
-        WARNING: '\033[93m',    # Yellow
-        ERROR: '\033[91m',      # Red
-        'RESET': '\033[0m'
-    }
+    # ANSI color codes for console output. Only emitted when stdout is an
+    # interactive terminal - a cmd.exe window renders raw escapes as garbage,
+    # and a redirected log file ends up with binary escape bytes in it.
+    try:
+        _IS_TTY = sys.stdout.isatty()
+    except Exception:
+        _IS_TTY = False
+
+    if _IS_TTY:
+        COLORS = {
+            DEBUG: '\033[90m',      # Gray
+            INFO: '\033[94m',       # Blue
+            SUCCESS: '\033[92m',    # Green
+            WARNING: '\033[93m',    # Yellow
+            ERROR: '\033[91m',      # Red
+            'RESET': '\033[0m'
+        }
+    else:
+        COLORS = {
+            DEBUG: '',
+            INFO: '',
+            SUCCESS: '',
+            WARNING: '',
+            ERROR: '',
+            'RESET': ''
+        }
 
     def __init__(self, max_entries: int = 100):
         """
@@ -108,9 +126,19 @@ class ActivityLogManager:
         # Include ticker if present
         if entry['ticker']:
             ticker_str = f"[{entry['ticker']}]"
-            print(f"[ActivityLog] {level_str} {source_str} {ticker_str} {entry['message']}")
+            text = f"[ActivityLog] {level_str} {source_str} {ticker_str} {entry['message']}"
         else:
-            print(f"[ActivityLog] {level_str} {source_str} {entry['message']}")
+            text = f"[ActivityLog] {level_str} {source_str} {entry['message']}"
+
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            # stdout's codec (e.g. cp1252 on a redirected Windows console)
+            # can't represent characters like the '✓' checkmark used in
+            # screener messages. Fall back to a best-effort transliteration
+            # instead of losing the log line.
+            encoding = getattr(sys.stdout, 'encoding', None) or 'ascii'
+            print(text.encode(encoding, errors='replace').decode(encoding))
 
     def _notify_subscribers(self, entry: Dict) -> None:
         """Send log entry to all active SSE subscribers."""

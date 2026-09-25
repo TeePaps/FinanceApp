@@ -1,5 +1,6 @@
 from flask import Flask, render_template, jsonify, request, Response
 import os
+import sys
 import time
 import json
 from datetime import datetime, timedelta
@@ -175,6 +176,11 @@ def get_excluded_tickers_info():
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+@app.route('/healthz')
+def healthz():
+    return jsonify({"status": "ok"}), 200
 
 
 # =============================================================================
@@ -767,6 +773,8 @@ def api_enabled_ticker_count():
 @app.before_request
 def check_startup_tasks():
     """Run startup tasks on first request"""
+    if request.path == '/healthz':
+        return
     global startup_check_done
     if not startup_check_done:
         startup_check_done = True
@@ -838,6 +846,10 @@ def check_html_parser_dependencies():
 if __name__ == '__main__':
     import atexit
 
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, 'reconfigure'):
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+
     # The Werkzeug reloader runs this module in TWO processes: a supervisor and
     # the child that actually serves. Initializing providers and the scheduler
     # in both makes every scheduled refresh fire twice - doubling external API
@@ -864,4 +876,15 @@ if __name__ == '__main__':
         init_scheduler(app)
         atexit.register(shutdown_scheduler)
 
-    app.run(debug=True, port=8080, use_reloader=use_reloader)
+        import signal
+        def _graceful_exit(signum, frame):
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, _graceful_exit)
+        if hasattr(signal, 'SIGBREAK'):
+            signal.signal(signal.SIGBREAK, _graceful_exit)
+
+    host = os.environ.get('FINANCEAPP_HOST', '127.0.0.1')
+    port = int(os.environ.get('FINANCEAPP_PORT', '8080'))
+    debug = os.environ.get('FINANCEAPP_DEBUG', '1') == '1'
+
+    app.run(host=host, port=port, debug=debug, use_reloader=use_reloader)

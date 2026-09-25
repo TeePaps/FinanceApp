@@ -13,25 +13,76 @@ A Flask-based web application for tracking stock portfolios, analyzing market va
 - **Profit Timeline**: Visualize trading performance over time
 - **Multi-Provider Architecture**: Pluggable data sources with automatic fallback chains
 
-## Quick Start
+## Quick Start (any OS)
+
+Requires Python 3.9+.
 
 ```bash
 # Clone the repository
 git clone <repo-url>
 cd FinanceApp
 
+# macOS/Linux: create the venv, install dependencies, and start the server
+python3 restart_server.py setup
+python3 restart_server.py restart
+
+# Windows: same, using py (or python)
+py restart_server.py setup
+py restart_server.py restart
+```
+
+Open http://127.0.0.1:8080 in your browser. Databases are created automatically on first run.
+
+### Manual setup
+
+If you'd rather set up the environment yourself:
+
+```bash
 # Create virtual environment
 python3 -m venv venv
+
+# macOS/Linux
 source venv/bin/activate
+
+# Windows
+venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
-
-# Run the app
-python app.py
 ```
 
-Open http://localhost:8080 in your browser. Databases are created automatically on first run.
+Then use `restart_server.py` (below) to start/stop the server.
+
+## Running the server
+
+`restart_server.py` is the cross-platform launcher for the dev server. It finds the venv itself, so it works even when invoked with the system `python`/`python3`/`py`.
+
+```bash
+python3 restart_server.py restart   # stop any existing server, start a new one, health-check it (default)
+python3 restart_server.py start     # start without stopping an existing server first
+python3 restart_server.py stop      # stop the running server
+python3 restart_server.py status    # check whether the server is up
+python3 restart_server.py setup     # create the venv, install requirements, mark public.db skip-worktree
+```
+
+On Windows, use `py restart_server.py ...` (or `python`). Thin shims are also available: `./restart-server.sh` (POSIX) and `restart-server.bat` (Windows) — both just run `restart_server.py`.
+
+- Logs: `logs/server.log` (the previous run's log is rotated to `logs/server.log.1` on each restart) and `logs/app.log`.
+- Health check: `GET http://127.0.0.1:8080/healthz`.
+- Env vars: `FINANCEAPP_HOST` (default `127.0.0.1`), `FINANCEAPP_PORT` (default `8080`), `FINANCEAPP_DEBUG` (default `1`), `FINANCEAPP_RELOADER` (default `0`).
+
+## Market database (data_public/public.db)
+
+`data_public/public.db` is committed to the repo as a **seed** — enough data to run the app out of the box. `restart_server.py setup` marks it `skip-worktree` so local screener runs never show up as changes in `git status`.
+
+To intentionally publish a refreshed seed:
+
+```bash
+git update-index --no-skip-worktree data_public/public.db
+git add data_public/public.db
+git commit -m "Refresh public.db seed"
+git update-index --skip-worktree data_public/public.db
+```
 
 ## Tech Stack
 
