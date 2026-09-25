@@ -33,20 +33,45 @@ def _acquire_singleton_lock():
     try:
         import fcntl
     except ImportError:
-        # Non-POSIX platform: fall back to letting the scheduler start.
+        fcntl = None
+
+    if fcntl is not None:
+        lock_path = os.path.join(config.USER_DATA_DIR, 'scheduler.lock')
+        try:
+            os.makedirs(config.USER_DATA_DIR, exist_ok=True)
+            handle = open(lock_path, 'w')
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError):
+            return False
+
+        handle.write(str(os.getpid()))
+        handle.flush()
+        _lock_handle = handle
         return True
 
-    lock_path = os.path.join(config.USER_DATA_DIR, 'scheduler.lock')
     try:
-        os.makedirs(config.USER_DATA_DIR, exist_ok=True)
-        handle = open(lock_path, 'w')
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (OSError, BlockingIOError):
-        return False
+        import msvcrt
+    except ImportError:
+        msvcrt = None
 
-    handle.write(str(os.getpid()))
-    handle.flush()
-    _lock_handle = handle
+    if msvcrt is not None:
+        lock_path = os.path.join(config.USER_DATA_DIR, 'scheduler.lock')
+        try:
+            os.makedirs(config.USER_DATA_DIR, exist_ok=True)
+            handle = open(lock_path, 'w')
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+
+        handle.write(str(os.getpid()))
+        handle.flush()
+        _lock_handle = handle
+        return True
+
+    # Neither locking primitive is available on this platform: fail open.
+    activity_log.log('warning', 'scheduler',
+                      'No file-locking primitive available (fcntl/msvcrt missing); '
+                      'skipping singleton lock, multiple processes may schedule jobs.')
     return True
 
 

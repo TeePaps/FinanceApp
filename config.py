@@ -16,7 +16,7 @@ _CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.yaml')
 def _load_config():
     """Load configuration from YAML file."""
     try:
-        with open(_CONFIG_FILE, 'r') as f:
+        with open(_CONFIG_FILE, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
     except FileNotFoundError:
         print(f"[Config] Warning: {_CONFIG_FILE} not found, using defaults")

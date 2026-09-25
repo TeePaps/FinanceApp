@@ -33,7 +33,8 @@ if not log.handlers:
     file_handler = RotatingFileHandler(
         LOG_FILE,
         maxBytes=MAX_BYTES,
-        backupCount=BACKUP_COUNT
+        backupCount=BACKUP_COUNT,
+        encoding='utf-8'
     )
     file_handler.setLevel(logging.DEBUG)
 
@@ -97,7 +98,7 @@ def tail_log(lines=50):
     if not os.path.exists(LOG_FILE):
         return "No log file exists yet"
 
-    with open(LOG_FILE, 'r') as f:
+    with open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as f:
         all_lines = f.readlines()
         return ''.join(all_lines[-lines:])
 
