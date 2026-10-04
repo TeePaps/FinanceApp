@@ -153,6 +153,37 @@ def _reconcile_delistings(all_tickers, priced_tickers):
             )
 
 
+def _write_refresh_summary(job, index_name, start_time, total, full, no_eps,
+                           no_price, excluded=0):
+    """Persist the 'refresh_summary' metadata read by /api/data-status.
+
+    Shared by all four bulk jobs (job: full | quick | smart | global); call
+    only after a COMPLETED run, never on cancel or crash.
+    """
+    summary = {
+        'last_refresh': datetime.now().isoformat(),
+        'total_tickers': total,
+        'excluded_count': excluded,
+        'no_price_data': no_price,
+        'no_eps_data': no_eps,
+        'full_data': full,
+        'job': job,
+        'index': index_name,
+        'duration_seconds': round(time.time() - start_time, 1),
+    }
+    try:
+        db.set_metadata('refresh_summary', json.dumps(summary))
+    except Exception:
+        pass
+
+
+def _count_eps(valuations):
+    """(with_eps, without_eps) over an iterable of valuation rows."""
+    rows = list(valuations)
+    full = sum(1 for v in rows if v.get('eps_avg') is not None)
+    return full, len(rows) - full
+
+
 def _needs_history_refresh():
     """Should this run re-download the 3-month price history batch?
 
@@ -906,6 +937,12 @@ def run_screener(index_name='all'):
     now_iso = datetime.now().isoformat()
     db.set_metadata('last_price_update', now_iso)
     db.set_metadata('last_dividend_update', now_iso)
+    if _running:
+        if index_name == 'all':
+            db.set_metadata('last_full_sync', now_iso)
+        full, no_eps = _count_eps(valuations_batch.values())
+        _write_refresh_summary('full', index_name, start_time, len(tickers),
+                               full, no_eps, len(tickers) - len(valuations_batch))
 
     # Phase: Fetch 52-week data for tickers that need it
     if _running:
@@ -973,6 +1010,8 @@ def run_quick_price_update(index_name='all'):
     activity_log.log("info", "screener", f"Quick Update: {len(tickers)} tickers ({index_display_name})")
 
     updated_count = 0
+    completed = False
+    valuations_batch = {}
     try:
         orchestrator = get_orchestrator()
 
@@ -1146,6 +1185,7 @@ def run_quick_price_update(index_name='all'):
 
         if valuations_batch:
             data_manager.bulk_update_valuations(valuations_batch)
+        completed = True
 
     except Exception as e:
         log_error(f"Quick Update failed", e)
@@ -1156,6 +1196,11 @@ def run_quick_price_update(index_name='all'):
 
     # Update staleness metadata (prices only for quick update)
     db.set_metadata('last_price_update', datetime.now().isoformat())
+    if completed and _running:
+        full, no_eps = _count_eps(valuations_batch.values())
+        _write_refresh_summary('quick', index_name, start_time, len(tickers),
+                               full, no_eps, len(tickers) - len(valuations_batch),
+                               excluded=len(tickers_raw) - len(tickers))
 
     # Phase: Fetch 52-week data for tickers that need it
     if _running:
@@ -1250,6 +1295,11 @@ def run_smart_update(index_name='all'):
         db.record_price_successes(new_successes)
     if new_failures:
         db.record_price_failures(new_failures, threshold=FAILURE_THRESHOLD)
+    # Same outage guard as _reconcile_delistings: if no new ticker priced at
+    # all, don't count it against them. (Existing tickers are recorded there.)
+    if new_successes:
+        db.record_ticker_failures_bulk(
+            new_failures, new_successes, threshold=FAILURE_THRESHOLD, reason='no_price')
 
     if missing_tickers:
         activity_log.log("success", "screener", f"✓ Phase 1: New tickers processed")
@@ -1404,6 +1454,7 @@ def run_global_refresh():
     import numpy as np
     from data_manager import get_all_unique_tickers, get_index_data  # Lazy import
 
+    start_time = time.time()
     _running = True
 
     all_tickers_raw = get_all_unique_tickers()
@@ -1629,18 +1680,10 @@ def run_global_refresh():
     if skip_reasons['no_price'] or successful_tickers:
         record_ticker_failures(skip_reasons['no_price'], successful_tickers)
 
-    skip_summary = {
-        'last_refresh': now_iso,
-        'total_tickers': total_tickers,
-        'excluded_count': excluded_count,
-        'no_price_data': len(skip_reasons['no_price']),
-        'no_eps_data': len(skip_reasons['success_no_eps']),
-        'full_data': len(skip_reasons['success']),
-    }
-    try:
-        db.set_metadata('refresh_summary', json.dumps(skip_summary))
-    except Exception:
-        pass
+    _write_refresh_summary('global', 'all', start_time, total_tickers,
+                           len(skip_reasons['success']),
+                           len(skip_reasons['success_no_eps']),
+                           len(skip_reasons['no_price']), excluded=excluded_count)
 
     # Update staleness metadata
     db.set_metadata('last_price_update', now_iso)

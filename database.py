@@ -1713,6 +1713,22 @@ def get_fetch_checks(kind: str, tickers=None) -> Dict[str, Dict]:
     return out
 
 
+def get_ticker_fetch_checks(ticker: str) -> Dict[str, Dict]:
+    """Return {kind: {'checked_at': str, 'ok': bool}} for a single ticker."""
+    out: Dict[str, Dict] = {}
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT kind, checked_at, ok FROM fetch_checks WHERE ticker = ?',
+            (ticker.upper(),))
+        for row in cursor.fetchall():
+            out[row['kind']] = {
+                'checked_at': row['checked_at'],
+                'ok': bool(row['ok']),
+            }
+    return out
+
+
 def record_fetch_checks(kind: str, tickers: List[str], ok: bool):
     """Record the outcome of a maintenance fetch for a batch of tickers.
 

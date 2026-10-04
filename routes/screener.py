@@ -284,6 +284,27 @@ def api_data_freshness():
     price_age = calc_age(last_price, 'minutes')
     dividend_age = calc_age(last_dividend, 'days')
 
+    # Full sync: last_full_sync is written by a completed all-index screener run.
+    # last_dividend_update was the only record of one before that key existed.
+    from config import STALENESS_FULL_SYNC_DUE_DAYS
+    full_sync_last = db.get_metadata('last_full_sync')
+    full_sync_source = 'last_full_sync' if full_sync_last else None
+    if not full_sync_last and last_dividend:
+        full_sync_last = last_dividend
+        full_sync_source = 'last_dividend_update'
+
+    full_sync_age = None
+    if full_sync_last:
+        try:
+            dt = datetime.fromisoformat(full_sync_last.replace('Z', '+00:00'))
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+            full_sync_age = round((datetime.now() - dt).total_seconds() / 86400, 1)
+        except (ValueError, AttributeError):
+            pass
+    if full_sync_age is None:
+        full_sync_last = full_sync_source = None
+
     return jsonify({
         'prices': {
             'last_update': last_price,
@@ -300,6 +321,13 @@ def api_data_freshness():
             'last_update': last_dividend,
             'age_days': dividend_age,
             'status': get_freshness_status(dividend_age, 'dividend')
+        },
+        'full_sync': {
+            'last': full_sync_last,
+            'age_days': full_sync_age,
+            'due': full_sync_age is None or full_sync_age >= STALENESS_FULL_SYNC_DUE_DAYS,
+            'threshold_days': STALENESS_FULL_SYNC_DUE_DAYS,
+            'source': full_sync_source
         }
     })
 

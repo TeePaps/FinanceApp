@@ -252,6 +252,8 @@ STALENESS_PRICE_FRESH_MINUTES = _get('staleness.price_fresh_minutes', 60)
 STALENESS_PRICE_STALE_HOURS = _get('staleness.price_stale_hours', 24)
 STALENESS_DIVIDEND_FRESH_DAYS = _get('staleness.dividend_fresh_days', 7)
 STALENESS_DIVIDEND_STALE_DAYS = _get('staleness.dividend_stale_days', 30)
+# A full all-index sync older than this is reported as due by /api/data-freshness.
+STALENESS_FULL_SYNC_DUE_DAYS = _get('staleness.full_sync_due_days', 30)
 
 # How often the screener forces an unconditional full-universe dividend sweep,
 # regardless of per-ticker freshness. Selective refresh keeps normal runs cheap;

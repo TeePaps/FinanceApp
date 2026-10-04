@@ -473,7 +473,10 @@ def api_all_tickers():
             'indexes': status.get('indexes', []),
             'sec_status': status.get('sec_status', 'unknown'),
             'valuation_updated': val.get('updated'),
-            'sec_checked': status.get('sec_checked')
+            'sec_checked': status.get('sec_checked'),
+            'price_source': val.get('price_source'),
+            'price_updated': val.get('price_updated'),
+            'dividend_updated': val.get('dividend_updated')
         }
         result.append({k: v for k, v in row.items() if k in wanted} if wanted else row)
 

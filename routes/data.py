@@ -3,6 +3,7 @@ Data routes blueprint.
 
 Handles:
 - GET /api/data-status - Comprehensive data status
+- GET /api/ticker/<symbol> - Read-only per-ticker status (database only, never fetches)
 - GET /api/excluded-tickers - Get excluded tickers
 - POST /api/excluded-tickers/clear - Clear excluded tickers
 - GET /api/eps-recommendations - Get EPS update recommendations
@@ -79,7 +80,13 @@ def api_data_status():
             valuations_count = len(valuations)
 
             # Count by EPS source
-            sec_source_count = sum(1 for v in valuations if v.get('eps_source') == 'sec')
+            # eps_source is stored as 'sec', 'sec_edgar' or 'sec_cache' - all SEC-derived
+            eps_source_counts = {}
+            for v in valuations:
+                src = v.get('eps_source') or 'none'
+                eps_source_counts[src] = eps_source_counts.get(src, 0) + 1
+            sec_source_count = sum(n for src, n in eps_source_counts.items()
+                                   if src.startswith('sec'))
             yf_source_count = sum(1 for v in valuations if v.get('eps_source') == 'yfinance')
 
             # Average EPS years
@@ -102,6 +109,7 @@ def api_data_status():
                 'coverage_pct': round((valuations_count / total_tickers * 100) if total_tickers > 0 else 0, 1),
                 'sec_source_count': sec_source_count,
                 'yf_source_count': yf_source_count,
+                'eps_source_counts': eps_source_counts,
                 'avg_eps_years': round(avg_eps_years, 1),
                 'last_updated': last_updated
             })
@@ -273,3 +281,77 @@ def api_screener_update_dividends():
     thread.start()
 
     return jsonify({'status': 'started', 'index': index_name})
+
+
+def _age_minutes(timestamp):
+    """Whole minutes since an ISO timestamp, or None if absent/unparseable."""
+    if not timestamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(timestamp).replace('Z', '+00:00'))
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return max(0, int((datetime.now() - dt).total_seconds() / 60))
+    except (ValueError, TypeError):
+        return None
+
+
+@data_bp.route('/ticker/<symbol>')
+def api_ticker_status(symbol):
+    """Read-only per-ticker status. Database reads only - never calls a provider."""
+    ticker = symbol.upper()
+    val = db.get_valuation(ticker)
+    info = db.get_ticker_info(ticker)
+    if not val and not info:
+        return jsonify({'success': False, 'error': f'Unknown ticker: {ticker}'}), 404
+
+    val = val or {}
+    info = info or {}
+    sec = db.get_sec_company(ticker) or {}
+    failure = db.get_ticker_failure(ticker) or {}
+
+    price_updated = val.get('price_updated') or val.get('updated')
+    return jsonify({
+        'success': True,
+        'ticker': ticker,
+        'company_name': val.get('company_name') or info.get('company_name'),
+        'indexes': info.get('indexes', []),
+        'enabled': bool(info['enabled']) if info.get('enabled') is not None else None,
+        'delisted': bool(info['delisted']) if info.get('delisted') is not None else None,
+        'price': {
+            'value': val.get('current_price'),
+            'source': val.get('price_source'),
+            'updated': price_updated,
+            'age_minutes': _age_minutes(price_updated),
+        },
+        'eps': {
+            'avg': val.get('eps_avg'),
+            'years': val.get('eps_years'),
+            'source': val.get('eps_source'),
+            'updated': sec.get('updated'),
+            'sec_status': info.get('sec_status'),
+        },
+        'dividend': {
+            'annual': val.get('annual_dividend'),
+            'updated': val.get('dividend_updated'),
+        },
+        'valuation': {
+            'estimated_value': val.get('estimated_value'),
+            'price_vs_value': val.get('price_vs_value'),
+            'updated': val.get('updated'),
+            'fifty_two_week_high': val.get('fifty_two_week_high'),
+            'fifty_two_week_low': val.get('fifty_two_week_low'),
+            'off_high_pct': val.get('off_high_pct'),
+            'price_change_1m': val.get('price_change_1m'),
+            'price_change_3m': val.get('price_change_3m'),
+            'in_selloff': val.get('in_selloff'),
+            'selloff_severity': val.get('selloff_severity'),
+        },
+        'fetch_checks': db.get_ticker_fetch_checks(ticker),
+        'failures': {
+            'count': failure.get('failure_count', 0),
+            'last_failure': failure.get('last_failure'),
+            'reason': failure.get('reason'),
+            'delist_strikes': info.get('delist_strikes') or 0,
+        },
+    })

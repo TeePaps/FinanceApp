@@ -225,6 +225,7 @@ staleness:
   # often each kind of data can change. See also rate_limits.sec.eps_* for the
   # filing-calendar-aware EPS policy and providers.split_cache_days for splits.
   dividend_full_sweep_days: 30   # Force an unconditional full dividend sweep
+  full_sync_due_days: 30         # /api/data-freshness flags a full sync due after
   fifty_two_week_refresh_days: 7 # Refresh existing 52-week high/low after
   fifty_two_week_retry_days: 1   # Back off failed 52-week lookups for
   company_name_retry_days: 7     # Back off failed company-name lookups for
