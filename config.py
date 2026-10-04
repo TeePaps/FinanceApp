@@ -1,20 +1,26 @@
 """
 Configuration constants for the Finance App.
 
-Loads configuration from config.yaml and exposes values as Python constants.
+Loads configuration from the user's config.yaml (paths.USER_CONFIG_FILE,
+created from config.defaults.yaml if missing) and exposes values as Python
+constants.
 All magic numbers and thresholds are centralized for easy tuning and testing.
 """
 
 import os
 import yaml
 
+import paths
+from user_config import ensure_user_config
+
 # ============================================================================
 # Load Configuration from YAML
 # ============================================================================
-_CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.yaml')
+_CONFIG_FILE = paths.USER_CONFIG_FILE
 
 def _load_config():
     """Load configuration from YAML file."""
+    ensure_user_config()
     try:
         with open(_CONFIG_FILE, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
@@ -46,14 +52,15 @@ def _get(path: str, default=None):
 # Two separate databases for data isolation:
 # - data_public/public.db: Market data (SEC, indexes, valuations)
 # - data_private/private.db: Personal data (holdings, transactions)
+# Locations come from paths.py (repo in dev mode, FINANCEAPP_HOME/data when installed).
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data_public')  # Public data
-USER_DATA_DIR = os.path.join(os.path.dirname(__file__), 'data_private')  # Private data
-ARCHIVE_DIR = os.path.join(os.path.dirname(__file__), 'archive')
+DATA_DIR = paths.DATA_PUBLIC_DIR  # Public data
+USER_DATA_DIR = paths.DATA_PRIVATE_DIR  # Private data
+ARCHIVE_DIR = paths.ARCHIVE_DIR
 
-# Database paths (used by database.py)
-PUBLIC_DB_PATH = os.path.join(DATA_DIR, 'public.db')
-PRIVATE_DB_PATH = os.path.join(USER_DATA_DIR, 'private.db')
+# Database paths (database.py reads the same values from paths)
+PUBLIC_DB_PATH = paths.PUBLIC_DB_PATH
+PRIVATE_DB_PATH = paths.PRIVATE_DB_PATH
 
 # Legacy file paths (kept for migration scripts, data now in databases)
 STOCKS_FILE = os.path.join(USER_DATA_DIR, 'stocks.csv')
@@ -62,10 +69,9 @@ EXCLUDED_TICKERS_FILE = os.path.join(DATA_DIR, 'excluded_tickers.json')
 TICKER_FAILURES_FILE = os.path.join(DATA_DIR, 'ticker_failures.json')
 
 # ============================================================================
-# Auto-create required directories
+# Auto-create required directories (and seed public.db in installed mode)
 # ============================================================================
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(USER_DATA_DIR, exist_ok=True)
+paths.ensure_dirs()
 
 # ============================================================================
 # Cache Settings

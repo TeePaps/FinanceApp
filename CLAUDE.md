@@ -26,8 +26,12 @@ A stock portfolio valuation app that fetches market data from multiple providers
 ```
 FinanceApp/
 ├── app.py                 # Flask app, 40+ routes (LARGE FILE - 2000+ lines)
-├── database.py            # SQLite CRUD for both databases
+├── database.py            # SQLite CRUD for both databases (+ SCHEMA_VERSION_* / user_version)
 ├── config.py              # All constants and thresholds
+├── paths.py               # ALL data/config/log/pid locations (dev vs FINANCEAPP_HOME installed); stdlib-only
+├── version.py             # __version__ (reported by /healthz)
+├── user_config.py         # Creates/tops up config.yaml from config.defaults.yaml
+├── config.defaults.yaml   # Tracked default config; config.yaml is the untracked user copy
 ├── sec_data.py            # SEC EDGAR API integration
 ├── data_manager.py        # High-level data operations
 │
@@ -251,7 +255,7 @@ print(f'Loaded {len(data.get(\"tickers\", []))} tickers')
 ## Gotchas & Pitfalls
 
 1. **app.py is huge** - 2000+ lines, routes should move to blueprints
-2. **Two config files** - `config.py` (app) vs `services/providers/config.py` (providers)
+2. **Two config files** - `config.py` (app) vs `services/providers/config.py` (providers). Both read the untracked `config.yaml` (paths.USER_CONFIG_FILE); edit `config.defaults.yaml` to change shipped defaults. Never hardcode file locations - use `paths.py`.
 3. **Blueprints active** - Routes in `routes/` are registered via `register_blueprints()`
 4. **No tests** - Manual testing only
 5. **yfinance is fragile** - Often changes API, breaks things

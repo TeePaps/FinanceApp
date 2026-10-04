@@ -20,6 +20,11 @@ Usage:
 
 Logs: logs/server.log (appended; rotated by size via server_log.py).
 FINANCEAPP_PORT other than 8080 uses logs/server-<port>.log/.pid instead.
+
+Installed mode (FINANCEAPP_HOME set, normally by launch.py): log and PID
+files are <HOME>/run/server.log / server.pid regardless of port (one server per
+install), and the default port is 8765. Locations come from paths.py, which is
+stdlib-only so this script still runs with system Python.
 """
 
 import os
@@ -33,17 +38,24 @@ import socket
 import urllib.request
 from datetime import datetime
 
+# Import siblings (paths, server_log) from this script's own directory even
+# when invoked from elsewhere with system Python.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import paths
 import server_log
 
 # Configuration
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SERVER_PORT = int(os.environ.get("FINANCEAPP_PORT", "8080"))
+BASE_DIR = paths.CODE_DIR
+SERVER_PORT = paths.default_port()
 SERVER_HOST = os.environ.get("FINANCEAPP_HOST", "127.0.0.1")
 # Default-port paths are read by external monitoring; other ports get their
 # own files so a side run can never clobber the main instance's log/PID.
-_SUFFIX = "" if SERVER_PORT == 8080 else "-%d" % SERVER_PORT
-LOG_FILE = os.path.join(BASE_DIR, "logs", "server%s.log" % _SUFFIX)
-PID_FILE = os.path.join(BASE_DIR, "logs", "server%s.pid" % _SUFFIX)
+# An installed copy has its own RUN_DIR, so it never needs the suffix.
+_SUFFIX = "" if (paths.IS_INSTALLED or SERVER_PORT == paths.DEFAULT_PORT) \
+    else "-%d" % SERVER_PORT
+LOG_FILE = os.path.join(paths.RUN_DIR, "server%s.log" % _SUFFIX)
+PID_FILE = os.path.join(paths.RUN_DIR, "server%s.pid" % _SUFFIX)
 
 # Always use 127.0.0.1 for the health check, never "localhost" -- on
 # Windows "localhost" can resolve to ::1 first and the connection hangs
@@ -332,6 +344,7 @@ def start_server(from_restart=False):
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"  # print() must reach the log promptly
     env["FINANCEAPP_SERVER_LOG"] = LOG_FILE  # server rotates it by size
+    env["FINANCEAPP_PORT"] = str(SERVER_PORT)  # child must bind what we health-check
 
     log_fh = open(LOG_FILE, "a", encoding="utf-8")
     try:

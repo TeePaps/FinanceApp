@@ -3,6 +3,10 @@
 # ============================================================================
 # All configurable values in one place. Edit this file to tune the app.
 # The config.py module loads these values and exposes them as Python constants.
+#
+# config.defaults.yaml is the tracked, shipped default. The app reads the
+# user's config.yaml (untracked; created from this file on first run, and any
+# keys added here later are filled in without touching existing values).
 
 # ============================================================================
 # Cache Settings

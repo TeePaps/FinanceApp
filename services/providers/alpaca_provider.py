@@ -2,7 +2,7 @@
 Alpaca Markets provider implementation.
 
 Provides price data from Alpaca Data API.
-Requires API key and secret - stored in data_private/secrets.json
+Requires API key and secret - stored in secrets.json in the private data dir (paths.DATA_PRIVATE_DIR)
 """
 
 import time

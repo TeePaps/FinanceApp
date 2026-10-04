@@ -1,7 +1,9 @@
 """
 Secure secrets management for API keys.
 
-Stores secrets in data_private/ folder which is gitignored.
+Stores secrets in the private data folder (paths.DATA_PRIVATE_DIR:
+data_private/ in dev mode, which is gitignored; FINANCEAPP_HOME/data/data_private
+when installed).
 Provides both file-based storage and environment variable fallback.
 """
 
@@ -9,9 +11,10 @@ import os
 import json
 from typing import Optional
 
-# Path to secrets file (in gitignored data_private folder)
-_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-SECRETS_DIR = os.path.join(_BASE_DIR, 'data_private')
+import paths
+
+# Path to secrets file (in the private data folder)
+SECRETS_DIR = paths.DATA_PRIVATE_DIR
 SECRETS_FILE = os.path.join(SECRETS_DIR, 'secrets.json')
 
 # In-memory cache

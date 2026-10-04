@@ -6,10 +6,11 @@ Handles loading, saving, and accessing provider settings including:
 - Cache durations
 - Provider-specific settings
 
-All configuration is stored in config.yaml at the project root.
+All configuration is stored in the user's config.yaml (paths.USER_CONFIG_FILE:
+the repo root in dev mode, FINANCEAPP_HOME/data when installed), which is
+created from / topped up with config.defaults.yaml by user_config.py.
 """
 
-import os
 from ruamel.yaml import YAML
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field, asdict
@@ -20,9 +21,11 @@ _yaml.preserve_quotes = True
 _yaml.default_flow_style = False
 _yaml.indent(mapping=2, sequence=2, offset=2)
 
-# Path to config file
-_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-CONFIG_FILE = os.path.join(_BASE_DIR, 'config.yaml')
+import paths
+from user_config import ensure_user_config
+
+# Path to the user config file (read and written here)
+CONFIG_FILE = paths.USER_CONFIG_FILE
 
 # Global config instance
 _config: Optional['ProviderConfig'] = None
@@ -32,8 +35,9 @@ _full_yaml: Optional[Any] = None  # Cache full yaml (CommentedMap) for preservat
 def _load_yaml() -> Dict[str, Any]:
     """Load the full config.yaml file."""
     global _full_yaml
+    ensure_user_config()
     try:
-        with open(CONFIG_FILE, 'r') as f:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             _full_yaml = _yaml.load(f)
             if _full_yaml is None:
                 _full_yaml = {}
@@ -189,7 +193,7 @@ class ProviderConfig:
         providers['circuit_breaker']['cooldown_seconds'] = self.cooldown_seconds
 
         try:
-            with open(CONFIG_FILE, 'w') as f:
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 _yaml.dump(_full_yaml, f)
         except IOError as e:
             print(f"[ProviderConfig] Error saving config: {e}")

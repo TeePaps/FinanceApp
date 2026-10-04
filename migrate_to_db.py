@@ -25,13 +25,14 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 
 import database as db
+import paths
 
-BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE_DIR, 'data_public')  # Public data (SEC, indexes)
-USER_DATA_DIR = os.path.join(BASE_DIR, 'data_private')  # Private data (holdings)
+BASE_DIR = paths.CODE_DIR
+DATA_DIR = paths.DATA_PUBLIC_DIR  # Public data (SEC, indexes)
+USER_DATA_DIR = paths.DATA_PRIVATE_DIR  # Private data (holdings)
 SEC_DIR = os.path.join(DATA_DIR, 'sec')
 COMPANIES_DIR = os.path.join(SEC_DIR, 'companies')
-ARCHIVE_DIR = os.path.join(BASE_DIR, 'archive')
+ARCHIVE_DIR = paths.ARCHIVE_DIR
 
 
 def load_json_file(filepath):

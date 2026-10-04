@@ -8,7 +8,7 @@ from config import STOCKS_FILE, TRANSACTIONS_FILE
 
 
 def read_user_csv(filepath):
-    """Read CSV file from data_private directory (legacy; returns [] if gone)."""
+    """Read CSV file from the private data directory (legacy; returns [] if gone)."""
     if not filepath or not os.path.exists(filepath):
         return []
     with open(filepath, 'r') as f:

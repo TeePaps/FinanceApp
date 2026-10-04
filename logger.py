@@ -2,7 +2,8 @@
 Logging utility for the Finance App.
 
 Provides file-based logging with automatic rotation to prevent unbounded growth.
-Logs are written to logs/app.log with automatic rotation at 1MB.
+Logs are written to app.log in paths.RUN_DIR (logs/ in dev mode,
+FINANCEAPP_HOME/run when installed) with automatic rotation at 1MB.
 
 Usage:
     from logger import log
@@ -15,8 +16,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 
+import paths
+
 # Create logs directory if it doesn't exist
-LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
+LOG_DIR = paths.RUN_DIR
 os.makedirs(LOG_DIR, exist_ok=True)
 
 LOG_FILE = os.path.join(LOG_DIR, 'app.log')

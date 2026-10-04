@@ -6,6 +6,8 @@ import json
 from datetime import datetime, timedelta
 import math
 import threading
+import paths
+from version import __version__
 import data_manager
 from data_manager import get_all_unique_tickers, get_index_data, get_all_ticker_indexes
 import database as db
@@ -185,7 +187,7 @@ def index():
 
 @app.route('/healthz')
 def healthz():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok", "version": __version__}), 200
 
 
 # =============================================================================
@@ -898,7 +900,7 @@ if __name__ == '__main__':
             signal.signal(signal.SIGBREAK, _graceful_exit)
 
     host = os.environ.get('FINANCEAPP_HOST', '127.0.0.1')
-    port = int(os.environ.get('FINANCEAPP_PORT', '8080'))
-    debug = os.environ.get('FINANCEAPP_DEBUG', '1') == '1'
+    port = paths.default_port()  # 8080 in dev mode, 8765 installed
+    debug = os.environ.get('FINANCEAPP_DEBUG', '0' if paths.IS_INSTALLED else '1') == '1'
 
     app.run(host=host, port=port, debug=debug, use_reloader=use_reloader)

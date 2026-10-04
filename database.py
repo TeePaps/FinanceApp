@@ -6,6 +6,12 @@ Provides database connection, schema initialization, and CRUD operations.
 Two separate databases:
 - data_private/private.db: User's personal data (holdings, transactions)
 - data_public/public.db: Public market data (SEC, indexes, valuations)
+(Directories come from paths.py; see docs/installer-updater-design.md.)
+
+Schema versions are stored in each file's PRAGMA user_version and set after
+init/migrations. Bump SCHEMA_VERSION_PUBLIC / SCHEMA_VERSION_PRIVATE whenever
+a release changes that database's schema (add the migration to the matching
+_init_*_database function).
 
 Private Database Tables:
 - stocks: User's stock registry
@@ -30,10 +36,16 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple, Any
 from contextlib import contextmanager
 
+import paths
+
 # Database paths
-BASE_DIR = os.path.dirname(__file__)
-PRIVATE_DB_PATH = os.path.join(BASE_DIR, 'data_private', 'private.db')
-PUBLIC_DB_PATH = os.path.join(BASE_DIR, 'data_public', 'public.db')
+BASE_DIR = paths.CODE_DIR
+PRIVATE_DB_PATH = paths.PRIVATE_DB_PATH
+PUBLIC_DB_PATH = paths.PUBLIC_DB_PATH
+
+# Schema versions this code expects (PRAGMA user_version). See module docstring.
+SCHEMA_VERSION_PUBLIC = 1
+SCHEMA_VERSION_PRIVATE = 1
 
 # Import index definitions from central registry
 from services.indexes import VALID_INDICES, INDIVIDUAL_INDICES, INDEX_NAMES
@@ -110,6 +122,27 @@ def get_db():
     """Context manager for database connections (defaults to public)."""
     with get_public_db() as conn:
         yield conn
+
+
+def get_schema_version(db_path: str) -> Optional[int]:
+    """PRAGMA user_version of a database file, or None if it does not exist."""
+    if not os.path.exists(db_path):
+        return None
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    try:
+        return conn.execute('PRAGMA user_version').fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _set_schema_version(conn: sqlite3.Connection, version: int, label: str):
+    """Record the schema version after init/migrations; never lowers it."""
+    current = conn.execute('PRAGMA user_version').fetchone()[0]
+    if current < version:
+        conn.execute('PRAGMA user_version = %d' % int(version))
+    elif current > version:
+        print("[Database] Warning: %s schema version %d is newer than this "
+              "code expects (%d)" % (label, current, version))
 
 
 def init_database():
@@ -467,6 +500,8 @@ def _init_public_database():
                 VALUES (?, ?, ?)
             ''', (name, display_name, short_name))
 
+        _set_schema_version(conn, SCHEMA_VERSION_PUBLIC, 'public.db')
+
 
 def _init_private_database():
     """Initialize the private database schema."""
@@ -498,6 +533,8 @@ def _init_private_database():
 
         # Create indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_transactions_ticker ON transactions(ticker)')
+
+        _set_schema_version(conn, SCHEMA_VERSION_PRIVATE, 'private.db')
 
 
 # =============================================================================
@@ -2728,6 +2765,9 @@ def get_first_buy_date(ticker: str) -> Optional[str]:
         return row['first_buy'] if row and row['first_buy'] else None
 
 
-# Initialize databases on import if needed
-if not os.path.exists(PUBLIC_DB_PATH) or not os.path.exists(PRIVATE_DB_PATH):
+# Initialize databases on import if needed: a file is missing, or its schema
+# version is older than this code expects (runs the idempotent migrations).
+paths.ensure_dirs()
+if (get_schema_version(PUBLIC_DB_PATH) or 0) < SCHEMA_VERSION_PUBLIC \
+        or (get_schema_version(PRIVATE_DB_PATH) or 0) < SCHEMA_VERSION_PRIVATE:
     init_database()

@@ -4,7 +4,7 @@ Interactive Brokers provider implementation.
 Provides real-time price data from Interactive Brokers TWS/Gateway.
 Requires a running TWS or IB Gateway with API enabled.
 
-Connection settings stored in data_private/secrets.json:
+Connection settings stored in secrets.json in the private data dir (paths.DATA_PRIVATE_DIR):
 - IBKR_HOST: Host address (default: 127.0.0.1)
 - IBKR_PORT: API port (default: 7497 for TWS, 4001 for Gateway)
 - IBKR_CLIENT_ID: Client ID for the connection (default: 1)

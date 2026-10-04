@@ -4,6 +4,9 @@
 # Personal holdings database and all contents
 data_private/
 
+# User config (created from the tracked config.defaults.yaml on first run)
+config.yaml
+
 # Legacy directories (pre-database migration)
 user_data/
 data/

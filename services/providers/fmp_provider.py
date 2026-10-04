@@ -2,7 +2,7 @@
 Financial Modeling Prep (FMP) provider implementation.
 
 Provides price data from FMP API. Supports batch fetching when available.
-API key required - stored in data_private/secrets.json
+API key required - stored in secrets.json in the private data dir (paths.DATA_PRIVATE_DIR)
 """
 
 import re
