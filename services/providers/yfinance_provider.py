@@ -855,7 +855,8 @@ class YFinanceEPSProvider(EPSProvider):
                     success=False,
                     data=None,
                     source=self.name,
-                    error="No income statement data"
+                    error="No income statement data",
+                    no_data=True
                 )
 
             eps_history = []
@@ -874,7 +875,8 @@ class YFinanceEPSProvider(EPSProvider):
                     success=False,
                     data=None,
                     source=self.name,
-                    error="No EPS data in income statement"
+                    error="No EPS data in income statement",
+                    no_data=True
                 )
 
             # Extract EPS values
@@ -904,7 +906,8 @@ class YFinanceEPSProvider(EPSProvider):
                     success=False,
                     data=None,
                     source=self.name,
-                    error="No valid EPS values found"
+                    error="No valid EPS values found",
+                    no_data=True
                 )
 
             # Company name is cosmetic here and the EPS record is keyed by

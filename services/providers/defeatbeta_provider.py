@@ -321,7 +321,8 @@ class DefeatBetaEPSProvider(EPSProvider):
                     success=False,
                     data=None,
                     source=self.name,
-                    error=f"Empty income statement for {ticker}"
+                    error=f"Empty income statement for {ticker}",
+                    no_data=True
                 )
 
             eps_history = []
@@ -347,7 +348,8 @@ class DefeatBetaEPSProvider(EPSProvider):
                     success=False,
                     data=None,
                     source=self.name,
-                    error=f"No EPS data found in income statement for {ticker}"
+                    error=f"No EPS data found in income statement for {ticker}",
+                    no_data=True
                 )
 
             # Get date columns (exclude 'Breakdown' and 'TTM')
@@ -423,7 +425,8 @@ class DefeatBetaEPSProvider(EPSProvider):
                     success=False,
                     data=None,
                     source=self.name,
-                    error=f"No valid EPS values found for {ticker}"
+                    error=f"No valid EPS values found for {ticker}",
+                    no_data=True
                 )
 
             # Sort by year descending

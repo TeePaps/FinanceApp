@@ -76,11 +76,18 @@ class SECEPSProvider(EPSProvider):
             data = sec_data.get_sec_eps(ticker)
 
             if not data:
+                # None means either SEC definitively has nothing for this
+                # ticker (no filer record - an ETF or fund - or a no-EPS marker
+                # that get_sec_eps just stored) or a fetch that failed with
+                # nothing cached. Only the former is no_data.
+                no_data = (not sec_data.get_cik_for_ticker(ticker)
+                           or bool((sec_data.load_company_cache(ticker) or {}).get('sec_no_eps')))
                 return ProviderResult(
                     success=False,
                     data=None,
                     source=self.name,
-                    error="No SEC data available for ticker"
+                    error="No SEC data available for ticker",
+                    no_data=no_data
                 )
 
             eps_history = data.get('eps_history', [])
@@ -92,7 +99,8 @@ class SECEPSProvider(EPSProvider):
                         success=False,
                         data=None,
                         source=self.name,
-                        error=data.get('reason', 'SEC has no EPS data for this company')
+                        error=data.get('reason', 'SEC has no EPS data for this company'),
+                        no_data=True
                     )
                 return ProviderResult(
                     success=False,
@@ -125,7 +133,7 @@ class SECEPSProvider(EPSProvider):
             try:
                 from services.activity_log import activity_log
                 source_info = "(cached)" if data.get('_from_cache') else "(from API)"
-                activity_log.log("success", "sec", f"{ticker} EPS: {len(standardized_history)} years {source_info}", ticker=ticker)
+                activity_log.log("success", self.name, f"{ticker} EPS: {len(standardized_history)} years {source_info}", ticker=ticker)
             except Exception:
                 pass
 
@@ -138,7 +146,7 @@ class SECEPSProvider(EPSProvider):
         except ImportError as e:
             try:
                 from services.activity_log import activity_log
-                activity_log.log("error", "sec", f"{ticker} sec_data module not available", ticker=ticker)
+                activity_log.log("error", self.name, f"{ticker} sec_data module not available", ticker=ticker)
             except Exception:
                 pass
             return ProviderResult(
@@ -150,7 +158,7 @@ class SECEPSProvider(EPSProvider):
         except Exception as e:
             try:
                 from services.activity_log import activity_log
-                activity_log.log("error", "sec", f"{ticker} error: {str(e)[:50]}", ticker=ticker)
+                activity_log.log("error", self.name, f"{ticker} error: {str(e)[:50]}", ticker=ticker)
             except Exception:
                 pass
             return ProviderResult(
@@ -170,7 +178,7 @@ class SECEPSProvider(EPSProvider):
 
         try:
             from services.activity_log import activity_log
-            activity_log.log("info", "sec", f"Force refreshing {ticker}...", ticker=ticker)
+            activity_log.log("info", self.name, f"Force refreshing {ticker}...", ticker=ticker)
         except Exception:
             pass
 
@@ -230,9 +238,9 @@ class SECEPSProvider(EPSProvider):
             try:
                 from services.activity_log import activity_log
                 if new_years:
-                    activity_log.log("success", "sec", f"{ticker} refreshed, {new_years} new years", ticker=ticker)
+                    activity_log.log("success", self.name, f"{ticker} refreshed, {new_years} new years", ticker=ticker)
                 else:
-                    activity_log.log("success", "sec", f"{ticker} refreshed, no new years", ticker=ticker)
+                    activity_log.log("success", self.name, f"{ticker} refreshed, no new years", ticker=ticker)
             except Exception:
                 pass
 
@@ -241,7 +249,7 @@ class SECEPSProvider(EPSProvider):
         except Exception as e:
             try:
                 from services.activity_log import activity_log
-                activity_log.log("error", "sec", f"{ticker} refresh error: {str(e)[:50]}", ticker=ticker)
+                activity_log.log("error", self.name, f"{ticker} refresh error: {str(e)[:50]}", ticker=ticker)
             except Exception:
                 pass
             return ProviderResult(

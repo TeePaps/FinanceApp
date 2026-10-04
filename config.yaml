@@ -232,3 +232,11 @@ staleness:
   balance_sheet_refresh_days: 30      # Star input: quarterly filing data
   shares_outstanding_refresh_days: 30 # Star input: quarterly filing data
   analyst_estimate_refresh_days: 7    # Star input: consensus estimates
+
+# ============================================================================
+# Feed Events (durable provider-call log)
+# ============================================================================
+# Per-call provider outcomes and circuit-breaker transitions are persisted to
+# the feed_events table in public.db for external monitoring (/api/feed-stats).
+feed_events:
+  retention_days: 90             # Events older than this are pruned

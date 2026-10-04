@@ -21,7 +21,15 @@ from .base import (
     AnalystEstimateData, BalanceSheetData, SharesOutstandingData,
 )
 from .config import get_config, ProviderConfig
-from .circuit_breaker import get_circuit_breaker, CircuitBreaker
+from .circuit_breaker import get_circuit_breaker, CircuitBreaker, CircuitState
+from services import feed_events
+from services.activity_log import activity_log
+
+# Live-feed level for an outcome when the caller doesn't pick one
+_OUTCOME_LEVELS = {
+    feed_events.OUTCOME_SUCCESS: "success",
+    feed_events.OUTCOME_NO_DATA: "info",
+}
 
 
 def _breaker_key(provider: 'BaseProvider') -> str:
@@ -278,13 +286,51 @@ class DataOrchestrator:
 
     def _record_provider_success(self, provider: BaseProvider):
         """Record successful provider call."""
-        if self.config.circuit_breaker_enabled:
-            self.circuit_breaker.record_success(_breaker_key(provider))
+        self._record_breaker(provider, healthy=True)
 
     def _record_provider_failure(self, provider: BaseProvider):
         """Record failed provider call."""
-        if self.config.circuit_breaker_enabled:
-            self.circuit_breaker.record_failure(_breaker_key(provider))
+        self._record_breaker(provider, healthy=False)
+
+    def _record_breaker(self, provider: BaseProvider, healthy: bool):
+        """Feed one call result to the circuit breaker and log a state change."""
+        if not self.config.circuit_breaker_enabled:
+            return
+
+        key = _breaker_key(provider)
+        breaker = self.circuit_breaker
+        before = breaker.get_state(key)
+        if healthy:
+            breaker.record_success(key)
+        else:
+            breaker.record_failure(key)
+        after = breaker.get_state(key)
+
+        if after == before:
+            return
+        if after == CircuitState.OPEN:
+            activity_log.log("error", provider.name,
+                             f"Circuit breaker {key} opened - skipping it for {breaker.cooldown_seconds:g}s")
+        elif after == CircuitState.CLOSED:
+            activity_log.log("success", provider.name, f"Circuit breaker {key} closed - provider recovered")
+
+    @staticmethod
+    def _elapsed_ms(started: float) -> int:
+        """Milliseconds since a time.monotonic() reading."""
+        return int((time.monotonic() - started) * 1000)
+
+    def _record_outcome(self, provider: BaseProvider, kind: str, outcome: str, duration_ms: int,
+                        message: str, ticker: Optional[str] = None, level: Optional[str] = None,
+                        live: bool = False):
+        """Record the outcome of one provider call (kind + outcome + duration).
+
+        live=True writes it as a live activity-feed line (which is also
+        persisted); otherwise it goes to the durable log only, for calls that
+        have no feed line of their own.
+        """
+        emit = activity_log.log if live else feed_events.record
+        emit(level or _OUTCOME_LEVELS.get(outcome, "warning"), provider.name, message, ticker,
+             kind=kind, outcome=outcome, duration_ms=duration_ms)
 
     def _get_cache_max_age(self, data_type: DataType) -> timedelta:
         """Get cache duration based on data type."""
@@ -437,6 +483,7 @@ class DataOrchestrator:
         # Try providers in order
         providers = self.registry.get_providers_ordered(DataType.PRICE, self.config)
         errors = []
+        attempted = False
 
         for provider in providers:
             if not isinstance(provider, PriceProvider):
@@ -447,68 +494,57 @@ class DataOrchestrator:
                 errors.append(f"{provider.name}: circuit open (skipped)")
                 continue
 
+            attempted = True
+            started = time.monotonic()
             try:
-                # Log provider attempt
-                try:
-                    from services.activity_log import activity_log
-                    activity_log.log("info", provider.name, f"Trying {ticker}...")
-                except Exception:
-                    pass
+                activity_log.log("info", provider.name, f"Trying {ticker}...", persist=False)
 
                 self._rate_limit(provider)
 
                 # Execute with timeout
+                started = time.monotonic()
                 result = self._execute_with_timeout(
                     lambda p=provider, t=ticker: p.fetch_price(t),
                     timeout_seconds=self._provider_timeout(provider)
                 )
+                duration_ms = self._elapsed_ms(started)
 
                 if result.success:
                     # Record success with circuit breaker
                     self._record_provider_success(provider)
-
-                    # Log success
-                    try:
-                        from services.activity_log import activity_log
-                        activity_log.log("success", provider.name, f"{ticker} = ${result.data:.2f}")
-                    except ImportError:
-                        pass
+                    self._record_outcome(provider, 'price', feed_events.OUTCOME_SUCCESS, duration_ms,
+                                         f"{ticker} = ${result.data:.2f}", ticker, live=True)
 
                     # Save to database cache
                     self._save_price_to_cache(ticker, result.data, provider.name)
+                    feed_events.record_check('price', ticker, True)
                     return result
                 else:
                     # Record failure with circuit breaker
                     self._record_provider_failure(provider)
-
-                    # Log failure
-                    try:
-                        from services.activity_log import activity_log
-                        activity_log.log("warning", provider.name, f"{ticker} failed")
-                    except ImportError:
-                        pass
+                    self._record_outcome(provider, 'price', feed_events.classify_error(result.error),
+                                         duration_ms, f"{ticker} failed", ticker, level="warning", live=True)
 
                     errors.append(f"{provider.name}: {result.error}")
 
             except TimeoutError as e:
                 # Timeout - record as failure
                 self._record_provider_failure(provider)
-                try:
-                    from services.activity_log import activity_log
-                    activity_log.log("error", provider.name, f"{ticker} timeout")
-                except ImportError:
-                    pass
+                self._record_outcome(provider, 'price', feed_events.OUTCOME_TIMEOUT,
+                                     self._elapsed_ms(started), f"{ticker} timeout", ticker,
+                                     level="error", live=True)
                 errors.append(f"{provider.name}: {str(e)}")
 
             except Exception as e:
                 # Other exception - record as failure
                 self._record_provider_failure(provider)
-                try:
-                    from services.activity_log import activity_log
-                    activity_log.log("error", provider.name, f"{ticker} error")
-                except ImportError:
-                    pass
+                self._record_outcome(provider, 'price', feed_events.classify_error(e),
+                                     self._elapsed_ms(started), f"{ticker} error", ticker,
+                                     level="error", live=True)
                 errors.append(f"{provider.name}: {str(e)}")
+
+        if attempted:
+            feed_events.record_check('price', ticker, False)
 
         return ProviderResult(
             success=False,
@@ -557,6 +593,11 @@ class DataOrchestrator:
             # silently mis-destructure) for the screener's callers.
             return (results, sources) if return_sources else results
 
+        # Everything still in `remaining` is a live fetch; cache hits are not
+        # fetch attempts and leave no fetch_checks record.
+        live_tickers = list(remaining)
+        attempted = False
+
         # Get providers in order (batch-capable first if preferred)
         providers = self.registry.get_providers_ordered(DataType.PRICE, self.config)
 
@@ -571,6 +612,8 @@ class DataOrchestrator:
             if not self._should_try_provider(provider):
                 continue
 
+            attempted = True
+
             try:
                 self._rate_limit(provider)
 
@@ -578,11 +621,8 @@ class DataOrchestrator:
                     # Batch fetch with timeout - only log for large batches (screener)
                     # Small fetches (1-5 tickers) are usually UI lookups, log them more quietly
                     if len(remaining) > 5:
-                        try:
-                            from services.activity_log import activity_log
-                            activity_log.log("info", provider.name, f"Fetching prices for {len(remaining)} tickers...")
-                        except ImportError:
-                            pass
+                        activity_log.log("info", provider.name, f"Fetching prices for {len(remaining)} tickers...",
+                                         persist=False)
 
                     # Chunk the request rather than passing the entire ticker
                     # list into ONE timed call. Providers chunk internally with
@@ -606,32 +646,45 @@ class DataOrchestrator:
                         except TimeoutError:
                             # Keep the chunks that already landed; the next
                             # provider in the chain retries what's left.
+                            self._record_outcome(provider, 'price', feed_events.OUTCOME_TIMEOUT,
+                                                 self._elapsed_ms(started),
+                                                 f"0/{len(chunk)} prices (timeout)", level="error")
                             continue
+                        except Exception as e:
+                            # Aborts this provider's remaining chunks (handled
+                            # below); the call itself is recorded here.
+                            self._record_outcome(provider, 'price', feed_events.classify_error(e),
+                                                 self._elapsed_ms(started),
+                                                 f"0/{len(chunk)} prices (error: {str(e)[:60]})", level="error")
+                            raise
+                        duration_ms = self._elapsed_ms(started)
 
                         to_cache = {}
+                        chunk_ok = 0
                         for ticker, result in batch_results.items():
                             if result.success and result.data is not None:
                                 results[ticker] = result.data
                                 sources[ticker] = provider.name
                                 to_cache[ticker] = (result.data, provider.name)
-                                success_count += 1
+                                chunk_ok += 1
+                        success_count += chunk_ok
 
                         # One transaction per chunk instead of a connection +
                         # commit per ticker.
                         self._save_prices_to_cache(to_cache)
+                        self._record_outcome(
+                            provider, 'price',
+                            feed_events.OUTCOME_SUCCESS if chunk_ok else feed_events.OUTCOME_EMPTY,
+                            duration_ms, f"{chunk_ok}/{len(chunk)} prices")
 
                     remaining = [t for t in remaining if t not in results]
 
                     # Log batch results - only log for large batches (screener operations)
                     if len(tickers) > 5:
-                        try:
-                            from services.activity_log import activity_log
-                            if success_count > 0:
-                                activity_log.log("success", provider.name, f"{success_count}/{len(tickers)} prices fetched")
-                            else:
-                                activity_log.log("warning", provider.name, f"Batch price fetch returned no data ({len(tickers)} tickers requested)")
-                        except ImportError:
-                            pass
+                        if success_count > 0:
+                            activity_log.log("success", provider.name, f"{success_count}/{len(tickers)} prices fetched")
+                        else:
+                            activity_log.log("warning", provider.name, f"Batch price fetch returned no data ({len(tickers)} tickers requested)")
 
                     # Record success/failure based on batch results
                     if success_count > 0:
@@ -643,10 +696,13 @@ class DataOrchestrator:
                     # Individual fetch for remaining tickers
                     still_remaining = []
                     success_count = 0
-                    attempted = len(remaining)  # what THIS provider tries (post-cache)
+                    attempted_count = len(remaining)  # what THIS provider tries (post-cache)
                     to_cache = {}
+                    call_ms = 0  # provider time only, not the rate-limit sleeps
+                    error_outcome = None
 
                     for ticker in remaining:
+                        started = time.monotonic()
                         try:
                             result = self._execute_with_timeout(
                                 lambda p=provider, t=ticker: p.fetch_price(t),
@@ -660,21 +716,31 @@ class DataOrchestrator:
                                 success_count += 1
                             else:
                                 still_remaining.append(ticker)
+                                if not result.success:
+                                    error_outcome = feed_events.classify_error(result.error)
 
-                        except TimeoutError:
+                        except Exception as e:
+                            # TimeoutError included: classify_error maps it to 'timeout'
                             still_remaining.append(ticker)
-                        except Exception:
-                            still_remaining.append(ticker)
+                            error_outcome = feed_events.classify_error(e)
+                        finally:
+                            call_ms += self._elapsed_ms(started)
 
                         self._rate_limit(provider)
 
                     self._save_prices_to_cache(to_cache)
                     remaining = still_remaining
 
+                    # One aggregate event for the whole pass over the tickers
+                    self._record_outcome(
+                        provider, 'price',
+                        feed_events.OUTCOME_SUCCESS if success_count else (error_outcome or feed_events.OUTCOME_EMPTY),
+                        call_ms, f"{success_count}/{attempted_count} prices")
+
                     # Record overall success/failure
                     if success_count > 0:
                         self._record_provider_success(provider)
-                    elif success_count == 0 and attempted > 0:
+                    elif success_count == 0 and attempted_count > 0:
                         # Provider produced nothing from everything it tried.
                         # (Comparing against len(tickers) missed this whenever
                         # some tickers were served from cache.)
@@ -682,19 +748,15 @@ class DataOrchestrator:
 
             except TimeoutError as e:
                 self._record_provider_failure(provider)
-                try:
-                    from services.activity_log import activity_log
-                    activity_log.log("error", provider.name, "batch timeout")
-                except ImportError:
-                    pass
+                activity_log.log("error", provider.name, "batch timeout")
 
             except Exception as e:
                 self._record_provider_failure(provider)
-                try:
-                    from services.activity_log import activity_log
-                    activity_log.log("error", provider.name, f"error - {str(e)}")
-                except ImportError:
-                    pass
+                activity_log.log("error", provider.name, f"error - {str(e)}")
+
+        if attempted:
+            for ticker in live_tickers:
+                feed_events.record_check('price', ticker, ticker in results)
 
         if return_sources:
             return results, sources
@@ -706,6 +768,10 @@ class DataOrchestrator:
 
         Tries providers in order, preferring authoritative sources.
         Includes timeout handling and circuit breaker for fault tolerance.
+
+        A provider answering `no_data` (it has nothing for this ticker) is
+        healthy: it is not counted against its circuit breaker, and if every
+        provider answers that way the fetch check is still recorded as ok.
 
         Args:
             ticker: Stock ticker symbol
@@ -723,6 +789,8 @@ class DataOrchestrator:
         # Try providers in order
         providers = self.registry.get_providers_ordered(DataType.EPS, self.config)
         errors = []
+        attempted = False
+        had_error = False  # a real failure, as opposed to "nothing to find"
 
         for provider in providers:
             if not isinstance(provider, EPSProvider):
@@ -733,34 +801,61 @@ class DataOrchestrator:
                 errors.append(f"{provider.name}: circuit open (skipped)")
                 continue
 
+            attempted = True
+            started = time.monotonic()
             try:
                 self._rate_limit(provider)
 
                 # Execute with timeout
+                started = time.monotonic()
                 result = self._execute_with_timeout(
                     lambda p=provider, t=ticker: p.fetch_eps(t),
                     timeout_seconds=self._provider_timeout(provider)
                 )
+                duration_ms = self._elapsed_ms(started)
 
+                # The providers print their own live-feed lines for EPS, so
+                # the outcomes here go to the durable log only.
                 if result.success:
                     # Record success with circuit breaker
                     self._record_provider_success(provider)
+                    self._record_outcome(provider, 'eps', feed_events.OUTCOME_SUCCESS, duration_ms,
+                                         f"{ticker} EPS fetched", ticker)
                     self._set_cache(DataType.EPS, ticker, result.data, provider.name)
+                    feed_events.record_check('eps', ticker, True)
                     return result
+                elif result.no_data:
+                    # The provider answered; it just has nothing for this ticker
+                    self._record_provider_success(provider)
+                    self._record_outcome(provider, 'eps', feed_events.OUTCOME_NO_DATA, duration_ms,
+                                         f"{ticker} has no EPS data", ticker, level="info")
+                    errors.append(f"{provider.name}: {result.error}")
                 else:
                     # Record failure with circuit breaker
+                    had_error = True
                     self._record_provider_failure(provider)
+                    self._record_outcome(provider, 'eps', feed_events.classify_error(result.error),
+                                         duration_ms, f"{ticker} EPS failed", ticker, level="warning")
                     errors.append(f"{provider.name}: {result.error}")
 
             except TimeoutError as e:
                 # Timeout - record as failure
+                had_error = True
                 self._record_provider_failure(provider)
+                self._record_outcome(provider, 'eps', feed_events.OUTCOME_TIMEOUT,
+                                     self._elapsed_ms(started), f"{ticker} EPS timeout", ticker, level="error")
                 errors.append(f"{provider.name}: {str(e)}")
 
             except Exception as e:
                 # Other exception - record as failure
+                had_error = True
                 self._record_provider_failure(provider)
+                self._record_outcome(provider, 'eps', feed_events.classify_error(e),
+                                     self._elapsed_ms(started), f"{ticker} EPS error", ticker, level="error")
                 errors.append(f"{provider.name}: {str(e)}")
+
+        if attempted:
+            feed_events.record_check('eps', ticker, not had_error)
 
         return ProviderResult(
             success=False,

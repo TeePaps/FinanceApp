@@ -21,6 +21,7 @@ Usage:
 """
 
 import time
+from datetime import datetime
 from enum import Enum
 from typing import Dict, Optional
 from dataclasses import dataclass, field
@@ -43,7 +44,10 @@ class ProviderCircuit:
         state: Current circuit state
         failure_count: Number of failures in current window
         failure_timestamps: Times of recent failures (for windowed counting)
-        last_failure_time: When the circuit was opened
+        last_failure_time: When the circuit was opened (the cooldown anchor)
+        last_success_time: When a request last succeeded
+        last_failure_at: When a request last failed (any failure, not just the one that opened)
+        opened_at: When the circuit last tripped open; 0 while closed
         half_open_request_in_flight: Whether a test request is active
     """
     state: CircuitState = CircuitState.CLOSED
@@ -51,6 +55,8 @@ class ProviderCircuit:
     failure_timestamps: list = field(default_factory=list)
     last_failure_time: float = 0
     last_success_time: float = 0
+    last_failure_at: float = 0
+    opened_at: float = 0
     half_open_request_in_flight: bool = False
 
     def reset(self):
@@ -58,6 +64,7 @@ class ProviderCircuit:
         self.state = CircuitState.CLOSED
         self.failure_count = 0
         self.failure_timestamps = []
+        self.opened_at = 0
         self.half_open_request_in_flight = False
 
 
@@ -175,11 +182,13 @@ class CircuitBreaker:
         with self._lock:
             circuit = self._get_circuit(provider_name)
             now = time.time()
+            circuit.last_failure_at = now
 
             if circuit.state == CircuitState.HALF_OPEN:
                 # Test request failed, reopen circuit
                 circuit.state = CircuitState.OPEN
                 circuit.last_failure_time = now
+                circuit.opened_at = now
                 circuit.half_open_request_in_flight = False
                 return
 
@@ -191,6 +200,7 @@ class CircuitBreaker:
             if circuit.failure_count >= self.failure_threshold:
                 circuit.state = CircuitState.OPEN
                 circuit.last_failure_time = now
+                circuit.opened_at = now
 
     def get_state(self, provider_name: str) -> CircuitState:
         """Get current state of a provider's circuit."""
@@ -207,6 +217,10 @@ class CircuitBreaker:
             "state": circuit.state.value,
             "failure_count": circuit.failure_count,
             "threshold": self.failure_threshold,
+            "cooldown_remaining_seconds": None,
+            "last_failure": self._iso(circuit.last_failure_at),
+            "last_success": self._iso(circuit.last_success_time),
+            "opened_at": self._iso(circuit.opened_at),
         }
 
         if circuit.state == CircuitState.OPEN:
@@ -214,6 +228,11 @@ class CircuitBreaker:
             status["cooldown_remaining_seconds"] = max(0, remaining)
 
         return status
+
+    @staticmethod
+    def _iso(timestamp: float) -> Optional[str]:
+        """Local ISO datetime for an epoch time, None if it never happened."""
+        return datetime.fromtimestamp(timestamp).isoformat() if timestamp else None
 
     def get_status(self, provider_name: str) -> Dict:
         """Get detailed status for a provider's circuit."""

@@ -50,6 +50,11 @@ app.json.compact = True
 from routes import register_blueprints
 register_blueprints(app)
 
+# Persist provider-call outcomes to public.db. Module level (idempotent) so it
+# runs however the app is started, not only via the __main__ block below.
+from services import feed_events
+feed_events.init()
+
 # Flag to prevent multiple startup checks
 startup_check_done = False
 

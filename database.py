@@ -26,7 +26,7 @@ Public Database Tables:
 
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple, Any
 from contextlib import contextmanager
 
@@ -117,6 +117,11 @@ def init_database():
     _init_public_database()
     _init_private_database()
     print("[Database] Both schemas initialized successfully")
+
+
+def init_public_database():
+    """Initialize only the public schema (idempotent)."""
+    _init_public_database()
 
 
 def _init_public_database():
@@ -265,6 +270,23 @@ def _init_public_database():
             )
         ''')
 
+        # Durable copy of the activity feed's provider-call outcomes and
+        # circuit-breaker transitions (see services/feed_events.py). `outcome`
+        # is set only on events that record one provider call.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS feed_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                level TEXT NOT NULL,
+                source TEXT NOT NULL,
+                ticker TEXT,
+                kind TEXT,
+                outcome TEXT,
+                message TEXT NOT NULL,
+                duration_ms INTEGER
+            )
+        ''')
+
         # CIK Mapping table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS cik_mapping (
@@ -382,6 +404,8 @@ def _init_public_database():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_valuation_history_ticker ON valuation_history(ticker)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dividend_history_ticker ON dividend_history(ticker)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_shares_history_ticker ON shares_outstanding_history(ticker)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_feed_events_ts ON feed_events(ts)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_feed_events_source_ts ON feed_events(source, ts)')
 
         # Migrations - add columns if they don't exist
         cursor.execute('PRAGMA table_info(valuations)')
@@ -1747,6 +1771,55 @@ def record_fetch_checks(kind: str, tickers: List[str], ok: bool):
                 checked_at = excluded.checked_at,
                 ok = excluded.ok
         ''', rows)
+
+
+# --- Feed events (durable activity feed) ---
+
+_FEED_EVENT_COLUMNS = ('ts', 'level', 'source', 'ticker', 'kind', 'outcome',
+                       'message', 'duration_ms')
+
+
+def insert_feed_events(events: List[Dict]):
+    """Insert a batch of feed events in one transaction."""
+    if not events:
+        return
+    with get_db() as conn:
+        conn.cursor().executemany(
+            f'INSERT INTO feed_events ({", ".join(_FEED_EVENT_COLUMNS)}) '
+            f'VALUES ({", ".join("?" * len(_FEED_EVENT_COLUMNS))})',
+            [tuple(e.get(c) for c in _FEED_EVENT_COLUMNS) for e in events])
+
+
+def prune_feed_events(retention_days: int) -> int:
+    """Delete feed events older than `retention_days`. Returns rows deleted."""
+    cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM feed_events WHERE ts < ?', (cutoff,))
+        return cursor.rowcount
+
+
+def get_feed_event_counts(since: str) -> List[Dict]:
+    """Event counts per (source, level) since `since`, with the newest ts of each."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT source, level, COUNT(*) AS events, MAX(ts) AS last_ts
+            FROM feed_events WHERE ts >= ?
+            GROUP BY source, level
+        ''', (since,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_feed_outcome_events(since: str) -> List[Dict]:
+    """Outcome-bearing feed events (one per provider call) since `since`."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT source, kind, outcome, duration_ms, ts
+            FROM feed_events WHERE ts >= ? AND outcome IS NOT NULL
+        ''', (since,))
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def record_split_checks(tickers: List[str]):

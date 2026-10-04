@@ -293,3 +293,9 @@ ANALYST_ESTIMATE_REFRESH_DAYS = _get('staleness.analyst_estimate_refresh_days', 
 # ============================================================================
 # Index definitions moved to services/indexes/ for single source of truth
 from services.indexes import VALID_INDICES, INDEX_NAMES as INDEX_DISPLAY_NAMES
+
+# ============================================================================
+# Feed Events
+# ============================================================================
+# How long durable provider-call events are kept in public.db's feed_events.
+FEED_EVENTS_RETENTION_DAYS = _get('feed_events.retention_days', 90)

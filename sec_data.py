@@ -598,10 +598,15 @@ def _fetch_companyfacts(cik, use_memo=True):
     rate_limit()
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
     response = _SEC_SESSION.get(url, timeout=SEC_REQUEST_TIMEOUT)
-    if response.status_code != 200:
+    if response.status_code == 404:
+        # SEC answered: this CIK files no XBRL facts (ETFs, trusts). That is a
+        # definitive "no data", not a transport failure - return an empty
+        # document so callers record it as such instead of as an error.
+        payload = {}
+    elif response.status_code != 200:
         return None
-
-    payload = response.json()
+    else:
+        payload = response.json()
     _companyfacts_to_memo(cik, payload)
     return payload
 

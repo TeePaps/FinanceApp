@@ -42,6 +42,9 @@ class ProviderResult:
         cached: Whether this result came from cache
         timestamp: When the data was fetched/cached
         metadata: Optional dict for provider-specific metadata (e.g., new_years_added)
+        no_data: True when the provider answered and definitively has nothing for
+            this ticker (e.g. an ETF with no EPS), as opposed to a transport or
+            parse failure. Not a sign of provider ill-health.
     """
     success: bool
     data: Any
@@ -50,6 +53,7 @@ class ProviderResult:
     cached: bool = False
     timestamp: Optional[datetime] = None
     metadata: Optional[Dict[str, Any]] = None
+    no_data: bool = False
 
     def __post_init__(self):
         if self.timestamp is None:

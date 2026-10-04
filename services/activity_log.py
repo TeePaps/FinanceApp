@@ -12,6 +12,13 @@ Usage:
     activity_log.log('info', 'yfinance', 'Fetched price for AAPL', ticker='AAPL')
     activity_log.log('error', 'fmp', 'API key invalid')
 
+    # Record one provider call (outcome/duration are optional, additive fields)
+    activity_log.log('success', 'yfinance', 'AAPL = $190.00', ticker='AAPL',
+                     kind='price', outcome='success', duration_ms=412)
+
+    # Observers (e.g. the durable feed_events writer) register a sink
+    activity_log.add_sink(callable_taking_entry_dict)
+
     # Subscribe to SSE stream (in Flask route)
     @app.route('/api/activity/stream')
     def activity_stream():
@@ -24,7 +31,7 @@ import time
 import threading
 from collections import deque
 from datetime import datetime
-from typing import Optional, List, Dict, Generator
+from typing import Callable, Optional, List, Dict, Generator
 
 
 class ActivityLogManager:
@@ -79,8 +86,21 @@ class ActivityLogManager:
         self._subscribers = []
         self._subscriber_lock = threading.Lock()
         self._next_subscriber_id = 0
+        self._sinks: List[Callable[[Dict], None]] = []
 
-    def log(self, level: str, source: str, message: str, ticker: Optional[str] = None) -> None:
+    def add_sink(self, sink: Callable[[Dict], None]) -> None:
+        """
+        Register a callable that receives every persistable entry.
+
+        Debug entries and entries logged with persist=False are not sent. A
+        sink that raises is ignored - observers must never break logging.
+        """
+        if sink not in self._sinks:
+            self._sinks.append(sink)
+
+    def log(self, level: str, source: str, message: str, ticker: Optional[str] = None,
+            *, kind: Optional[str] = None, outcome: Optional[str] = None,
+            duration_ms: Optional[int] = None, persist: bool = True) -> None:
         """
         Add a log entry and notify all SSE subscribers.
 
@@ -89,6 +109,11 @@ class ActivityLogManager:
             source: Source of the log (e.g., 'yfinance', 'screener', 'database')
             message: Log message
             ticker: Optional ticker symbol associated with this log entry
+            kind: Optional data kind of a provider call (e.g., 'price', 'eps')
+            outcome: Optional result of a provider call (see services/feed_events.py)
+            duration_ms: Optional duration of the provider call
+            persist: False keeps the entry out of sinks (chatter such as
+                "Trying X..."); it still reaches the ring buffer and SSE
         """
         # Validate level
         level = level.lower()
@@ -96,12 +121,17 @@ class ActivityLogManager:
             level = self.INFO
 
         # Create log entry
+        now = datetime.now()
         entry = {
-            'timestamp': datetime.now().strftime('%H:%M:%S'),
+            'timestamp': now.strftime('%H:%M:%S'),
+            'ts': now.isoformat(),
             'level': level,
             'source': source,
             'message': message,
-            'ticker': ticker
+            'ticker': ticker,
+            'kind': kind,
+            'outcome': outcome,
+            'duration_ms': duration_ms
         }
 
         # Add to ring buffer (thread-safe)
@@ -113,6 +143,17 @@ class ActivityLogManager:
 
         # Notify all subscribers (thread-safe)
         self._notify_subscribers(entry)
+
+        if persist and level != self.DEBUG:
+            self._notify_sinks(entry)
+
+    def _notify_sinks(self, entry: Dict) -> None:
+        """Hand an entry to every registered sink, ignoring sink failures."""
+        for sink in self._sinks:
+            try:
+                sink(entry)
+            except Exception:
+                pass
 
     def _print_to_console(self, entry: Dict) -> None:
         """Print log entry to console with color formatting."""
