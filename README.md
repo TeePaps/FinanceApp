@@ -4,13 +4,14 @@ A Flask-based web application for tracking stock portfolios, analyzing market va
 
 ## Install
 
-[![Download for macOS](https://img.shields.io/badge/Download-macOS-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/TeePaps/FinanceApp/releases/latest/download/Install-FinanceApp.command)
+[![Download for macOS](https://img.shields.io/badge/Download-macOS-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/TeePaps/FinanceApp/releases/latest/download/Install-FinanceApp-mac.zip)
 [![Download for Windows](https://img.shields.io/badge/Download-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/TeePaps/FinanceApp/releases/latest/download/Install-FinanceApp.bat)
 
-Download the installer for your system and double-click it. You do **not** need Python: the
-installer sets up everything it needs ([uv](https://docs.astral.sh/uv/) and a private copy of
-Python 3.12) without touching any Python already on your computer. When it finishes, FinanceApp
-opens in your browser at `http://127.0.0.1:8765` (or the next free port).
+Download the installer for your system and double-click it (on macOS, double-click the
+downloaded `Install-FinanceApp-mac.zip` first; it unzips to `Install-FinanceApp.command`). You do
+**not** need Python: the installer sets up everything it needs ([uv](https://docs.astral.sh/uv/)
+and a private copy of Python 3.12) without touching any Python already on your computer. When it
+finishes, FinanceApp opens in your browser at `http://127.0.0.1:8765` (or the next free port).
 
 Or paste one line into a terminal:
 
@@ -26,10 +27,12 @@ irm https://github.com/TeePaps/FinanceApp/releases/latest/download/install.ps1 |
 
 **The installers are not code-signed**, so the first run needs one extra click:
 
-- **macOS (Gatekeeper):** right-click `Install-FinanceApp.command` → **Open** → **Open**. On
-  macOS 15+, if there is no Open button, go to **System Settings → Privacy & Security** and click
-  **Open Anyway**. If macOS says you don't have permission to run it, run
-  `chmod +x ~/Downloads/Install-FinanceApp.command` in Terminal and try again (or use the one-liner).
+- **macOS (Gatekeeper):** unzip `Install-FinanceApp-mac.zip`, then right-click
+  `Install-FinanceApp.command` → **Open** → **Open**. On macOS 15+, if there is no Open button, go
+  to **System Settings → Privacy & Security** and click **Open Anyway**. (The bare
+  `Install-FinanceApp.command` is also attached to each release; a browser download of it loses
+  its execute permission, so it needs `chmod +x ~/Downloads/Install-FinanceApp.command` first.
+  The zip or the one-liner avoids that.)
 - **Windows (SmartScreen):** if "Windows protected your PC" appears, click **More info** →
   **Run anyway**.
 

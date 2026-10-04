@@ -1,6 +1,6 @@
 # FinanceApp installer bootstrap (Windows PowerShell 5.1+).
 #
-#   irm https://raw.githubusercontent.com/TeePaps/FinanceApp/main/install.ps1 | iex
+#   irm https://github.com/TeePaps/FinanceApp/releases/latest/download/install.ps1 | iex
 #   powershell -ExecutionPolicy Bypass -File install.ps1 --port 9000
 #
 # Ensures uv (official installer, PATH left untouched), downloads installer.py

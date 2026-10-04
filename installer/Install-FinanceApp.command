@@ -5,9 +5,11 @@
 # otherwise the one published with the latest release. Arguments and the
 # FINANCEAPP_* environment overrides documented in install.sh pass through.
 #
-# Not signed: the first time, right-click -> Open (or System Settings ->
-# Privacy & Security -> Open Anyway). If macOS says you lack permission to
-# run it, run:  chmod +x ~/Downloads/Install-FinanceApp.command
+# Published as Install-FinanceApp-mac.zip (the zip keeps the execute bit a
+# browser download of the bare .command would lose). Not signed: the first
+# time, right-click -> Open (or System Settings -> Privacy & Security -> Open
+# Anyway). If macOS says you lack permission to run it, run:
+#   chmod +x ~/Downloads/Install-FinanceApp.command
 set -euo pipefail
 
 REPO="TeePaps/FinanceApp"

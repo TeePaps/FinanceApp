@@ -124,6 +124,15 @@ idempotent migrations and stamp on first start. `database.get_schema_version(pat
   - `unpack_release` extracts to a staging dir then renames (same version = repair: replaced,
     venv included). `build_venv(home, vdir, state, log, uv=None)` returns the venv python;
     uv is always called with `UV_PYTHON_PREFERENCE=only-managed`.
+  - Phase 6: installer and updater no longer unpack straight into `versions/<X>`.
+    `prepare_version(zip, home, state, log, uv)` = `stage_release` (unpack to
+    `versions/.staging-<X>`, after `clean_staging` removes stale `.staging-*`/`.trash-*`) →
+    `build_venv` (`uv venv --relocatable`, falls back to a plain venv on old uv) → `smoke_test`
+    (no .pyc written) → `promote_staged` (existing `versions/<X>` moved to `.trash-*`, staging
+    renamed in, trash put back if that fails). Any failure removes the staging dir and leaves
+    `versions/` unchanged, so a failed repair or a re-apply of the version kept as "previous"
+    never breaks it. The updater calls the same three steps itself (to report progress).
+    `switch_current` clears `install.json.last_failed`.
   - `smoke_test(home, vdir, isolated=True)`: by default FINANCEAPP_HOME is a throwaway temp
     dir, so importing the new code cannot migrate the real DBs before the pre-update snapshot.
   - Data: `backup_data(home, dest)` (full data copy + install.json + README.txt, dev-clone
@@ -167,7 +176,7 @@ Latest release lookup: `GET https://api.github.com/repos/TeePaps/FinanceApp/rele
 - Windows one-liner: `irm https://github.com/TeePaps/FinanceApp/releases/latest/download/install.ps1 | iex`
   (Phase 3 change: the bootstraps live in `installer/`, not the repo root, so the one-liners
   use the release assets, which also keeps bootstrap and installer.py from the same release.)
-- README buttons → `https://github.com/TeePaps/FinanceApp/releases/latest/download/Install-FinanceApp.command` / `.bat`
+- README buttons → `https://github.com/TeePaps/FinanceApp/releases/latest/download/Install-FinanceApp-mac.zip` / `Install-FinanceApp.bat`
 - Bootstraps: ensure uv → download `installer.py` (latest release asset) →
   `uv run --python 3.12 installer.py [args]`.
 - `installer.py` args: `--home`, `--port`, `--version`, `--zip PATH` (local zip, offline/testing),
@@ -188,9 +197,9 @@ Latest release lookup: `GET https://api.github.com/repos/TeePaps/FinanceApp/rele
   `FINANCEAPP_INSTALL_PS1_URL`); `FINANCEAPP_NO_PAUSE=1` skips the final pause. With
   `irm | iex`, pass installer args via `$env:FINANCEAPP_INSTALL_ARGS`. uv is installed with
   `UV_NO_MODIFY_PATH=1` (always called by absolute path; shell profiles untouched).
-- Known limitation: a `.command` downloaded by a browser may lack the execute bit (macOS then
-  refuses to run it). README documents `chmod +x` / the one-liner; shipping it zipped would
-  avoid this.
+- A `.command` downloaded by a browser loses its execute bit, so `build_release.py` also
+  produces `Install-FinanceApp-mac.zip` (the .command stored with mode 0755; listed in
+  SHA256SUMS) and the README macOS button links that zip. The bare `.command` stays an asset.
 - Launchers: Mac `~/Applications/FinanceApp.app` (minimal bundle whose executable runs
   `uv run --python 3.12 <HOME>/launch.py open`, or the current venv's python directly);
   Windows Desktop + Start Menu `.lnk` (created via PowerShell WScript.Shell), Start Menu
@@ -202,7 +211,8 @@ Latest release lookup: `GET https://api.github.com/repos/TeePaps/FinanceApp/rele
   failure with a `previous` dir on disk swaps current/previous, records
   `install.json.last_failed = {version, at}`, starts previous and exits **2** (`--no-revert`
   disables). Without a console (pythonw / .app) output goes to `run/launch.log` and errors
-  show a dialog.
+  show a dialog (the .app/.desktop runner sets `FINANCEAPP_GUI=1` for this, since its stdout is
+  redirected rather than missing; launch.py drops it from the server's environment).
 - Launcher implementation: the Mac `.app` executable (and the "Uninstall FinanceApp.command")
   is a bash script that reads `current` from install.json at run time (sed) and runs that
   venv's python, falling back to `uv run`, so it survives updates without rewriting. Windows

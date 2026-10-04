@@ -497,17 +497,25 @@ def _apply_worker(target, channel):
         zv = c.zip_version(zpath)
         if c.parse_version(zv) != c.parse_version(target):
             raise c.InstallError("Downloaded zip is version %s, expected %s" % (zv, target))
+        target = zv  # the exact spelling used for versions/<X> and install.json
 
+        # Unpack, venv and smoke test happen in versions/.staging-<target>; the
+        # result replaces versions/<target> only once it passed, so updating to
+        # a version that is on disk as "previous" can never break it.
         _job_update(step="unpack", message="Unpacking %s..." % target)
-        vdir = c.unpack_release(zpath, home, log=_job_log)
+        staging = c.stage_release(zpath, home, log=_job_log)
         c.rmtree(tmpdir)
         tmpdir = None
+        try:
+            _job_update(step="venv", message="Installing dependencies (this can take a minute)...")
+            c.build_venv(home, staging, orig_state, log=_job_log)
 
-        _job_update(step="venv", message="Installing dependencies (this can take a minute)...")
-        c.build_venv(home, vdir, orig_state, log=_job_log)
-
-        _job_update(step="smoke_test", message="Testing the new version...")
-        c.smoke_test(home, vdir, log=_job_log)
+            _job_update(step="smoke_test", message="Testing the new version...")
+            c.smoke_test(home, staging, log=_job_log)
+            vdir = c.promote_staged(home, staging, target, log=_job_log)
+        except BaseException:
+            c.rmtree(staging)
+            raise
 
         _job_update(step="backup", message="Backing up your data...")
         if c.has_user_data(home):

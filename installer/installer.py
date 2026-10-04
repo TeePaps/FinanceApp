@@ -321,7 +321,9 @@ def _install(core, args, zip_path):
     try:
         vdir = _build(core, args, home, state, version, zip_path, mode, port)
     except BaseException:
-        if mode == "upgrade" and not args.no_launch:
+        # Staged builds leave the existing version intact on failure, so a
+        # failed repair can restart it too.
+        if mode in ("upgrade", "repair") and not args.no_launch:
             log("Install failed; restarting the existing version %s..." % state.get("current"))
             core.run_launcher(home, "start", log=log)
         raise
@@ -334,12 +336,16 @@ def _build(core, args, home, state, version, zip_path, mode, port):
     uv = core.ensure_uv(log)
     log("  uv: %s" % uv)
 
-    log("[2/5] Unpacking %s" % version)
-    vdir = core.unpack_release(zip_path, home, log=log)
-
-    log("[3/5] Building the Python environment")
-    core.build_venv(home, vdir, state, log=log, uv=uv)
-    core.smoke_test(home, vdir, log=log)
+    log("[2/5] Unpacking %s and building its Python environment" % version)
+    if hasattr(core, "prepare_version"):
+        # Staged: an existing versions/<X> is only replaced after the new
+        # copy's venv and smoke test succeed.
+        vdir = core.prepare_version(zip_path, home, state, log=log, uv=uv)
+    else:  # core.py from a release older than this installer
+        vdir = core.unpack_release(zip_path, home, log=log)
+        core.build_venv(home, vdir, state, log=log, uv=uv)
+        core.smoke_test(home, vdir, log=log)
+    log("[3/5] Python environment OK")
 
     log("[4/5] Setting up data")
     if args.import_from or args.restore_from:

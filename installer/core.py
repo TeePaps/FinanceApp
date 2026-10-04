@@ -201,6 +201,9 @@ def switch_current(home, version):
     Returns the saved state.
     """
     state = load_state(home) or new_state()
+    # A deliberate switch supersedes launch.py's "version X failed to start"
+    # note (otherwise the UI would keep reporting an old failure).
+    state.pop("last_failed", None)
     cur = state.get("current")
     if cur and cur != version:
         state["previous"] = cur
@@ -648,6 +651,117 @@ def unpack_release(zip_path, home, log=None):
     return target
 
 
+def staging_dir(home, version):
+    return os.path.join(versions_dir(home), ".staging-%s" % version)
+
+
+def clean_staging(home, log=None):
+    """Remove leftover ``.staging-*`` / ``.trash-*`` dirs under versions/
+    (from an interrupted install or update). Returns the removed paths."""
+    root = versions_dir(home)
+    removed = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return removed
+    for name in names:
+        if name.startswith((".staging-", ".trash-")):
+            p = os.path.join(root, name)
+            _log(log)("Removing leftover %s" % name)
+            rmtree(p, log)
+            removed.append(p)
+    return removed
+
+
+def _rename_retry(src, dst, attempts=10):
+    """os.replace with retries: on Windows a scanner/indexer briefly holding a
+    file inside a freshly written tree makes directory renames fail."""
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(0.5)
+
+
+def stage_release(zip_path, home, log=None):
+    """Extract a release zip to ``versions/.staging-<X.Y.Z>`` (replacing a
+    stale one) and return that dir. Nothing outside the staging dir changes."""
+    log = _log(log)
+    version = zip_version(zip_path)
+    top = zip_top_dir(zip_path)
+    vroot = versions_dir(home)
+    os.makedirs(vroot, exist_ok=True)
+    clean_staging(home, log)
+    staging = staging_dir(home, version)
+    tmp = tempfile.mkdtemp(prefix=".staging-%s-x" % version, dir=vroot)
+    log("Unpacking %s ..." % os.path.basename(zip_path))
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            _safe_extract(z, tmp)
+        src = os.path.join(tmp, top)
+        if not os.path.isfile(os.path.join(src, "app.py")):
+            raise InstallError("Release zip has no app.py; not a FinanceApp release")
+        _rename_retry(src, staging)
+    finally:
+        rmtree(tmp)
+    return staging
+
+
+def promote_staged(home, staging, version, log=None):
+    """Move a built + smoke-tested staging dir to ``versions/<version>``.
+
+    An existing dir for that version (repair, or re-applying the "previous"
+    version) is moved aside first and put back if the final rename fails, so
+    the install is never left without a working copy of that version.
+    """
+    log = _log(log)
+    target = version_dir(home, version)
+    trash = None
+    if os.path.exists(target):
+        trash = os.path.join(versions_dir(home), ".trash-%s-%d" % (version, int(time.time())))
+        try:
+            _rename_retry(target, trash)
+        except OSError as e:
+            raise InstallError("Could not replace %s (is FinanceApp %s still running?): %s"
+                               % (target, version, e))
+    try:
+        _rename_retry(staging, target)
+    except OSError as e:
+        if trash:
+            try:
+                _rename_retry(trash, target)
+            except OSError:
+                pass
+        raise InstallError("Could not move the new version into place: %s" % e)
+    if trash:
+        rmtree(trash, log)
+    log("Installed to %s" % target)
+    return target
+
+
+def prepare_version(zip_path, home, state=None, log=None, uv=None):
+    """Unpack, build the venv and smoke-test a release in a staging dir, then
+    move it to ``versions/<X.Y.Z>``. Returns that dir.
+
+    If any step fails the staging dir is removed and ``versions/`` is exactly
+    as before (an existing dir for the same version is untouched), so a failed
+    repair / re-apply never breaks the current or previous version.
+    """
+    log = _log(log)
+    version = zip_version(zip_path)
+    staging = stage_release(zip_path, home, log)
+    try:
+        build_venv(home, staging, state, log=log, uv=uv)
+        smoke_test(home, staging, log=log)
+        return promote_staged(home, staging, version, log)
+    except BaseException:
+        rmtree(staging)
+        raise
+
+
 # --------------------------------------------------------------------------
 # venv / smoke test
 # --------------------------------------------------------------------------
@@ -666,7 +780,17 @@ def build_venv(home, version_dir_path, state=None, log=None, uv=None):
     if os.path.exists(venv):
         rmtree(venv, log)
     log("Creating virtual environment...")
-    run_logged([uv, "venv", "--python", py, venv], log, env=env, cwd=version_dir_path)
+    # --relocatable: the venv is built in a staging dir and renamed into place
+    # (prepare_version), so nothing in it may embed its absolute path.
+    try:
+        run_logged([uv, "venv", "--relocatable", "--python", py, venv], log, env=env,
+                   cwd=version_dir_path)
+    except InstallError:
+        # uv < 0.4.4 has no --relocatable; app.py is started as "python app.py",
+        # so a plain venv still works after the rename (only console scripts
+        # in venv/bin would carry the old path).
+        rmtree(venv)
+        run_logged([uv, "venv", "--python", py, venv], log, env=env, cwd=version_dir_path)
     vpy = venv_python(version_dir_path)
     req = os.path.join(version_dir_path, "requirements.txt")
     log("Installing dependencies (this can take a minute)...")
@@ -693,8 +817,9 @@ def smoke_test(home, version_dir_path, log=None, isolated=True, timeout=300):
     if not os.path.exists(vpy):
         raise InstallError("No venv in %s" % version_dir_path)
     tmp = tempfile.mkdtemp(prefix="financeapp-smoke-") if isolated else None
+    # No .pyc: the dir may be a staging dir that is renamed afterwards.
     env = dict(os.environ, FINANCEAPP_HOME=tmp or home, FINANCEAPP_DEBUG="0",
-               PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+               PYTHONUTF8="1", PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1")
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONPATH", None)
     log("Smoke test: import app ...")
@@ -1069,6 +1194,9 @@ def _posix_runner(home, script, args, uv, interactive=False, logfile=None):
     python (read from install.json at run time, so it survives updates),
     falling back to ``uv run`` with uv-managed Python."""
     redirect = ' >>"$H/run/%s" 2>&1' % logfile if logfile else ""
+    # Launched from Finder (logfile): tell launch.py there is no terminal, so
+    # it reports failures in a dialog instead of only in the log.
+    gui = "export FINANCEAPP_GUI=1\n" if logfile else ""
     tail = ('\nif [ -t 1 ]; then echo; { read -r -p "Press Return to close this window..." _ '
             '</dev/tty; } 2>/dev/null || true; fi\n' if interactive else "\n")
     return """#!/bin/bash
@@ -1076,7 +1204,7 @@ def _posix_runner(home, script, args, uv, interactive=False, logfile=None):
 H={home}
 UV={uv}
 cd "$HOME" || cd /
-mkdir -p "$H/run" 2>/dev/null || true
+{gui}mkdir -p "$H/run" 2>/dev/null || true
 CUR=$(sed -n 's/^[[:space:]]*"current"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$H/install.json" 2>/dev/null | head -n 1)
 PY="$H/versions/$CUR/venv/bin/python3"
 if [ -n "$CUR" ] && [ -x "$PY" ]; then
@@ -1087,7 +1215,7 @@ else
   echo "FinanceApp: cannot find Python for $H (re-run the installer)."{redirect}
   {alert}
 fi{tail}""".format(home=_sh_quote(home), uv=_sh_quote(uv), script=script, args=args,
-                   redirect=redirect, tail=tail,
+                   redirect=redirect, tail=tail, gui=gui,
                    alert=("osascript -e 'display alert \"FinanceApp\" message \"Cannot find "
                           "Python. Please re-run the FinanceApp installer.\"' >/dev/null 2>&1 || true"
                           if IS_MAC else "true"))
@@ -1189,6 +1317,9 @@ def _powershell(script, env_extra=None, timeout=60):
 
 _PS_SHORTCUTS = r"""
 $ErrorActionPreference = 'Stop'
+# Paths are read back by Python as UTF-8 (non-ASCII user names); PS 5.1
+# would otherwise write them in the OEM code page.
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 $items = $env:FA_SHORTCUTS | ConvertFrom-Json
 $sh = New-Object -ComObject WScript.Shell
 foreach ($i in $items) {

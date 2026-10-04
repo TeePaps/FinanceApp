@@ -8,6 +8,9 @@ Produces in the output directory:
     FinanceApp-X.Y.Z.zip      top-level folder FinanceApp-X.Y.Z/
     installer.py, install.sh, install.ps1,
     Install-FinanceApp.command, Install-FinanceApp.bat   (copied from installer/ if present)
+    Install-FinanceApp-mac.zip  Install-FinanceApp.command with mode 0755 stored in the zip:
+                              a browser-downloaded .command loses its execute bit, but
+                              Archive Utility restores it from the zip (README links this)
     SHA256SUMS.txt            "sha256  filename" for every asset above
 
 The zip is built from the committed tree at --ref (default HEAD) via `git archive`,
@@ -66,6 +69,8 @@ INSTALLER_ASSETS = [
     "Install-FinanceApp.bat",
 ]
 EXECUTABLE_ASSETS = {"install.sh", "Install-FinanceApp.command"}
+MAC_ZIP = "Install-FinanceApp-mac.zip"
+MAC_COMMAND = "Install-FinanceApp.command"
 
 REQUIRED_IN_ZIP = ["app.py", "version.py", "paths.py", "config.defaults.yaml",
                    "requirements.txt", "restart_server.py", "data_public/public.db"]
@@ -154,6 +159,24 @@ def copy_installer_assets(out_dir: Path, src_dir: Path) -> list[Path]:
     return copied
 
 
+def build_mac_zip(out_dir: Path) -> Path | None:
+    """Zip Install-FinanceApp.command with its 0755 mode recorded (Unix
+    create_system + external_attr), so double-click unzip yields a runnable file."""
+    src = out_dir / MAC_COMMAND
+    if not src.is_file():
+        warn(f"{MAC_COMMAND} not built; skipping {MAC_ZIP}")
+        return None
+    zip_path = out_dir / MAC_ZIP
+    info = zipfile.ZipInfo(MAC_COMMAND, date_time=time.localtime()[:6])
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.create_system = 3  # Unix: Archive Utility / unzip honour the mode bits
+    info.external_attr = (0o100755 & 0xFFFF) << 16
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(info, src.read_bytes())
+    print(f"  {MAC_ZIP}")
+    return zip_path
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -198,13 +221,16 @@ def main() -> None:
 
     # Remove stale assets from a previous build so SHA256SUMS matches the directory contents.
     for stale in [*out_dir.glob("FinanceApp-*.zip"), out_dir / "SHA256SUMS.txt",
-                  *(out_dir / n for n in INSTALLER_ASSETS)]:
+                  *(out_dir / n for n in INSTALLER_ASSETS), out_dir / MAC_ZIP]:
         if stale.is_file():
             stale.unlink()
 
     print(f"Building FinanceApp {version} from {args.ref} -> {out_dir}")
     assets = [build_zip(version, args.ref, out_dir)]
     assets += copy_installer_assets(out_dir, Path(args.installer_dir))
+    mac_zip = build_mac_zip(out_dir)
+    if mac_zip:
+        assets.append(mac_zip)
     write_checksums(out_dir, assets)
     print("Done.")
 

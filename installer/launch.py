@@ -38,8 +38,11 @@ EXIT_REVERTED = 2
 
 
 def _headless():
+    # FINANCEAPP_GUI=1 is set by the macOS .app / Linux .desktop runner, whose
+    # stdout is redirected to run/launch.log (so it is not None).
     return sys.stdout is None or not hasattr(sys.stdout, "write") or \
-        os.path.basename(sys.executable).lower() == "pythonw.exe"
+        os.path.basename(sys.executable).lower() == "pythonw.exe" or \
+        os.environ.get("FINANCEAPP_GUI") == "1"
 
 
 class Out(object):
@@ -103,6 +106,7 @@ def run_server_cmd(home, state, cmd, extra, out):
     env = dict(os.environ)
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONPATH", None)
+    env.pop("FINANCEAPP_GUI", None)  # the server (and launch.py it spawns) has no GUI role
     env.update({
         "FINANCEAPP_HOME": home,
         "FINANCEAPP_PORT": str(int(state.get("port") or 8765)),

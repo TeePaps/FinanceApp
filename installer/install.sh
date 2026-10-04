@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # FinanceApp installer bootstrap (macOS / Linux).
 #
-#   curl -fsSL https://raw.githubusercontent.com/TeePaps/FinanceApp/main/install.sh | bash
+#   curl -fsSL https://github.com/TeePaps/FinanceApp/releases/latest/download/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --port 9000 --import-from ~/Apps/Claude/FinanceApp
 #
 # Ensures uv (official installer, PATH left untouched), downloads installer.py
