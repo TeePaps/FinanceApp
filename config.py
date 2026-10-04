@@ -183,6 +183,11 @@ YAHOO_BATCH_DELAY = _get('rate_limits.yahoo.batch_delay', 0.5)
 YAHOO_SINGLE_DELAY = _get('rate_limits.yahoo.single_delay', 0.3)
 YAHOO_CHUNK_DELAY = _get('rate_limits.yahoo.chunk_delay', 1.5)
 YAHOO_HISTORY_BATCH_DELAY = _get('rate_limits.yahoo.history_batch_delay', 0.5)
+# Batch chunk retries (yfinance_provider._download_chunk): worst case added per
+# chunk = sum of the doubling backoffs, 6s normally / 30s when rate limited.
+YAHOO_CHUNK_RETRIES = _get('rate_limits.yahoo.chunk_retries', 2)
+YAHOO_CHUNK_RETRY_BACKOFF = _get('rate_limits.yahoo.chunk_retry_backoff', 2)
+YAHOO_RATE_LIMIT_BACKOFF = _get('rate_limits.yahoo.rate_limit_backoff', 10)
 # Orchestrator-enforced pacing for the dividend/split providers. The screener
 # used to sleep a fixed 0.3s per ticker on top of the orchestrator's limiter;
 # these values fold that into the single pacing authority.

@@ -150,6 +150,76 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
     def supports_batch(self) -> bool:
         return True
 
+    # yf.download() chunk sizes used by fetch_prices / fetch_price_history_batch
+    PRICE_CHUNK_SIZE = 50
+    HISTORY_CHUNK_SIZE = 100
+    # Assumed cost of one retried download that comes back empty / rate limited
+    # (these fail fast; only used to size the orchestrator's timeout allowance).
+    RETRY_ATTEMPT_SECONDS = 5
+
+    def _retry_backoff(self, attempt: int, rate_limited: bool) -> float:
+        """Seconds to sleep after failed attempt number `attempt` (0-based)."""
+        base = config.YAHOO_RATE_LIMIT_BACKOFF if rate_limited else config.YAHOO_CHUNK_RETRY_BACKOFF
+        return base * (2 ** attempt)
+
+    def batch_retry_allowance(self, n_tickers: int, history: bool = False) -> float:
+        """Worst-case extra seconds the chunk retries can add for a batch call.
+
+        The orchestrator adds this to its batch timeout (see
+        DataOrchestrator._batch_retry_allowance) so backoff sleeps never turn
+        into a timeout that discards already-downloaded chunks. With defaults
+        it is 2*5 + (10 + 20) = 40s per chunk, assuming every retry is
+        rate limited (the longer backoff). Single tickers are never retried.
+        """
+        retries = max(0, int(config.YAHOO_CHUNK_RETRIES or 0))
+        if n_tickers <= 1 or retries == 0:
+            return 0.0
+        size = self.HISTORY_CHUNK_SIZE if history else self.PRICE_CHUNK_SIZE
+        chunks = (n_tickers + size - 1) // size
+        per_chunk = sum(self._retry_backoff(a, True) for a in range(retries)) \
+            + retries * self.RETRY_ATTEMPT_SECONDS
+        return chunks * per_chunk
+
+    def _download_chunk(self, chunk: List[str], period: str, kind: str, label: str, quiet: bool):
+        """yf.download() one chunk, retrying empty frames / errors with backoff.
+
+        Returns (frame, error): error is the last exception (None if the last
+        attempt returned a frame, which may still be empty). Attempts that fail
+        and will be retried are logged WITH an outcome so they count as failed
+        provider calls; the chunk's final result is left for the caller to log
+        without one (the orchestrator records one outcome per chunk call).
+        quiet=True sends those lines to the durable log only. A single-ticker
+        chunk (UI lookup) is never retried.
+        """
+        from services import feed_events
+        from services.activity_log import activity_log
+
+        retries = max(0, int(config.YAHOO_CHUNK_RETRIES or 0)) if len(chunk) > 1 else 0
+        for attempt in range(retries + 1):
+            started = time.monotonic()
+            frame, error = None, None
+            try:
+                frame = yf.download(chunk, period=period, progress=False, threads=True)
+                if not frame.empty:
+                    return frame, None
+                outcome = feed_events.OUTCOME_EMPTY
+                reason = "returned empty"
+            except Exception as e:
+                frame, error = None, e
+                outcome = feed_events.classify_error(e)
+                reason = f"failed: {str(e)[:50]}"
+            if attempt >= retries:
+                return frame, error
+
+            rate_limited = outcome == feed_events.OUTCOME_RATE_LIMITED
+            delay = self._retry_backoff(attempt, rate_limited)
+            emit = feed_events.record if quiet else activity_log.log
+            emit("warning", "yfinance",
+                 f"{label} {reason}, retry {attempt + 1}/{retries} in {delay:g}s",
+                 kind=kind, outcome=outcome,
+                 duration_ms=int((time.monotonic() - started) * 1000))
+            time.sleep(delay)
+
     def fetch_price(self, ticker: str) -> ProviderResult:
         """Fetch price for a single ticker."""
         ticker = ticker.upper()
@@ -210,7 +280,7 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
             return results
 
         # Chunk tickers to avoid rate limits (50 at a time with longer delay)
-        chunk_size = 50
+        chunk_size = self.PRICE_CHUNK_SIZE
         all_data = None
         total_chunks = (len(tickers) + chunk_size - 1) // chunk_size
 
@@ -218,32 +288,29 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
             chunk = tickers[i:i + chunk_size]
             chunk_num = i // chunk_size + 1
 
-            try:
-                # Add delay between chunks to avoid rate limiting
-                if i > 0:
-                    time.sleep(config.YAHOO_CHUNK_DELAY)
+            # Add delay between chunks to avoid rate limiting
+            if i > 0:
+                time.sleep(config.YAHOO_CHUNK_DELAY)
 
-                # Only log chunk progress for larger batches (screener operations)
-                if len(tickers) > 5:
-                    activity_log.log("info", "yfinance", f"Prices: chunk {chunk_num}/{total_chunks} ({len(chunk)} tickers)...")
-                chunk_data = yf.download(chunk, period='1d', progress=False, threads=True)
+            # Only log chunk progress for larger batches (screener operations)
+            quiet = len(tickers) <= 5
+            if not quiet:
+                activity_log.log("info", "yfinance", f"Prices: chunk {chunk_num}/{total_chunks} ({len(chunk)} tickers)...")
+            chunk_data, error = self._download_chunk(
+                chunk, '1d', 'price', f"Prices chunk {chunk_num}/{total_chunks}", quiet)
 
-                if not chunk_data.empty:
-                    if all_data is None:
-                        all_data = chunk_data
-                    else:
-                        # Merge chunk data - for MultiIndex columns, concat works
-                        import pandas as pd
-                        all_data = pd.concat([all_data, chunk_data], axis=1)
-                else:
-                    if len(tickers) > 5:
-                        activity_log.log("warning", "yfinance", f"Chunk {chunk_num}/{total_chunks} returned empty")
-
-            except Exception as e:
+            if error is not None:
                 # Log but continue with other chunks
-                if len(tickers) > 5:
-                    activity_log.log("error", "yfinance", f"Chunk {chunk_num}/{total_chunks} failed: {str(e)[:50]}")
-                continue
+                if not quiet:
+                    activity_log.log("error", "yfinance", f"Chunk {chunk_num}/{total_chunks} failed: {str(error)[:50]}")
+            elif not chunk_data.empty:
+                if all_data is None:
+                    all_data = chunk_data
+                else:
+                    # Merge chunk data - for MultiIndex columns, concat works
+                    all_data = pd.concat([all_data, chunk_data], axis=1)
+            elif not quiet:
+                activity_log.log("warning", "yfinance", f"Chunk {chunk_num}/{total_chunks} returned empty")
 
         data = all_data if all_data is not None else None
 
@@ -426,7 +493,7 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
             return results
 
         # Chunk tickers to avoid rate limits (100 at a time)
-        chunk_size = 100
+        chunk_size = self.HISTORY_CHUNK_SIZE
         all_data = None
         total_chunks = (len(tickers) + chunk_size - 1) // chunk_size
 
@@ -436,26 +503,24 @@ class YFinancePriceProvider(PriceProvider, HistoricalPriceProvider, StockInfoPro
             chunk = tickers[i:i + chunk_size]
             chunk_num = i // chunk_size + 1
 
-            try:
-                # Add delay between chunks to avoid rate limiting
-                if i > 0:
-                    time.sleep(config.YAHOO_HISTORY_BATCH_DELAY)
+            # Add delay between chunks to avoid rate limiting
+            if i > 0:
+                time.sleep(config.YAHOO_HISTORY_BATCH_DELAY)
 
-                activity_log.log("info", "yfinance", f"History: chunk {chunk_num}/{total_chunks} ({len(chunk)} tickers)...")
-                chunk_data = yf.download(chunk, period=period, progress=False, threads=True)
+            activity_log.log("info", "yfinance", f"History: chunk {chunk_num}/{total_chunks} ({len(chunk)} tickers)...")
+            chunk_data, error = self._download_chunk(
+                chunk, period, 'price_history', f"History chunk {chunk_num}/{total_chunks}", False)
 
-                if not chunk_data.empty:
-                    if all_data is None:
-                        all_data = chunk_data
-                    else:
-                        # Merge chunk data
-                        all_data = pd.concat([all_data, chunk_data], axis=1)
+            if error is not None:
+                activity_log.log("error", "yfinance", f"History chunk {chunk_num}/{total_chunks} failed: {str(error)[:50]}")
+            elif not chunk_data.empty:
+                if all_data is None:
+                    all_data = chunk_data
                 else:
-                    activity_log.log("warning", "yfinance", f"History chunk {chunk_num} returned empty")
-
-            except Exception as e:
-                activity_log.log("error", "yfinance", f"History chunk {chunk_num}/{total_chunks} failed: {str(e)[:50]}")
-                continue
+                    # Merge chunk data
+                    all_data = pd.concat([all_data, chunk_data], axis=1)
+            else:
+                activity_log.log("warning", "yfinance", f"History chunk {chunk_num} returned empty")
 
         data = all_data
 

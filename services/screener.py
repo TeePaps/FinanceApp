@@ -143,6 +143,11 @@ def _reconcile_delistings(all_tickers, priced_tickers):
         return
 
     db.record_price_successes(priced)
+    # ticker_failures feeds exclusion at the same threshold, so it shares the
+    # outage guard above. This is the one place the bulk jobs record price
+    # misses (run_global_refresh does its own bookkeeping and never calls this).
+    db.record_ticker_failures_bulk(
+        failed, priced, threshold=FAILURE_THRESHOLD, reason='no_price')
     if failed:
         newly = db.record_price_failures(failed, threshold=FAILURE_THRESHOLD)
         if newly:
@@ -1438,6 +1443,10 @@ def run_smart_update(index_name='all'):
 
     # Update staleness metadata
     db.set_metadata('last_price_update', datetime.now().isoformat())
+    if _running:
+        full, no_eps = _count_eps(modified_valuations.values())
+        _write_refresh_summary('smart', index_name, start_time, len(tickers),
+                               full, no_eps, len(tickers) - len(modified_valuations))
 
     # Phase: Fetch 52-week data for tickers that need it
     if _running:

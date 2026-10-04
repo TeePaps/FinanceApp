@@ -245,6 +245,15 @@ class DataOrchestrator:
         own = getattr(provider, 'request_timeout', 0) or 0
         return max(default, own)
 
+    @staticmethod
+    def _batch_retry_allowance(provider: BaseProvider, n_tickers: int, **kwargs) -> float:
+        """Extra seconds a provider declares for its own internal chunk retries.
+
+        Providers without `batch_retry_allowance` get nothing extra.
+        """
+        allowance = getattr(provider, 'batch_retry_allowance', None)
+        return allowance(n_tickers, **kwargs) if callable(allowance) else 0.0
+
     def _execute_with_timeout(
         self,
         func: Callable,
@@ -638,6 +647,8 @@ class DataOrchestrator:
                                   for i in range(0, len(remaining), batch_size)]:
                         chunk_timeout = self.config.provider_timeout_seconds * max(
                             1, len(chunk) // 50)
+                        chunk_timeout += self._batch_retry_allowance(provider, len(chunk))
+                        started = time.monotonic()
                         try:
                             batch_results = self._execute_with_timeout(
                                 lambda p=provider, t=chunk: p.fetch_prices(t),
@@ -1288,10 +1299,25 @@ class DataOrchestrator:
                 if provider.supports_batch:
                     # Use longer timeout for batch (scales with ticker count)
                     batch_timeout = self.config.provider_timeout_seconds * max(1, len(remaining) // 20)
-                    batch_results = self._execute_with_timeout(
-                        lambda p=provider, t=remaining, per=period: p.fetch_price_history_batch(t, per),
-                        timeout_seconds=batch_timeout
-                    )
+                    batch_timeout += self._batch_retry_allowance(provider, len(remaining), history=True)
+                    started = time.monotonic()
+                    attempted_n = len(remaining)
+                    try:
+                        batch_results = self._execute_with_timeout(
+                            lambda p=provider, t=remaining, per=period: p.fetch_price_history_batch(t, per),
+                            timeout_seconds=batch_timeout
+                        )
+                    except TimeoutError:
+                        self._record_outcome(provider, 'price_history', feed_events.OUTCOME_TIMEOUT,
+                                             self._elapsed_ms(started),
+                                             f"0/{attempted_n} price histories (timeout)", level="error")
+                        raise
+                    except Exception as e:
+                        self._record_outcome(provider, 'price_history', feed_events.classify_error(e),
+                                             self._elapsed_ms(started),
+                                             f"0/{attempted_n} price histories (error: {str(e)[:60]})", level="error")
+                        raise
+                    duration_ms = self._elapsed_ms(started)
 
                     success_count = 0
                     for ticker, result in batch_results.items():
@@ -1300,6 +1326,10 @@ class DataOrchestrator:
                             if ticker in remaining:
                                 remaining.remove(ticker)
                             success_count += 1
+                    self._record_outcome(
+                        provider, 'price_history',
+                        feed_events.OUTCOME_SUCCESS if success_count else feed_events.OUTCOME_EMPTY,
+                        duration_ms, f"{success_count}/{attempted_n} price histories")
 
                     # Log result
                     try:

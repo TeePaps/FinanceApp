@@ -104,6 +104,9 @@ rate_limits:
     single_delay: 0.3            # Seconds between single ticker requests
     chunk_delay: 1.5             # Delay between 50-ticker chunks
     history_batch_delay: 0.5     # Delay for price history batches
+    chunk_retries: 2             # Extra attempts for a batch chunk that comes back empty or errors (0 = off; never for 1 ticker)
+    chunk_retry_backoff: 2       # Seconds before the first chunk retry; doubles each attempt
+    rate_limit_backoff: 10       # Same, but when Yahoo answered 429 / rate limited (doubles each attempt)
     # Per-provider pacing enforced by the orchestrator's rate limiter, which is
     # now the single pacing authority - the screener no longer adds its own
     # fixed per-ticker sleep on top of these. Set to the previous *combined*
