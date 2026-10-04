@@ -205,7 +205,9 @@ def _stop_by_pid_file():
 def _stop_by_port_unix():
     try:
         result = subprocess.run(
-            ["lsof", "-ti", ":%d" % SERVER_PORT],
+            # LISTEN only: a bare ":PORT" also matches *clients* (the browser
+            # polling /healthz during an in-app update) and would kill them.
+            ["lsof", "-ti", "tcp:%d" % SERVER_PORT, "-sTCP:LISTEN"],
             capture_output=True, text=True, timeout=5
         )
     except (OSError, subprocess.SubprocessError) as e:

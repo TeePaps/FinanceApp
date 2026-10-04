@@ -892,6 +892,12 @@ if __name__ == '__main__':
         init_scheduler(app)
         atexit.register(shutdown_scheduler)
 
+        # Release checks: ~30s after startup, then every 24h (only when the
+        # updates.auto_check setting is on; default on when installed).
+        from services import updater
+        updater.start_auto_check()
+        atexit.register(updater.shutdown)
+
         import signal
         def _graceful_exit(signum, frame):
             sys.exit(0)

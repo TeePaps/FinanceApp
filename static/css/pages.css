@@ -4291,7 +4291,7 @@ input:disabled + .toggle-slider {
 
 /* Buttons */
 .btn-primary {
-    background: var(--text-accent);
+    background: var(--text-accent, var(--color-primary));  /* --text-accent is not defined */
     color: white;
     border: none;
     padding: 10px 20px;
@@ -4816,3 +4816,107 @@ input:disabled + .toggle-slider {
         grid-template-columns: 1fr;
     }
 }
+
+/* =====================
+   Update banner / About & Updates
+   ===================== */
+
+.update-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 16px;
+    margin-bottom: 12px;
+    border-radius: var(--radius-lg);
+    background: var(--bg-secondary);
+    border-left: 4px solid var(--color-primary);
+    box-shadow: 0 2px 4px var(--shadow);
+    color: var(--text-primary);
+}
+
+.update-banner[hidden] { display: none; }
+
+.update-banner-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.update-banner-link {
+    background: none;
+    border: none;
+    color: var(--color-primary);
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 4px 6px;
+}
+
+.update-banner-link:hover { background: none; }
+
+.update-settings .update-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border-light);
+    color: var(--text-primary);
+}
+
+.update-settings .update-row:last-child { border-bottom: none; }
+
+.update-settings .update-row label {
+    min-width: 160px;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.update-settings .update-warning { color: var(--color-danger); }
+
+.update-pill {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 10px;
+    background: var(--color-primary);
+    color: #fff;
+    font-size: 0.8rem;
+}
+
+.update-modal-body {
+    padding: 16px 20px 20px;
+    color: var(--text-primary);
+}
+
+.update-notes {
+    white-space: pre-wrap;
+    font-size: 0.9rem;
+    max-height: 50vh;
+    overflow-y: auto;
+}
+
+.update-steps {
+    margin: 0 0 12px;
+    padding-left: 22px;
+    color: var(--text-muted);
+}
+
+.update-steps li { padding: 2px 0; }
+.update-steps li.done { color: var(--color-success); }
+.update-steps li.done::after { content: " ✓"; }
+.update-steps li.active { color: var(--text-primary); font-weight: 600; }
+.update-steps li.failed { color: var(--color-danger); }
+
+.update-message { margin: 8px 0; }
+
+.update-error {
+    color: var(--color-danger);
+    white-space: pre-wrap;
+    font-size: 0.85rem;
+    max-height: 30vh;
+    overflow-y: auto;
+}
+
+.update-modal-actions { margin-top: 12px; text-align: right; }

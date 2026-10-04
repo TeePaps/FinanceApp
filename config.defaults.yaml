@@ -220,6 +220,13 @@ scheduler:
     timezone: "America/New_York"
 
 # ============================================================================
+# Updates (Settings -> About & Updates)
+# ============================================================================
+updates:
+  auto_check: null               # Check for new releases daily (null = on when installed, off in dev mode)
+  channel: stable                # stable | beta (beta also offers pre-releases)
+
+# ============================================================================
 # Staleness Dashboard Thresholds
 # ============================================================================
 staleness:

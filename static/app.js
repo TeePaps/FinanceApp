@@ -451,6 +451,7 @@ document.addEventListener('DOMContentLoaded', function() {
     loadStalenessDashboard();
     initTickerAutocomplete();
     loadIndices();  // Populate index dropdowns from API
+    initUpdates();  // Update banner / resume an in-progress update
 });
 
 // Handle browser back/forward buttons.
@@ -675,6 +676,7 @@ function showTab(tabName) {
         loadDatasets();
     } else if (tabName === 'settings') {
         loadProviderSettings();
+        loadUpdateSettings();
     } else if (tabName === 'logs') {
         // Connect SSE to receive live logs even if no operation is running
         progressManager.connectSSE();
@@ -5148,4 +5150,410 @@ function escapeHtml(s) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#039;');
+}
+
+// =====================
+// About & Updates (in-app updater; see docs/installer-updater-design.md)
+// =====================
+
+let updateStatus = null;
+let updateCheckRequested = false;  // dev mode: only show the banner after "Check now"
+const UPDATE_DISMISS_KEY = 'updateDismissedVersion';
+const UPDATE_STEPS = [
+    ['download', 'Download & verify'],
+    ['unpack', 'Unpack'],
+    ['venv', 'Install dependencies'],
+    ['smoke_test', 'Test new version'],
+    ['backup', 'Back up data'],
+    ['switch', 'Switch version'],
+    ['prune', 'Clean up'],
+    ['restart', 'Restart'],
+];
+
+function updateStorageGet(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+
+function updateStorageSet(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) { /* storage unavailable */ }
+}
+
+async function fetchUpdateStatus() {
+    const response = await fetch('/api/update/status', {cache: 'no-store'});
+    const result = await response.json();
+    if (!result.success) throw new Error(result.error || 'Could not read update status');
+    updateStatus = result.data;
+    return updateStatus;
+}
+
+async function initUpdates() {
+    try {
+        const s = await fetchUpdateStatus();
+        renderUpdateBanner();
+        const job = s.job || {};
+        if (job.state === 'running' || job.state === 'restarting') {
+            openUpdateModal(job.action === 'rollback' ? 'Reverting FinanceApp' : 'Updating FinanceApp');
+            pollUpdateJob(s.current, job.version);
+        }
+    } catch (e) {
+        console.warn('Update status unavailable:', e);
+    }
+}
+
+function renderUpdateBanner() {
+    const banner = document.getElementById('update-banner');
+    if (!banner) return;
+    const s = updateStatus;
+    const dismissed = updateStorageGet(UPDATE_DISMISS_KEY);
+    const isDev = s && s.mode === 'dev';
+    const show = s && s.available && s.latest &&
+        (isDev ? updateCheckRequested : dismissed !== s.latest);
+    if (!show) {
+        banner.hidden = true;
+        return;
+    }
+    const text = document.getElementById('update-banner-text');
+    text.textContent = isDev
+        ? `FinanceApp ${s.latest} is available (you have ${s.current}). This is a development checkout - update with git pull.`
+        : `FinanceApp ${s.latest} is available (you have ${s.current})`;
+    document.getElementById('update-banner-apply').hidden = !s.can_update;
+    banner.hidden = false;
+}
+
+function dismissUpdateBanner() {
+    if (updateStatus && updateStatus.latest) {
+        updateStorageSet(UPDATE_DISMISS_KEY, updateStatus.latest);
+    }
+    updateCheckRequested = false;
+    document.getElementById('update-banner').hidden = true;
+}
+
+function closeUpdateModal() {
+    const m = document.getElementById('update-modal');
+    if (m) m.remove();
+}
+
+function showUpdateNotes() {
+    const s = updateStatus || {};
+    closeUpdateModal();
+    const notes = s.notes ? escapeHtml(s.notes) : '<span class="muted">No release notes.</span>';
+    const link = s.html_url
+        ? `<p><a href="${escapeHtml(s.html_url)}" target="_blank" rel="noopener">View release on GitHub</a></p>`
+        : '';
+    const div = document.createElement('div');
+    div.id = 'update-modal';
+    div.innerHTML = `
+        <div class="modal-overlay" onclick="closeUpdateModal()">
+            <div class="modal-content" onclick="event.stopPropagation()">
+                <div class="modal-header"><h3>What's new in ${escapeHtml(s.latest || '')}</h3>
+                    <button class="modal-close" onclick="closeUpdateModal()">&times;</button></div>
+                <div class="update-modal-body">
+                    <div class="update-notes">${notes}</div>
+                    ${link}
+                </div>
+            </div>
+        </div>`;
+    document.body.appendChild(div);
+}
+
+function openUpdateModal(title) {
+    closeUpdateModal();
+    const steps = UPDATE_STEPS.map(([id, label]) =>
+        `<li data-step="${id}">${escapeHtml(label)}</li>`).join('');
+    const div = document.createElement('div');
+    div.id = 'update-modal';
+    div.innerHTML = `
+        <div class="modal-overlay">
+            <div class="modal-content update-progress-modal">
+                <div class="modal-header"><h3>${escapeHtml(title)}</h3></div>
+                <div class="update-modal-body">
+                    <ol class="update-steps" id="update-steps">${steps}</ol>
+                    <p class="update-message" id="update-message">Starting...</p>
+                    <p class="update-error" id="update-error" hidden></p>
+                    <div class="update-modal-actions" id="update-modal-actions" hidden>
+                        <button class="btn-secondary" onclick="closeUpdateModal()">Close</button>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+    document.body.appendChild(div);
+}
+
+function setUpdateModal(step, message, error) {
+    const list = document.getElementById('update-steps');
+    if (list && step) {
+        const ids = UPDATE_STEPS.map(st => st[0]);
+        const idx = ids.indexOf(step === 'restore' ? 'backup' : step);  // rollback's restore step
+        list.querySelectorAll('li').forEach((li, i) => {
+            li.classList.toggle('done', idx > -1 && i < idx);
+            li.classList.toggle('active', i === idx);
+            li.classList.toggle('failed', !!error && i === idx);
+        });
+    }
+    const msg = document.getElementById('update-message');
+    if (msg && message) msg.textContent = message;
+    const err = document.getElementById('update-error');
+    if (err) {
+        err.hidden = !error;
+        err.textContent = error || '';
+    }
+    const actions = document.getElementById('update-modal-actions');
+    if (actions) actions.hidden = !error;
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Phase 1: follow the job via /api/update/status; phase 2: once the server
+// restarts (status unreachable or job "restarting"), poll /healthz until the
+// version changes, then reload.
+async function pollUpdateJob(fromVersion, targetVersion) {
+    while (true) {
+        let s = null;
+        try {
+            s = await fetchUpdateStatus();
+        } catch (e) {
+            break;  // server going down for the restart
+        }
+        const job = s.job || {};
+        if (job.state === 'error') {
+            setUpdateModal(job.step, 'The update did not complete. FinanceApp is still on ' + s.current + '.', job.error);
+            loadUpdateSettings();
+            return;
+        }
+        setUpdateModal(job.step, job.message || 'Working...');
+        if (job.state === 'restarting') break;
+        if (job.state !== 'running') return;
+        await sleep(1000);
+    }
+    setUpdateModal('restart', 'Restarting FinanceApp' + (targetVersion ? ' ' + targetVersion : '') + '...');
+    await waitForNewVersion(fromVersion, targetVersion);
+}
+
+async function waitForNewVersion(fromVersion, targetVersion) {
+    const deadline = Date.now() + 3 * 60 * 1000;
+    let sawDown = false;
+    while (Date.now() < deadline) {
+        await sleep(2000);
+        let health = null;
+        try {
+            const r = await fetch('/healthz', {cache: 'no-store'});
+            if (r.ok) health = await r.json();
+        } catch (e) {
+            sawDown = true;
+            continue;
+        }
+        if (!health) { sawDown = true; continue; }
+        if (health.version && health.version !== fromVersion) {
+            setUpdateModal('restart', `FinanceApp ${health.version} is running. Reloading...`);
+            await sleep(800);
+            window.location.reload();
+            return;
+        }
+        if (sawDown) {
+            // Back up on the old version: launch.py reverted a failed start.
+            try {
+                const s = await fetchUpdateStatus();
+                const lf = s.last_failed;
+                if (lf && (!targetVersion || lf.version === targetVersion)) {
+                    setUpdateModal('restart', `FinanceApp ${s.current} is running.`,
+                        `Version ${lf.version} failed to start, so FinanceApp went back to ${s.current}. ` +
+                        `Details are in ${s.log_file}.`);
+                    return;
+                }
+            } catch (e) { /* keep waiting */ }
+        }
+    }
+    const logFile = (updateStatus && updateStatus.log_file) || 'run/server.log';
+    setUpdateModal('restart', 'FinanceApp has not come back yet.',
+        `The server did not restart within 3 minutes. Check ${logFile} (and update-restart.log next to it), ` +
+        'then start FinanceApp from its launcher and reload this page.');
+}
+
+async function applyUpdate() {
+    const s = updateStatus;
+    if (!s || !s.can_update) {
+        showNotification((s && s.dev_message) || 'Updates are not available in this copy', 'info');
+        return;
+    }
+    if (!confirm(`Update FinanceApp ${s.current} to ${s.latest}?\n\nYour data is backed up first. FinanceApp restarts when the update is installed.`)) {
+        return;
+    }
+    openUpdateModal('Updating FinanceApp');
+    try {
+        const response = await fetch('/api/update/apply', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({version: s.latest})
+        });
+        const result = await response.json();
+        if (!result.success) {
+            setUpdateModal(null, 'The update could not start.', result.error);
+            return;
+        }
+        pollUpdateJob(s.current, s.latest);
+    } catch (e) {
+        setUpdateModal(null, 'The update could not start.', e.message);
+    }
+}
+
+async function revertUpdate() {
+    const s = updateStatus;
+    if (!s || !s.previous) return;
+    const verb = s.previous_newer ? 'Switch' : 'Revert';
+    if (!confirm(`${verb} FinanceApp ${s.current} to the previous version ${s.previous}?\n\nFinanceApp will restart.`)) {
+        return;
+    }
+    await sendRollback(false);
+}
+
+async function sendRollback(restoreData) {
+    const s = updateStatus;
+    try {
+        const response = await fetch('/api/update/rollback', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({restore_data: restoreData})
+        });
+        const result = await response.json();
+        if (!result.success) {
+            showNotification('Revert failed: ' + result.error, 'error');
+            return;
+        }
+        const d = result.data;
+        if (d.needs_restore) {
+            if (!d.backup) {
+                alert(`Version ${d.previous} cannot read your current data (it was upgraded by ${d.current}), ` +
+                      'and no pre-update backup was found, so it is not safe to revert.');
+                return;
+            }
+            const ok = confirm(
+                `Version ${d.previous} uses an older data format than ${d.current}.\n\n` +
+                `To revert, your portfolio data and settings must be restored from the backup taken ` +
+                `before updating to ${d.current}. Transactions and settings changed since that update ` +
+                `WILL BE LOST (a copy of your current data is saved in the backups folder first).\n\n` +
+                'Restore the pre-update backup and revert?');
+            if (ok) await sendRollback(true);
+            return;
+        }
+        (d.warnings || []).forEach(w => console.warn('Revert:', w));
+        openUpdateModal('Reverting FinanceApp');
+        setUpdateModal('restart', `Restarting FinanceApp ${d.version}...`);
+        await waitForNewVersion(s.current, d.version);
+    } catch (e) {
+        showNotification('Revert failed: ' + e.message, 'error');
+    }
+}
+
+function formatUpdateTime(iso) {
+    if (!iso) return 'never';
+    const d = new Date(iso);
+    return isNaN(d) ? iso : d.toLocaleString();
+}
+
+async function loadUpdateSettings() {
+    const container = document.getElementById('about-updates-content');
+    if (!container) return;
+    try {
+        await fetchUpdateStatus();
+        renderUpdateSettings();
+    } catch (e) {
+        container.innerHTML = `<span class="error">Failed to load update status: ${escapeHtml(e.message)}</span>`;
+    }
+}
+
+function renderUpdateSettings() {
+    const container = document.getElementById('about-updates-content');
+    const s = updateStatus;
+    if (!container || !s) return;
+    const isDev = s.mode === 'dev';
+    const modeLabel = isDev ? 'Development checkout' : 'Installed';
+    let latest;
+    if (s.latest) {
+        latest = escapeHtml(s.latest) + (s.prerelease ? ' (pre-release)' : '');
+        latest += s.available ? ' <span class="update-pill">update available</span>'
+                              : ' <span class="muted">(up to date)</span>';
+    } else {
+        latest = '<span class="muted">unknown</span>';
+    }
+    let actions = '';
+    if (s.available) {
+        actions = s.can_update
+            ? `<button class="btn-primary" onclick="applyUpdate()">Update to ${escapeHtml(s.latest)}</button>
+               <button class="btn-secondary" onclick="showUpdateNotes()">What's new</button>`
+            : `<span class="settings-hint">${escapeHtml(s.dev_message || '')}</span>`;
+    }
+    const lastFailed = s.last_failed && s.last_failed.version
+        ? `<div class="update-row update-warning">Version ${escapeHtml(s.last_failed.version)} failed to start on
+           ${escapeHtml(formatUpdateTime(s.last_failed.at))} and FinanceApp went back to the previous version.</div>`
+        : '';
+    const previous = !isDev
+        ? `<div class="update-row"><label>Previous version</label>
+             <span>${s.previous ? escapeHtml(s.previous) : '<span class="muted">none</span>'}</span>
+             ${s.previous ? `<button class="btn-warning" onclick="revertUpdate()">${s.previous_newer ? 'Switch back to' : 'Revert to'} ${escapeHtml(s.previous)}</button>` : ''}
+           </div>`
+        : '';
+    container.innerHTML = `
+        <div class="update-settings">
+            <div class="update-row"><label>Version</label>
+                <span><strong>${escapeHtml(s.current)}</strong> <span class="muted">· ${modeLabel}</span></span></div>
+            <div class="update-row"><label>Latest release</label><span>${latest}</span></div>
+            <div class="update-row"><label>Last checked</label>
+                <span>${escapeHtml(formatUpdateTime(s.checked_at))}${s.check_error
+                    ? ` <span class="error">(check failed: ${escapeHtml(s.check_error)})</span>` : ''}</span>
+                <button class="btn-secondary" id="update-check-btn" onclick="checkForUpdates()">Check now</button></div>
+            ${actions ? `<div class="update-row update-actions">${actions}</div>` : ''}
+            ${lastFailed}
+            ${previous}
+            <div class="update-row"><label for="update-auto-check">Check automatically</label>
+                <input type="checkbox" id="update-auto-check" ${s.auto_check ? 'checked' : ''}
+                       onchange="saveUpdateSettings({auto_check: this.checked})">
+                <span class="cache-hint">Look for a new release daily</span></div>
+            <div class="update-row"><label for="update-beta">Beta channel</label>
+                <input type="checkbox" id="update-beta" ${s.channel === 'beta' ? 'checked' : ''}
+                       onchange="saveUpdateSettings({channel: this.checked ? 'beta' : 'stable'})">
+                <span class="cache-hint">Also offer pre-release versions</span></div>
+            ${isDev ? `<p class="settings-hint">${escapeHtml(s.dev_message || '')}</p>` : ''}
+        </div>`;
+}
+
+async function checkForUpdates() {
+    const btn = document.getElementById('update-check-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Checking...'; }
+    try {
+        const response = await fetch('/api/update/check', {method: 'POST'});
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+        updateStatus = result.data;
+        updateCheckRequested = true;
+        if (updateStatus.check_error) {
+            showNotification('Update check failed: ' + updateStatus.check_error, 'error');
+        } else if (updateStatus.available) {
+            showNotification(`FinanceApp ${updateStatus.latest} is available`, 'info');
+        } else {
+            showNotification(`FinanceApp ${updateStatus.current} is up to date`, 'success');
+        }
+        renderUpdateSettings();
+        renderUpdateBanner();
+    } catch (e) {
+        showNotification('Update check failed: ' + e.message, 'error');
+        if (btn) { btn.disabled = false; btn.textContent = 'Check now'; }
+    }
+}
+
+async function saveUpdateSettings(changes) {
+    try {
+        const response = await fetch('/api/update/settings', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(changes)
+        });
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+        showNotification('Update settings saved', 'success');
+        await loadUpdateSettings();
+        renderUpdateBanner();
+    } catch (e) {
+        showNotification('Error saving update settings: ' + e.message, 'error');
+        loadUpdateSettings();
+    }
 }

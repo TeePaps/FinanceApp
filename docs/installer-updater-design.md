@@ -239,6 +239,56 @@ localStorage), progress modal polling status then `/healthz` until version chang
 Settings → "About & Updates": version, Check now, auto-check toggle, beta channel toggle,
 previous version + Revert.
 
+As implemented (Phases 4–5):
+- `services/updater.py` loads `installer/core.py` from `paths.CODE_DIR` by path and only
+  orchestrates core helpers. Mode is `"installed"` only when `FINANCEAPP_HOME` is set, CODE_DIR
+  is `<HOME>/versions/<X>` (not a git checkout) and install.json exists; otherwise `"dev"`
+  (check works, apply/rollback return `success:false` with a "use git pull" message).
+- Status also returns `installed_current`, `prerelease`, `published_at`, `check_error`,
+  `previous_newer` (after a revert the "previous" is newer; UI says "Switch back to"),
+  `last_failed` (from launch.py), `can_update`, `dev_message`, `home`, `log_file`; `job` also has
+  `action` (update|rollback), `version`, `from_version`, `started_at`, `finished_at`, `log`.
+  Job states: idle | running | restarting | error. One job at a time (409 otherwise).
+  `POST /api/update/apply` accepts optional `{version}` (default: cached latest); 202 on start.
+- Cache `RUN_DIR/update_check.json` (dev: `logs/`) holds the last result per channel; a
+  failed check keeps the last good `latest` and sets `error`. Changing channel drops the cache.
+- Checksums: `SHA256SUMS.txt` is required for GitHub releases; with `$FINANCEAPP_UPDATE_FEED`
+  set it is verified when present (test feeds may omit it).
+- Apply failure before the switch removes the half-built version dir (unless it is the
+  current/previous); a failure after the switch restores the original install.json.
+  `install_home_files` always runs after a switch; `install_launchers` only when install.json
+  has a non-empty `launchers` list (so `--no-shortcuts` installs never get `~/Applications`
+  or Start Menu entries from an update). Failures there are warnings.
+- Restart: `<new current venv python> <HOME>/launch.py restart`, spawned after install.json is
+  final; macOS/Linux `start_new_session=True`, Windows `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP|
+  CREATE_NO_WINDOW` via a short-lived trampoline (restart_server's `taskkill /T` would otherwise
+  kill launch.py as part of this server's process tree). Output → `run/update-restart.log`.
+  The old server does not exit by itself: launch.py's stop (pid file) ends it. If it is still
+  alive 300 s later the job turns into an error so the UI can say so. Rollback spawns after a
+  1 s delay so its HTTP response is sent first. Env passes through (FINANCEAPP_UPDATE_FEED
+  reaches the new server; launch.py/restart_server already copy os.environ).
+  `restart_server.py`'s Unix port fallback now uses `lsof -ti tcp:PORT -sTCP:LISTEN`; a bare
+  `:PORT` also matched clients and could kill the browser polling during the restart.
+- Rollback schema check: previous version's expected schema = `SCHEMA_VERSION_PUBLIC/PRIVATE`
+  regex-read from `versions/<prev>/database.py` (missing → warning, treated as compatible).
+  Only a newer **private.db** triggers `needs_restore` (`backup` = `backups/pre-<current>` or
+  null if missing → UI refuses). A newer public.db (rebuildable) is a warning only.
+  `restore_data` first saves current private.db + config.yaml to
+  `backups/rollback-from-<cur>-<ts>/`, then restores private.db with the SQLite backup API
+  *into* the live file (safe while open, works on Windows) and replaces config.yaml.
+- Settings: `updates: {auto_check: null, channel: stable}` in config.defaults.yaml;
+  `auto_check: null` = on when installed, off in dev. Written with ruamel round-trip; the
+  providers config cache is refreshed so a later provider save keeps the section.
+- Auto-check: a separate APScheduler BackgroundScheduler in updater (the price scheduler can
+  be disabled/paused by the user, so it is not reused): first run 30 s after start, then every
+  24 h; each run re-reads `auto_check`, so toggling needs no restart. Started from app.py's
+  serving-process block only (not under the test client / `import app`).
+- UI: banner hidden in dev mode unless the user clicked Check now (then it says to use git
+  pull, no Update button). Progress modal polls status every 1 s; once status is unreachable
+  or the job is `restarting` it polls `/healthz` every 2 s for up to 3 min, reloads on a new
+  version, reports a launch.py revert (`last_failed`) or a timeout pointing at
+  `run/server.log` / `update-restart.log`.
+
 ## Uninstaller
 
 `uninstall.py [--yes] [--delete-data] [--purge]`: stop server on saved port → backup data to

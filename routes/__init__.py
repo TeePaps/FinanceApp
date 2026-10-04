@@ -14,6 +14,7 @@ from .sec import sec_bp
 from .admin import admin_bp
 from .stars import stars_bp
 from .feeds import feeds_bp
+from .update import update_bp
 
 
 def register_blueprints(app):
@@ -28,3 +29,4 @@ def register_blueprints(app):
     app.register_blueprint(admin_bp)
     app.register_blueprint(stars_bp)
     app.register_blueprint(feeds_bp)
+    app.register_blueprint(update_bp)

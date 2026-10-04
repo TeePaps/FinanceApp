@@ -9,10 +9,20 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=46">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=48">
 </head>
 <body>
     <div class="container">
+        <!-- Update banner (shown by initUpdates() when a new release is available) -->
+        <div id="update-banner" class="update-banner" role="status" hidden>
+            <span id="update-banner-text"></span>
+            <span class="update-banner-actions">
+                <button type="button" class="update-banner-link" onclick="showUpdateNotes()">What's new</button>
+                <button type="button" id="update-banner-apply" class="btn-primary" onclick="applyUpdate()">Update now</button>
+                <button type="button" class="btn-secondary" onclick="dismissUpdateBanner()">Later</button>
+            </span>
+        </div>
+
         <div class="header-row">
             <h1>Stock Portfolio Tracker</h1>
             <div class="header-right">
@@ -530,6 +540,15 @@
             <section id="settings-section">
                 <h2>Settings</h2>
 
+                <!-- About & Updates (populated by loadUpdateSettings()) -->
+                <div class="settings-card" id="about-updates-card">
+                    <h3>About &amp; Updates</h3>
+                    <p class="settings-desc">Version information and in-app updates.</p>
+                    <div id="about-updates-content">
+                        <span class="loading">Loading...</span>
+                    </div>
+                </div>
+
                 <!-- Index Configuration -->
                 <div class="settings-card">
                     <h3>Stock Indexes</h3>
@@ -648,6 +667,6 @@
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
 
     <!-- Main App Logic -->
-    <script src="{{ url_for('static', filename='app.js') }}?v=54"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=56"></script>
 </body>
 </html>
