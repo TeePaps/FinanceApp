@@ -863,6 +863,12 @@ if __name__ == '__main__':
     )
 
     if is_serving_process:
+        # Launched via restart_server.py: rotate the redirected log by size.
+        _server_log_path = os.environ.get('FINANCEAPP_SERVER_LOG')
+        if _server_log_path:
+            import server_log
+            server_log.start_rotation_watch(_server_log_path)
+
         atexit.register(cleanup_providers)
 
         # Check cross-platform dependencies

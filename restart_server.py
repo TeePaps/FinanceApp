@@ -7,29 +7,43 @@ Manages the Flask server as a detached background process, tracked via
 a PID file and verified with a /healthz check.
 
 Usage:
-    python restart_server.py [restart|start|stop|status|setup]
+    python restart_server.py [restart|start|stop|status [--json]|setup]
 
     restart  Stop any running server, then start a new one (default).
-    start    Start the server if it is not already running.
+    start    Start the server if it is not already running. If the process
+             is alive but not answering, it waits, then reports failure
+             (use restart); it never spawns a second instance.
     stop     Stop the server.
     status   Report whether the server is running and healthy.
+             --json prints a single JSON object (exit 0 if healthy, else 1).
     setup    Create the venv, install requirements, and prepare the repo.
+
+Logs: logs/server.log (appended; rotated by size via server_log.py).
+FINANCEAPP_PORT other than 8080 uses logs/server-<port>.log/.pid instead.
 """
 
 import os
 import sys
+import json
 import time
 import platform
 import subprocess
 import signal
+import socket
 import urllib.request
+from datetime import datetime
+
+import server_log
 
 # Configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVER_PORT = int(os.environ.get("FINANCEAPP_PORT", "8080"))
 SERVER_HOST = os.environ.get("FINANCEAPP_HOST", "127.0.0.1")
-LOG_FILE = os.path.join(BASE_DIR, "logs", "server.log")
-PID_FILE = os.path.join(BASE_DIR, "logs", "server.pid")
+# Default-port paths are read by external monitoring; other ports get their
+# own files so a side run can never clobber the main instance's log/PID.
+_SUFFIX = "" if SERVER_PORT == 8080 else "-%d" % SERVER_PORT
+LOG_FILE = os.path.join(BASE_DIR, "logs", "server%s.log" % _SUFFIX)
+PID_FILE = os.path.join(BASE_DIR, "logs", "server%s.pid" % _SUFFIX)
 
 # Always use 127.0.0.1 for the health check, never "localhost" -- on
 # Windows "localhost" can resolve to ::1 first and the connection hangs
@@ -107,6 +121,29 @@ def check_health(timeout=2):
         return True
     except Exception:
         return False
+
+
+def is_port_listening(timeout=1):
+    """True if something accepts TCP connections on the server port."""
+    try:
+        with socket.create_connection(("127.0.0.1", SERVER_PORT), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def fetch_health(timeout=2):
+    """Return the parsed /healthz JSON body (or {} if not JSON), None if unreachable."""
+    try:
+        with urllib.request.urlopen(HEALTH_URL, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    try:
+        data = json.loads(body)
+        return data if isinstance(data, dict) else {"body": data}
+    except ValueError:
+        return {}
 
 
 def wait_healthy(timeout=30):
@@ -246,16 +283,12 @@ def stop_server():
 
 def _rotate_log():
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    if not os.path.exists(LOG_FILE):
+    # A live process (even an unresponsive one) still writes to this file;
+    # renaming it would send its output to server.log.1.
+    if is_pid_alive(read_pid_file()):
         return
-
-    log_1 = LOG_FILE + ".1"
-    try:
-        if os.path.exists(log_1):
-            os.remove(log_1)
-        os.replace(LOG_FILE, log_1)
-    except OSError as e:
-        print("  Warning: could not rotate log: %s" % e)
+    if server_log.needs_rotation(LOG_FILE) and not server_log.rotate(LOG_FILE):
+        print("  Warning: could not rotate log")
 
 
 def _print_log_tail(n=20):
@@ -269,13 +302,25 @@ def _print_log_tail(n=20):
 
 
 def start_server(from_restart=False):
-    if not from_restart and check_health():
+    if not from_restart:
         pid = read_pid_file()
-        if pid is not None:
-            print("Server already running: %s (pid %d)" % (SERVER_URL, pid))
-        else:
-            print("Server already running: %s" % SERVER_URL)
-        return True
+        if check_health():
+            if pid is not None:
+                print("Server already running: %s (pid %d)" % (SERVER_URL, pid))
+            else:
+                print("Server already running: %s" % SERVER_URL)
+            return True
+        if is_pid_alive(pid) and is_port_listening():
+            # Busy, not dead: spawning now would create a second instance and
+            # steal the log/PID file. The port check tells a busy server from
+            # a stale PID file whose number was reused by another process.
+            print("Server process %d is alive but not responding; waiting..." % pid)
+            if wait_healthy(timeout=20):
+                print("Server already running: %s (pid %d)" % (SERVER_URL, pid))
+                return True
+            print("Server (pid %d) is running but unresponsive at %s." % (pid, HEALTH_URL))
+            print("Run 'restart' to replace it.")
+            return False
 
     _rotate_log()
 
@@ -285,9 +330,14 @@ def start_server(from_restart=False):
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"  # print() must reach the log promptly
+    env["FINANCEAPP_SERVER_LOG"] = LOG_FILE  # server rotates it by size
 
-    log_fh = open(LOG_FILE, "w", encoding="utf-8")
+    log_fh = open(LOG_FILE, "a", encoding="utf-8")
     try:
+        # Marker separates runs in the appended log.
+        log_fh.write("=== server start %s ===\n" % datetime.now().isoformat(timespec="seconds"))
+        log_fh.flush()
         if IS_WINDOWS:
             creationflags = (
                 getattr(subprocess, "DETACHED_PROCESS", 0)
@@ -326,7 +376,7 @@ def start_server(from_restart=False):
             return True
         time.sleep(0.5)
 
-    print("Server failed to start. Last 20 lines of logs/server.log:")
+    print("Server failed to start. Last 20 lines of %s:" % LOG_FILE)
     _print_log_tail(20)
     return False
 
@@ -343,6 +393,46 @@ def status():
 
     print("Health check (%s): %s" % (HEALTH_URL, "OK" if healthy else "unreachable"))
 
+    return 0 if healthy else 1
+
+
+def status_json():
+    """Print one JSON object describing the server; exit code 0 if healthy."""
+    pid = read_pid_file()
+    alive = is_pid_alive(pid)
+    health = fetch_health()
+    healthy = health is not None
+
+    started = None
+    uptime = None
+    try:
+        mtime = os.path.getmtime(PID_FILE)  # written when the server is spawned
+        started = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
+        if alive:
+            uptime = max(0, int(time.time() - mtime))
+    except OSError:
+        pass
+
+    try:
+        log_size = os.path.getsize(LOG_FILE)
+    except OSError:
+        log_size = 0
+
+    print(json.dumps({
+        "running": alive,
+        "healthy": healthy,
+        "pid": pid,
+        "port": SERVER_PORT,
+        "host": SERVER_HOST,
+        "url": SERVER_URL,
+        "health_url": HEALTH_URL,
+        "pid_file": PID_FILE,
+        "log_file": LOG_FILE,
+        "log_size_bytes": log_size,
+        "started_at": started,
+        "uptime_seconds": uptime,
+        "health": health if health else None,
+    }))
     return 0 if healthy else 1
 
 
@@ -395,11 +485,18 @@ def setup():
 
 def main():
     valid_commands = ("restart", "start", "stop", "status", "setup")
-    command = sys.argv[1] if len(sys.argv) > 1 else "restart"
+    args = sys.argv[1:]
+    command = args[0] if args else "restart"
+    flags = args[1:]
 
-    if command not in valid_commands:
-        print("Usage: python restart_server.py [%s]" % "|".join(valid_commands))
+    if command not in valid_commands or any(f != "--json" for f in flags) \
+            or ("--json" in flags and command != "status"):
+        print("Usage: python restart_server.py [%s] (status accepts --json)"
+              % "|".join(valid_commands))
         return 1
+
+    if command == "status" and "--json" in flags:
+        return status_json()  # machine-readable: no banner
 
     print("Platform: %s" % platform.system())
     print("Target: %s" % SERVER_URL)
