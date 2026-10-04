@@ -2,6 +2,68 @@
 
 A Flask-based web application for tracking stock portfolios, analyzing market valuations, and finding undervalued investment opportunities using data from multiple providers.
 
+## Install
+
+[![Download for macOS](https://img.shields.io/badge/Download-macOS-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/TeePaps/FinanceApp/releases/latest/download/Install-FinanceApp.command)
+[![Download for Windows](https://img.shields.io/badge/Download-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/TeePaps/FinanceApp/releases/latest/download/Install-FinanceApp.bat)
+
+Download the installer for your system and double-click it. You do **not** need Python: the
+installer sets up everything it needs ([uv](https://docs.astral.sh/uv/) and a private copy of
+Python 3.12) without touching any Python already on your computer. When it finishes, FinanceApp
+opens in your browser at `http://127.0.0.1:8765` (or the next free port).
+
+Or paste one line into a terminal:
+
+```bash
+# macOS / Linux (Terminal)
+curl -fsSL https://github.com/TeePaps/FinanceApp/releases/latest/download/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://github.com/TeePaps/FinanceApp/releases/latest/download/install.ps1 | iex
+```
+
+**The installers are not code-signed**, so the first run needs one extra click:
+
+- **macOS (Gatekeeper):** right-click `Install-FinanceApp.command` → **Open** → **Open**. On
+  macOS 15+, if there is no Open button, go to **System Settings → Privacy & Security** and click
+  **Open Anyway**. If macOS says you don't have permission to run it, run
+  `chmod +x ~/Downloads/Install-FinanceApp.command` in Terminal and try again (or use the one-liner).
+- **Windows (SmartScreen):** if "Windows protected your PC" appears, click **More info** →
+  **Run anyway**.
+
+Where things go:
+
+| | macOS | Windows |
+|---|---|---|
+| App and data | `~/FinanceApp` | `%LOCALAPPDATA%\FinanceApp` |
+| Launcher | `~/Applications/FinanceApp.app` (also in Launchpad/Spotlight) | Desktop + Start Menu **FinanceApp** shortcuts |
+| Your data | `~/FinanceApp/data` | `%LOCALAPPDATA%\FinanceApp\data` |
+
+Running the installer again offers to repair or upgrade; it never touches your data. Useful
+installer options (append after `| bash -s --` on macOS, or set `$env:FINANCEAPP_INSTALL_ARGS` on
+Windows): `--port N`, `--import-from <path to a dev clone>` (copies `data_public/`,
+`data_private/`, `config.yaml`), `--restore-from <backup folder>`, `--no-launch`.
+
+### Uninstall
+
+- **macOS:** double-click `~/FinanceApp/Uninstall FinanceApp.command`.
+- **Windows:** **Settings → Apps → Installed apps → FinanceApp → Uninstall**, or Start Menu →
+  FinanceApp → **Uninstall FinanceApp**.
+
+By default the uninstaller **keeps your data**: it copies it to
+`~/FinanceApp-data-backup-YYYYMMDD/` (in your home folder) before removing the app. To bring it
+back, reinstall with `--restore-from ~/FinanceApp-data-backup-YYYYMMDD`. Typing `DELETE` at the
+prompt (or passing `--delete-data`) deletes the data instead; `--purge` also removes uv's cache and
+its Python downloads.
+
+### Developers
+
+The git-clone workflow below (`restart_server.py`, port 8080, data inside the repo) is unchanged
+and is what you want for working on the code. The installer files live in `installer/`; see
+`docs/installer-updater-design.md`.
+
 ## Features
 
 - **Portfolio Management**: Track holdings, transactions, and realized profits using FIFO cost basis
@@ -13,9 +75,9 @@ A Flask-based web application for tracking stock portfolios, analyzing market va
 - **Profit Timeline**: Visualize trading performance over time
 - **Multi-Provider Architecture**: Pluggable data sources with automatic fallback chains
 
-## Quick Start (any OS)
+## Developer Quick Start (git clone, any OS)
 
-Requires Python 3.9+.
+Requires Python 3.9+. (End users: see [Install](#install) above instead.)
 
 ```bash
 # Clone the repository

@@ -47,6 +47,9 @@ Mac: `~/FinanceApp`  ·  Windows: `%LOCALAPPDATA%\FinanceApp`
   "updated_at": "ISO8601"
 }
 ```
+Optional keys added by Phase 3: `"launchers": [paths created by install_launchers]`,
+`"last_failed": {"version", "at"}` (set by launch.py when a restart reverts). Written with
+indent=2 (one `"current": "X"` per line — the Mac launcher scripts sed it).
 
 ## paths.py (repo root) — single source of truth for locations
 
@@ -108,11 +111,45 @@ idempotent migrations and stamp on first start. `database.get_schema_version(pat
   `switch_current(home, version)`, `prune_versions(home)`, `install_launchers(home)`,
   `free_port(start=8765)`.
 
+  As implemented (Phase 3; all take an optional `log` callable, raise `core.InstallError`
+  with a user-readable message, no import-time side effects, Python 3.8+ syntax):
+  - `fetch_latest_release(feed_url=None, channel="stable", version=None)` → `{version, tag,
+    notes, html_url, prerelease, draft, published_at, assets: {name: url}}`. Feed = arg, else
+    `$FINANCEAPP_UPDATE_FEED`, else GitHub API (`/releases/latest`; beta → `/releases` list;
+    `version=` → `/releases/tags/vX`). A feed may be a path or URL holding one release object,
+    a list, or `{"releases": [...]}`; asset URLs may be `file://` or relative to the feed.
+  - `download_release(release, dest_dir, log, require_checksum=False)` → zip path, verified
+    against `SHA256SUMS.txt` when the release has one. Also `release_zip_name`, `sha256`,
+    `verify_sha256`, `parse_sha256sums`, `parse_version`, `is_newer`, `zip_version`.
+  - `unpack_release` extracts to a staging dir then renames (same version = repair: replaced,
+    venv included). `build_venv(home, vdir, state, log, uv=None)` returns the venv python;
+    uv is always called with `UV_PYTHON_PREFERENCE=only-managed`.
+  - `smoke_test(home, vdir, isolated=True)`: by default FINANCEAPP_HOME is a throwaway temp
+    dir, so importing the new code cannot migrate the real DBs before the pre-update snapshot.
+  - Data: `backup_data(home, dest)` (full data copy + install.json + README.txt, dev-clone
+    layout), `snapshot_private(home, version)` → `backups/pre-<version>/`, `prune_backups(home,
+    keep=2)`, `import_data(src, home)` (used by --import-from and --restore-from: backs current
+    data up to `backups/pre-import-<ts>/`, then replaces each provided item; merges backup
+    install.json `extras`). SQLite files are always copied with the backup API; `-wal/-shm/
+    -journal/.lock` files are skipped.
+  - `install_home_files(home, vdir)` copies launch.py + uninstall.py into HOME and writes the
+    "Uninstall FinanceApp" script. **Phase 4: the updater should call `install_home_files` and
+    `install_launchers` after switching** (refreshes Windows shortcut targets and the registry
+    DisplayVersion). `run_launcher(home, cmd)`, `health(port)`, `port_in_use(port)`,
+    `remove_launchers(home)`, `purge_uv()`, `base_python(vdir, windowed=False)`.
+
 ## Release assets (built by GitHub Action on tag push)
 
 - `FinanceApp-X.Y.Z.zip` — top-level folder `FinanceApp-X.Y.Z/`; excludes `data_private/`,
   `_ARCHIVE/`, `_IDEAS/`, `backup/`, `playwright-mcp/`, `venv/`, `logs/`, `requirements/`
-  (the spec dir), `.github/`, `__pycache__/`. Includes `data_public/public.db` as seed.
+  (the spec dir), `.github/`, `.claude/`, `__pycache__/`. Includes `data_public/public.db` as seed.
+  Built by `scripts/build_release.py VERSION [--out dist/] [--ref HEAD] [--installer-dir DIR]`
+  from the committed tree via `git archive` (tracked files only; the seed is the committed
+  public.db blob, not the skip-worktree working copy; uncommitted edits are not shipped).
+  Fails unless `version.py` at the ref equals VERSION. Installer assets are copied from
+  `installer/` (missing ones skipped with a warning). `scripts/release.py X.Y.Z [--dry-run]
+  [--push]` bumps version.py, commits "Release vX.Y.Z", tags; `.github/workflows/release.yml`
+  publishes on `v*.*.*` tag push (`prerelease` when the version contains `-`).
 - `SHA256SUMS.txt` — `sha256  filename` lines for every asset.
 - `installer.py` (copy of repo `installer/installer.py`; bundles or downloads core.py — it must
   be runnable standalone, so it downloads the zip and imports core from the unpacked release,
@@ -126,14 +163,34 @@ Latest release lookup: `GET https://api.github.com/repos/TeePaps/FinanceApp/rele
 
 ## Entry points
 
-- Mac one-liner: `curl -fsSL https://raw.githubusercontent.com/TeePaps/FinanceApp/main/install.sh | bash`
-- Windows one-liner: `irm https://raw.githubusercontent.com/TeePaps/FinanceApp/main/install.ps1 | iex`
+- Mac one-liner: `curl -fsSL https://github.com/TeePaps/FinanceApp/releases/latest/download/install.sh | bash`
+- Windows one-liner: `irm https://github.com/TeePaps/FinanceApp/releases/latest/download/install.ps1 | iex`
+  (Phase 3 change: the bootstraps live in `installer/`, not the repo root, so the one-liners
+  use the release assets, which also keeps bootstrap and installer.py from the same release.)
 - README buttons → `https://github.com/TeePaps/FinanceApp/releases/latest/download/Install-FinanceApp.command` / `.bat`
 - Bootstraps: ensure uv → download `installer.py` (latest release asset) →
   `uv run --python 3.12 installer.py [args]`.
 - `installer.py` args: `--home`, `--port`, `--version`, `--zip PATH` (local zip, offline/testing),
   `--feed-url`, `--import-from PATH` (copy data_public/data_private/config.yaml from a dev clone),
-  `--restore-from PATH` (uninstaller backup), `--no-launch`, `--no-shortcuts`.
+  `--restore-from PATH` (uninstaller backup), `--no-launch`, `--no-shortcuts`, plus `--yes`
+  (no prompts; prompts read `/dev/tty` so `curl | bash` still asks; no terminal = defaults).
+  Defaults: `--zip` ← `$FINANCEAPP_INSTALLER_ZIP`, `--feed-url` ← `$FINANCEAPP_UPDATE_FEED`.
+  Standalone strategy: installer.py inlines only "find the release zip + verify SHA256SUMS",
+  then imports `installer/core.py` extracted from that zip, so the helpers always match the
+  version being installed. Re-run on an install: same version → repair (re-unpack + rebuild
+  venv), other version → upgrade/downgrade (snapshot `backups/pre-X/`); data never touched
+  except by --import-from/--restore-from. Saved port kept unless `--port`; a busy port moves
+  to the next free one. If an upgrade fails after stopping the server, the old one is restarted.
+- Bootstrap env overrides (offline tests): `FINANCEAPP_INSTALLER_PY` (local installer.py),
+  `FINANCEAPP_INSTALLER_URL`, `FINANCEAPP_INSTALLER_ZIP`, `FINANCEAPP_UPDATE_FEED`,
+  `FINANCEAPP_UV`; `Install-FinanceApp.command`/`.bat` run the `install.sh`/`install.ps1` next
+  to them if present, else download the release asset (`FINANCEAPP_INSTALL_SH_URL` /
+  `FINANCEAPP_INSTALL_PS1_URL`); `FINANCEAPP_NO_PAUSE=1` skips the final pause. With
+  `irm | iex`, pass installer args via `$env:FINANCEAPP_INSTALL_ARGS`. uv is installed with
+  `UV_NO_MODIFY_PATH=1` (always called by absolute path; shell profiles untouched).
+- Known limitation: a `.command` downloaded by a browser may lack the execute bit (macOS then
+  refuses to run it). README documents `chmod +x` / the one-liner; shipping it zipped would
+  avoid this.
 - Launchers: Mac `~/Applications/FinanceApp.app` (minimal bundle whose executable runs
   `uv run --python 3.12 <HOME>/launch.py open`, or the current venv's python directly);
   Windows Desktop + Start Menu `.lnk` (created via PowerShell WScript.Shell), Start Menu
@@ -141,6 +198,20 @@ Latest release lookup: `GET https://api.github.com/repos/TeePaps/FinanceApp/rele
 - `launch.py <start|stop|restart|status|open>`: reads install.json, sets `FINANCEAPP_HOME`,
   `FINANCEAPP_PORT`, `FINANCEAPP_DEBUG=0`, runs `versions/<current>/venv` python on
   `versions/<current>/restart_server.py <cmd>`; `open` = start if not running, then open browser.
+  Details: HOME = the script's own dir (or `--home`); `status --json` passes through; `restart`
+  failure with a `previous` dir on disk swaps current/previous, records
+  `install.json.last_failed = {version, at}`, starts previous and exits **2** (`--no-revert`
+  disables). Without a console (pythonw / .app) output goes to `run/launch.log` and errors
+  show a dialog.
+- Launcher implementation: the Mac `.app` executable (and the "Uninstall FinanceApp.command")
+  is a bash script that reads `current` from install.json at run time (sed) and runs that
+  venv's python, falling back to `uv run`, so it survives updates without rewriting. Windows
+  `.lnk`s target the uv-managed base `pythonw.exe` (from the venv's `pyvenv.cfg`) with
+  `"<HOME>\launch.py" open`, so they don't depend on a version dir; "Uninstall FinanceApp.bat"
+  uses the base `python.exe`. Created paths are recorded in `install.json.launchers`;
+  removal only touches a `.app`/`.desktop`/registry entry that points at this HOME. Linux:
+  `~/.local/share/applications/financeapp.desktop`. `--no-shortcuts` skips all of these
+  (the HOME uninstall script is always written).
 - No code signing. README documents Gatekeeper (right-click → Open) and SmartScreen
   (More info → Run anyway).
 
@@ -175,3 +246,14 @@ previous version + Revert.
 typing DELETE required to delete) → remove versions/, launchers, shortcuts, registry entry,
 install root. `--purge` also removes uv + its pythons. Windows: since uninstall.py may live in
 the dir it deletes, re-exec from a temp copy.
+
+As implemented: also `--home DIR` (default: the script's dir) and `--backup-dir DIR` /
+`$FINANCEAPP_BACKUP_DIR` (tests). The backup is `core.backup_data` (data_public/,
+data_private/, config.yaml, archive/, install.json, README.txt), private.db is
+`quick_check`ed, and nothing is removed if the backup fails or the target is non-empty.
+core.py is loaded from `versions/<current|previous|any>/installer/core.py`; without it the
+uninstaller still backs up (plain copy) and deletes, but warns that shortcuts may remain.
+Windows re-exec copies uninstall.py + core.py to `%TEMP%` and runs them with a Python outside
+HOME (waits if the parent is outside HOME, otherwise hands off and exits). `--purge` runs
+`uv cache clean` + `uv python uninstall --all` (all uv-managed Pythons) and deletes uv/uvx only
+if they are in `~/.local/bin` (a Homebrew/pip uv is left alone).
