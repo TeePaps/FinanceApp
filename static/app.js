@@ -677,6 +677,7 @@ function showTab(tabName) {
     } else if (tabName === 'settings') {
         loadProviderSettings();
         loadUpdateSettings();
+        loadBackupInfo();
     } else if (tabName === 'logs') {
         // Connect SSE to receive live logs even if no operation is running
         progressManager.connectSSE();
@@ -5556,4 +5557,95 @@ async function saveUpdateSettings(changes) {
         showNotification('Error saving update settings: ' + e.message, 'error');
         loadUpdateSettings();
     }
+}
+
+// =====================
+// Backup & Export (routes/backup.py)
+// =====================
+
+function formatBytes(n) {
+    if (n == null) return '';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+async function loadBackupInfo() {
+    const el = document.getElementById('backup-location');
+    if (!el) return;
+    try {
+        const response = await fetch('/api/backup/info', {cache: 'no-store'});
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+        const info = result.data;
+        const f = info.files || {};
+        const sizes = [];
+        if (f.private_db && f.private_db.size != null) sizes.push('private.db ' + formatBytes(f.private_db.size));
+        if (f.public_db && f.public_db.size != null) sizes.push('public.db ' + formatBytes(f.public_db.size));
+        el.innerHTML = `<label>Data folder</label>
+            <code class="backup-path">${escapeHtml(info.data_dir)}</code>
+            ${sizes.length ? `<span class="cache-hint">${escapeHtml(sizes.join(' · '))}</span>` : ''}`;
+        const hint = document.getElementById('backup-market-hint');
+        if (hint && f.public_db && f.public_db.size != null) {
+            hint.textContent = `(public.db, ${formatBytes(f.public_db.size)} - can be rebuilt)`;
+        }
+        const secrets = document.getElementById('backup-include-secrets');
+        if (secrets && f.secrets && f.secrets.size == null) {
+            secrets.checked = false;
+            secrets.disabled = true;
+            secrets.parentElement.title = 'No API keys saved';
+        }
+    } catch (e) {
+        el.innerHTML = `<span class="error">Failed to load data location: ${escapeHtml(e.message)}</span>`;
+    }
+}
+
+function filenameFromDisposition(header, fallback) {
+    const m = /filename="?([^";]+)"?/i.exec(header || '');
+    return m ? m[1] : fallback;
+}
+
+// Fetch a file and hand it to the browser as a download; JSON error bodies
+// become a notification instead of replacing the page.
+async function downloadFromUrl(url, btn, busyText, fallbackName) {
+    const label = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = busyText; }
+    try {
+        const response = await fetch(url, {cache: 'no-store'});
+        const type = response.headers.get('Content-Type') || '';
+        if (!response.ok || type.includes('application/json')) {
+            let message = 'HTTP ' + response.status;
+            try { message = (await response.json()).error || message; } catch (e) { /* not JSON */ }
+            throw new Error(message);
+        }
+        const blob = await response.blob();
+        const name = filenameFromDisposition(response.headers.get('Content-Disposition'), fallbackName);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+        showNotification('Downloaded ' + name, 'success');
+    } catch (e) {
+        showNotification('Download failed: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = label; }
+    }
+}
+
+function downloadBackup() {
+    const secrets = document.getElementById('backup-include-secrets');
+    const market = document.getElementById('backup-include-market');
+    const params = new URLSearchParams({
+        include_secrets: secrets && secrets.checked ? '1' : '0',
+        include_market: market && market.checked ? '1' : '0',
+    });
+    downloadFromUrl('/api/backup/download?' + params, document.getElementById('backup-download-btn'),
+                    'Preparing backup...', 'FinanceApp-backup.zip');
+}
+
+function exportCsv(table, btn) {
+    downloadFromUrl(`/api/backup/export/${table}.csv`, btn, 'Exporting...', `FinanceApp-${table}.csv`);
 }

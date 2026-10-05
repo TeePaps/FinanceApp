@@ -4920,3 +4920,22 @@ input:disabled + .toggle-slider {
 }
 
 .update-modal-actions { margin-top: 12px; text-align: right; }
+
+/* Backup & Export card */
+.update-settings .update-row label.backup-option {
+    min-width: 0;
+    display: inline-flex;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-weight: normal;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.backup-settings .backup-path {
+    font-size: 0.85rem;
+    word-break: break-all;
+    color: var(--text-primary);
+}

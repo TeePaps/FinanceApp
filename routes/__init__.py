@@ -15,6 +15,7 @@ from .admin import admin_bp
 from .stars import stars_bp
 from .feeds import feeds_bp
 from .update import update_bp
+from .backup import backup_bp
 
 
 def register_blueprints(app):
@@ -30,3 +31,4 @@ def register_blueprints(app):
     app.register_blueprint(stars_bp)
     app.register_blueprint(feeds_bp)
     app.register_blueprint(update_bp)
+    app.register_blueprint(backup_bp)

@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=48">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=50">
 </head>
 <body>
     <div class="container">
@@ -549,6 +549,32 @@
                     </div>
                 </div>
 
+                <!-- Backup & Export (populated by loadBackupInfo()) -->
+                <div class="settings-card" id="backup-card">
+                    <h3>Backup &amp; Export</h3>
+                    <p class="settings-desc">Download a copy of your data, or export your stocks and transactions as CSV for a spreadsheet.</p>
+                    <div class="update-settings backup-settings">
+                        <div class="update-row">
+                            <button class="btn-primary" id="backup-download-btn" onclick="downloadBackup()">Download backup</button>
+                            <label class="backup-option" for="backup-include-secrets">
+                                <input type="checkbox" id="backup-include-secrets" checked>
+                                Include API keys <span class="cache-hint">(secrets.json - keep the backup private)</span>
+                            </label>
+                            <label class="backup-option" for="backup-include-market">
+                                <input type="checkbox" id="backup-include-market">
+                                Include market data <span class="cache-hint" id="backup-market-hint">(public.db - large, can be rebuilt)</span>
+                            </label>
+                        </div>
+                        <div class="update-row">
+                            <button class="btn-secondary" id="backup-export-transactions" onclick="exportCsv('transactions', this)">Export transactions CSV</button>
+                            <button class="btn-secondary" id="backup-export-stocks" onclick="exportCsv('stocks', this)">Export stocks CSV</button>
+                        </div>
+                        <div class="update-row backup-location" id="backup-location">
+                            <span class="loading">Loading...</span>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Index Configuration -->
                 <div class="settings-card">
                     <h3>Stock Indexes</h3>
@@ -667,6 +693,6 @@
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
 
     <!-- Main App Logic -->
-    <script src="{{ url_for('static', filename='app.js') }}?v=56"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=57"></script>
 </body>
 </html>

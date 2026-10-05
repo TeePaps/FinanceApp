@@ -2,7 +2,7 @@
 """Cut a FinanceApp release: bump version.py, commit, tag, (optionally) push.
 
 Usage:
-    python3 scripts/release.py X.Y.Z [--dry-run] [--push]
+    python3 scripts/release.py X.Y.Z [--dry-run] [--push] [--publish]
 
 Steps:
   1. Require a clean working tree (tracked files) on branch main.
@@ -11,6 +11,8 @@ Steps:
   4. With --push: git push origin main && git push origin vX.Y.Z
      Without --push: print those commands. Pushing the tag triggers
      .github/workflows/release.yml, which builds and publishes the GitHub release.
+  5. With --publish (implies --push): also build and publish the release from this
+     machine via scripts/publish_release.py (gh CLI), for when Actions can't run.
 
 --dry-run performs the checks and prints what would happen without changing anything.
 Pre-release versions (X.Y.Z-beta.1) are published as GitHub pre-releases.
@@ -54,12 +56,16 @@ def main() -> None:
     parser.add_argument("version", help="new version, e.g. 1.2.3 or 1.3.0-beta.1 (no leading v)")
     parser.add_argument("--dry-run", action="store_true", help="check and print; change nothing")
     parser.add_argument("--push", action="store_true", help="push main and the tag to origin")
+    parser.add_argument("--publish", action="store_true",
+                        help="push, then publish the GitHub release locally with gh")
     args = parser.parse_args()
 
     version = args.version[1:] if args.version.startswith("v") else args.version
     if not VERSION_RE.match(version):
         die(f"invalid version {args.version!r}; expected X.Y.Z or X.Y.Z-suffix")
     tag = f"v{version}"
+    if args.publish:
+        args.push = True
 
     branch = git("rev-parse", "--abbrev-ref", "HEAD")
     if branch != "main":
@@ -106,7 +112,15 @@ def main() -> None:
     if args.push:
         git("push", "origin", "main")
         git("push", "origin", tag)
-        print(f"Pushed main and {tag}; the release workflow will publish the GitHub release.")
+        print(f"Pushed main and {tag}.")
+        if args.publish:
+            result = subprocess.run([sys.executable, str(REPO_ROOT / "scripts" / "publish_release.py"),
+                                     version], cwd=REPO_ROOT)
+            if result.returncode != 0:
+                die(f"publishing failed; retry with: python3 scripts/publish_release.py {version}")
+        else:
+            print("The release workflow will publish the GitHub release "
+                  f"(or run: python3 scripts/publish_release.py {version}).")
     else:
         print("Not pushed. To publish, run:")
         for cmd in push_cmds:
