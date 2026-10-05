@@ -4934,6 +4934,19 @@ input:disabled + .toggle-slider {
     cursor: pointer;
 }
 
+.backup-settings input[type="file"] {
+    max-width: 100%;
+    font-size: 0.9rem;
+    color: var(--text-primary);
+}
+
+.update-settings .update-row.backup-restore-summary {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    word-break: break-word;
+}
+
 .backup-settings .backup-path {
     font-size: 0.85rem;
     word-break: break-all;

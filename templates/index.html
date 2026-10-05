@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=50">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/pages.css') }}?v=51">
 </head>
 <body>
     <div class="container">
@@ -569,6 +569,29 @@
                             <button class="btn-secondary" id="backup-export-transactions" onclick="exportCsv('transactions', this)">Export transactions CSV</button>
                             <button class="btn-secondary" id="backup-export-stocks" onclick="exportCsv('stocks', this)">Export stocks CSV</button>
                         </div>
+                        <!-- Import / Restore (inspectRestoreFile() / restoreBackup()) -->
+                        <div class="update-row backup-restore">
+                            <label for="backup-restore-file">Import / Restore backup</label>
+                            <input type="file" id="backup-restore-file" accept=".zip,application/zip" onchange="inspectRestoreFile(this)">
+                        </div>
+                        <div class="update-row backup-restore-summary" id="backup-restore-summary">
+                            <span class="cache-hint">Choose a backup .zip made with "Download backup". Your current data is saved to a safety copy before anything is replaced.</span>
+                        </div>
+                        <div class="update-row backup-restore">
+                            <label class="backup-option" for="restore-config">
+                                <input type="checkbox" id="restore-config" checked disabled>
+                                Restore settings <span class="cache-hint">(config.yaml)</span>
+                            </label>
+                            <label class="backup-option" for="restore-secrets">
+                                <input type="checkbox" id="restore-secrets" disabled>
+                                Restore API keys <span class="cache-hint" id="restore-secrets-hint">(if in the backup; otherwise current keys are kept)</span>
+                            </label>
+                            <label class="backup-option" for="restore-market">
+                                <input type="checkbox" id="restore-market" disabled>
+                                Restore market data <span class="cache-hint" id="restore-market-hint">(public.db, if in the backup)</span>
+                            </label>
+                            <button class="btn-danger" id="backup-restore-btn" onclick="restoreBackup()" disabled>Restore</button>
+                        </div>
                         <div class="update-row backup-location" id="backup-location">
                             <span class="loading">Loading...</span>
                         </div>
@@ -693,6 +716,6 @@
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
 
     <!-- Main App Logic -->
-    <script src="{{ url_for('static', filename='app.js') }}?v=57"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=58"></script>
 </body>
 </html>

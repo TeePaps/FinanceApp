@@ -61,6 +61,38 @@ def _fill_missing(user, defaults):
     return added
 
 
+def fill_missing_defaults(user_path=None, default_path=None):
+    """Deep-fill keys missing in ``user_path`` from the defaults file.
+
+    Existing user values are never overwritten. Returns the number of keys
+    added. Raises on unreadable YAML (callers decide how to report it).
+    """
+    user_path = user_path or paths.USER_CONFIG_FILE
+    default_path = default_path or paths.DEFAULT_CONFIG_FILE
+    if not os.path.isfile(default_path):
+        return 0
+    y = _yaml()
+    with open(default_path, 'r', encoding='utf-8') as f:
+        defaults = y.load(f)
+    with open(user_path, 'r', encoding='utf-8') as f:
+        user = y.load(f)
+    if not isinstance(defaults, dict):
+        return 0
+    if user is None:
+        user = copy.deepcopy(defaults)
+        added = len(defaults)
+    elif not isinstance(user, dict):
+        raise ValueError("%s is not a mapping" % user_path)
+    else:
+        added = _fill_missing(user, defaults)
+    if added:
+        tmp = user_path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            y.dump(user, f)
+        os.replace(tmp, user_path)
+    return added
+
+
 def ensure_user_config():
     """Make sure USER_CONFIG_FILE exists and has every default key. Never raises."""
     global _done
@@ -80,27 +112,8 @@ def ensure_user_config():
                 shutil.copyfile(default_path, user_path)
                 print("[Config] Created %s from defaults" % user_path)
                 return
-
-            y = _yaml()
-            with open(default_path, 'r', encoding='utf-8') as f:
-                defaults = y.load(f)
-            with open(user_path, 'r', encoding='utf-8') as f:
-                user = y.load(f)
-            if not isinstance(defaults, dict):
-                return
-            if user is None:
-                user = copy.deepcopy(defaults)
-                added = len(defaults)
-            elif not isinstance(user, dict):
-                print("[Config] %s is not a mapping; not merging defaults" % user_path)
-                return
-            else:
-                added = _fill_missing(user, defaults)
+            added = fill_missing_defaults(user_path, default_path)
             if added:
-                tmp = user_path + '.tmp'
-                with open(tmp, 'w', encoding='utf-8') as f:
-                    y.dump(user, f)
-                os.replace(tmp, user_path)
                 print("[Config] Added %d missing default key(s) to %s" % (added, user_path))
         except Exception as e:  # a bad user file must not stop the app
             print("[Config] Warning: could not reconcile %s with defaults: %s" % (user_path, e))

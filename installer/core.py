@@ -882,6 +882,23 @@ def copy_sqlite(src, dst):
             pass
 
 
+def restore_sqlite_into(src, dst, timeout=30):
+    """Overwrite the SQLite db ``dst`` with the contents of ``src`` using the
+    backup API *into* the existing file. Safe while a running server has
+    ``dst`` open (other connections see the new data on their next read),
+    and works on Windows, where an open file cannot be replaced."""
+    s = sqlite3.connect("file:%s?mode=ro" % urllib.request.pathname2url(
+        os.path.abspath(src)), uri=True)
+    try:
+        d = sqlite3.connect(dst, timeout=timeout)
+        try:
+            s.backup(d)
+        finally:
+            d.close()
+    finally:
+        s.close()
+
+
 def copy_tree_safe(src, dst):
     """Copy a directory tree, using copy_sqlite for SQLite files and skipping
     SQLite sidecar/temp files and __pycache__. Returns number of files copied."""

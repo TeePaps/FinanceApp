@@ -134,6 +134,17 @@ def delete_secret(key: str):
         _save_secrets(secrets)
 
 
+def replace_secrets(secrets: dict):
+    """Replace the whole secrets file (atomic, 0600) and the in-memory cache.
+
+    Used by backup restore; providers read keys via get_secret() on each use,
+    so the new keys take effect immediately.
+    """
+    if not isinstance(secrets, dict):
+        raise ValueError('secrets must be a JSON object')
+    _save_secrets(dict(secrets))
+
+
 def clear_cache():
     """Clear the in-memory secrets cache (useful for testing or reload)."""
     global _secrets_cache

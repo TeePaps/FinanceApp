@@ -5649,3 +5649,130 @@ function downloadBackup() {
 function exportCsv(table, btn) {
     downloadFromUrl(`/api/backup/export/${table}.csv`, btn, 'Exporting...', `FinanceApp-${table}.csv`);
 }
+
+// Import / Restore: inspect the chosen zip first (POST /api/backup/inspect,
+// changes nothing), then enable the options that apply to it.
+let restoreInspection = null;
+
+function setRestoreOption(id, enabled, checked, title) {
+    const box = document.getElementById(id);
+    if (!box) return;
+    box.disabled = !enabled;
+    box.checked = enabled && checked;
+    box.parentElement.title = title || '';
+}
+
+function resetRestoreForm(message, isError) {
+    restoreInspection = null;
+    setRestoreOption('restore-config', false, true);
+    setRestoreOption('restore-secrets', false, false);
+    setRestoreOption('restore-market', false, false);
+    const btn = document.getElementById('backup-restore-btn');
+    if (btn) btn.disabled = true;
+    const summary = document.getElementById('backup-restore-summary');
+    if (summary && message) {
+        summary.innerHTML = `<span class="${isError ? 'error' : 'cache-hint'}">${escapeHtml(message)}</span>`;
+    }
+}
+
+async function inspectRestoreFile(input) {
+    const file = input && input.files && input.files[0];
+    if (!file) {
+        resetRestoreForm('Choose a backup .zip made with "Download backup".');
+        return;
+    }
+    resetRestoreForm('Checking ' + file.name + '...');
+    try {
+        const form = new FormData();
+        form.append('file', file);
+        const response = await fetch('/api/backup/inspect', {method: 'POST', body: form});
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+        const d = result.data;
+        restoreInspection = {file, data: d};
+
+        const c = d.contents || {};
+        const p = d.private || {};
+        const counts = p.counts || {};
+        const parts = [
+            `<strong>${escapeHtml(file.name)}</strong>`,
+            d.app_version ? `from FinanceApp ${escapeHtml(d.app_version)}` : '',
+            d.created ? `created ${escapeHtml(formatUpdateTime(d.created))}` : '',
+        ].filter(Boolean);
+        const has = [`${counts.stocks ?? '?'} stocks, ${counts.transactions ?? '?'} transactions`];
+        if (c.config) has.push('settings');
+        if (c.secrets) has.push(`API keys (${(d.secret_names || []).length})`);
+        if (c.public_db && d.public) has.push(`market data (${formatBytes(d.public.size)})`);
+        const cur = d.current_counts;
+        document.getElementById('backup-restore-summary').innerHTML =
+            `<span>${parts.join(' · ')}</span>
+             <span class="cache-hint">Contains: ${escapeHtml(has.join(', '))}` +
+            ` · data schema v${escapeHtml(String(p.schema_version))}` +
+            (cur ? ` · you currently have ${cur.stocks} stocks, ${cur.transactions} transactions` : '') +
+            `</span>`;
+
+        setRestoreOption('restore-config', !!c.config, true,
+                         c.config ? '' : 'No settings in this backup');
+        setRestoreOption('restore-secrets', !!c.secrets, true,
+                         c.secrets ? '' : 'No API keys in this backup - your current keys are kept');
+        const marketOk = !!(c.public_db && d.public && d.public.restorable);
+        setRestoreOption('restore-market', marketOk, false,
+                         marketOk ? '' : (d.public && d.public.problem) || 'No market data in this backup');
+        document.getElementById('restore-secrets-hint').textContent = c.secrets
+            ? '(secrets.json from the backup replaces your saved keys)'
+            : '(not in this backup - your current keys are kept)';
+        document.getElementById('restore-market-hint').textContent = marketOk
+            ? '(public.db - replaces current market data)'
+            : '(' + ((d.public && d.public.problem) || 'not in this backup') + ')';
+        document.getElementById('backup-restore-btn').disabled = false;
+    } catch (e) {
+        resetRestoreForm('Cannot restore this file: ' + e.message, true);
+    }
+}
+
+async function restoreBackup() {
+    if (!restoreInspection) return;
+    const {file, data} = restoreInspection;
+    const counts = (data.private && data.private.counts) || {};
+    const opt = id => { const el = document.getElementById(id); return !!(el && el.checked && !el.disabled); };
+    const cfg = opt('restore-config'), sec = opt('restore-secrets'), mkt = opt('restore-market');
+    const replaced = ['your current stocks and transactions (all holdings)'];
+    if (cfg) replaced.push('your settings');
+    if (sec) replaced.push('your saved API keys');
+    if (mkt) replaced.push('market data');
+    const ok = confirm(
+        `Restore ${file.name}?\n\n` +
+        `This REPLACES ${replaced.join(', ')} with the backup ` +
+        `(${counts.stocks ?? '?'} stocks, ${counts.transactions ?? '?'} transactions). ` +
+        'Changes made since the backup was taken will be lost.\n\n' +
+        `A safety copy of your current data is saved first to:\n${data.safety_dir}/pre-restore-<date-time>`);
+    if (!ok) return;
+
+    const btn = document.getElementById('backup-restore-btn');
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Restoring...';
+    try {
+        const form = new FormData();
+        form.append('file', file);
+        form.append('restore_config', cfg ? '1' : '0');
+        form.append('restore_secrets', sec ? '1' : '0');
+        form.append('restore_market', mkt ? '1' : '0');
+        const response = await fetch('/api/backup/restore', {method: 'POST', body: form});
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+        const r = result.data;
+        (r.warnings || []).forEach(w => console.warn('Restore:', w));
+        alert(`Restore complete: ${r.counts.stocks} stocks, ${r.counts.transactions} transactions.\n\n` +
+              `Restored: ${r.restored.join(', ')}` +
+              (r.secrets_kept ? '\nAPI keys: kept your current keys' : '') +
+              `\nYour previous data was saved to:\n${r.safety_backup}` +
+              (r.restart_recommended ? '\n\nRestart FinanceApp so all restored settings take effect.' : '') +
+              '\n\nThe page will now reload.');
+        location.reload();
+    } catch (e) {
+        showNotification('Restore failed: ' + e.message, 'error');
+        btn.disabled = false;
+        btn.textContent = label;
+    }
+}

@@ -7,6 +7,11 @@ Endpoints:
                                              - zip of the user's data (see _README)
 - GET /api/backup/export/<transactions|stocks>.csv
                                              - one private table as CSV
+- POST /api/backup/inspect                   - describe an uploaded backup zip
+                                               (changes nothing)
+- POST /api/backup/restore                   - restore an uploaded backup zip
+                                               (form: restore_config=1,
+                                               restore_secrets=1, restore_market=0)
 
 The zip uses the same layout as an installer/uninstaller backup folder
 (data_private/, data_public/, config.yaml), so once unzipped it can be passed
@@ -15,11 +20,15 @@ to ``installer.py --restore-from``.
 
 import csv
 import io
+import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import zipfile
+import zlib
 from datetime import datetime
 
 from flask import Blueprint, Response, jsonify, request
@@ -244,3 +253,460 @@ def export_csv(table):
     return Response(text, mimetype='text/csv',
                     headers={'Content-Disposition': 'attachment; filename="%s"' % name,
                              'Cache-Control': 'no-store'})
+
+
+# ---------------------------------------------------------------------------
+# Import / restore
+# ---------------------------------------------------------------------------
+
+class RestoreError(Exception):
+    """A backup that cannot be restored; the message is shown to the user."""
+
+
+_MB = 1024 * 1024
+MAX_UPLOAD_BYTES = 4096 * _MB
+MAX_ZIP_ENTRIES = 10000
+# Members a restore reads (path inside the backup -> max uncompressed size).
+# Nothing else in the zip is ever extracted.
+RESTORE_MEMBERS = {
+    'data_private/private.db': 1024 * _MB,
+    'data_private/secrets.json': 1 * _MB,
+    'config.yaml': 5 * _MB,
+    'data_public/public.db': 4096 * _MB,
+    'README.txt': 1 * _MB,
+}
+PRIVATE_TABLES = ('stocks', 'transactions')
+PUBLIC_TABLES = ('tickers', 'valuations')
+
+_restore_lock = threading.Lock()
+
+
+def _form_flag(name, default):
+    value = request.form.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _core():
+    from services.updater import core
+    return core()
+
+
+def _save_upload(tmpdir):
+    """Stream the uploaded file to ``tmpdir``; returns its path."""
+    upload = request.files.get('file')
+    if upload is None or not upload.filename:
+        raise RestoreError('No backup file was uploaded.')
+    dest = os.path.join(tmpdir, 'upload.zip')
+    total = 0
+    with open(dest, 'wb') as out:
+        while True:
+            chunk = upload.stream.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                raise RestoreError('The uploaded file is too large to be a FinanceApp backup.')
+            out.write(chunk)
+    return dest
+
+
+def _unsafe_name(name):
+    if name.startswith('/') or re.match(r'^[A-Za-z]:', name):
+        return True
+    return any(part == '..' for part in name.split('/'))
+
+
+def _scan_zip(zf):
+    """Validate every entry name; return {backup-relative path: ZipInfo} for
+    the members a restore uses (handles one top-level wrapper folder)."""
+    infos = zf.infolist()
+    if len(infos) > MAX_ZIP_ENTRIES:
+        raise RestoreError('The zip has too many entries to be a FinanceApp backup.')
+    files = {}
+    for info in infos:
+        name = info.filename.replace('\\', '/')
+        if _unsafe_name(name):
+            raise RestoreError('Unsafe path in zip (%s); refusing to use it.' % info.filename)
+        if name.endswith('/') or name.startswith('__MACOSX/') or '/__MACOSX/' in name:
+            continue
+        files[name] = info
+
+    prefix = None
+    if 'data_private/private.db' in files:
+        prefix = ''
+    else:
+        tops = {n.split('/', 1)[0] for n in files if '/' in n}
+        loose = [n for n in files if '/' not in n and os.path.basename(n) != '.DS_Store']
+        if len(tops) == 1 and not loose:
+            top = tops.pop() + '/'
+            if top + 'data_private/private.db' in files:
+                prefix = top
+    if prefix is None:
+        raise RestoreError('This zip does not look like a FinanceApp backup '
+                           '(no data_private/private.db inside).')
+
+    members = {}
+    for rel, limit in RESTORE_MEMBERS.items():
+        info = files.get(prefix + rel)
+        if info is None:
+            continue
+        if info.file_size > limit:
+            raise RestoreError('%s in the backup is unexpectedly large (%s); refusing to use it.'
+                               % (rel, formatted_size(info.file_size)))
+        members[rel] = info
+    return members
+
+
+def formatted_size(n):
+    return '%.1f MB' % (n / float(_MB)) if n >= _MB else '%d bytes' % n
+
+
+def _extract(zf, info, dest, limit):
+    """Copy one member to ``dest`` (never more than ``limit`` bytes)."""
+    total = 0
+    with zf.open(info) as src, open(dest, 'wb') as out:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise RestoreError('%s in the backup is larger than allowed.' % info.filename)
+            out.write(chunk)
+    return dest
+
+
+def _check_backup_db(path, label, tables, max_version):
+    """Validate an extracted SQLite file. Returns {schema_version, counts}."""
+    with open(path, 'rb') as f:
+        if f.read(16) != b'SQLite format 3\x00':
+            raise RestoreError('%s in the backup is not a SQLite database.' % label)
+    try:
+        con = sqlite3.connect(path)
+        try:
+            # Our own temp copy: make it self-contained (no -wal needed) so it
+            # can be read and restored from consistently.
+            con.execute('PRAGMA journal_mode=DELETE')
+            rows = con.execute('PRAGMA integrity_check').fetchall()
+            if not rows or rows[0][0] != 'ok':
+                detail = '; '.join(str(r[0]) for r in rows[:3])
+                raise RestoreError('%s in the backup is damaged (integrity check: %s).'
+                                   % (label, detail))
+            have = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            missing = [t for t in tables if t not in have]
+            if missing:
+                raise RestoreError('%s in the backup is missing table(s): %s.'
+                                   % (label, ', '.join(missing)))
+            version = con.execute('PRAGMA user_version').fetchone()[0]
+            counts = {t: con.execute('SELECT COUNT(*) FROM %s' % t).fetchone()[0]
+                      for t in tables}
+        finally:
+            con.close()
+    except sqlite3.DatabaseError as e:
+        raise RestoreError('%s in the backup could not be read: %s' % (label, e))
+    if version > max_version:
+        raise RestoreError(
+            'This backup is from a newer version of FinanceApp (%s schema %d; this version '
+            'supports %d). Update the app first, then restore.' % (label, version, max_version))
+    return {'schema_version': version, 'counts': counts}
+
+
+def _parse_readme(text):
+    out = {}
+    for key, field in (('app_version', 'App version'), ('created', 'Created')):
+        m = re.search(r'^%s:\s*(.+?)\s*$' % re.escape(field), text, re.M)
+        if m:
+            out[key] = m.group(1)
+    return out
+
+
+def _load_backup(zip_path, workdir, want_market):
+    """Open + validate the backup; extract what a restore needs into
+    ``workdir``. Raises RestoreError. Returns a description dict."""
+    import database
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise RestoreError('Not a valid zip file (%s).' % e)
+    try:
+        members = _scan_zip(zf)
+        out = {'contents': {
+            'private_db': True,
+            'secrets': 'data_private/secrets.json' in members,
+            'config': 'config.yaml' in members,
+            'public_db': 'data_public/public.db' in members,
+        }, 'files': {}}
+        try:
+            if 'README.txt' in members:
+                text = zf.read(members['README.txt']).decode('utf-8', 'replace')
+                out.update(_parse_readme(text))
+
+            priv = _extract(zf, members['data_private/private.db'],
+                            os.path.join(workdir, 'private.db'),
+                            RESTORE_MEMBERS['data_private/private.db'])
+            out['private'] = _check_backup_db(priv, 'private.db', PRIVATE_TABLES,
+                                              database.SCHEMA_VERSION_PRIVATE)
+            out['files']['private_db'] = priv
+
+            if out['contents']['config']:
+                raw = zf.read(members['config.yaml'])
+                try:
+                    from user_config import _yaml
+                    data = _yaml().load(raw.decode('utf-8'))
+                except Exception as e:
+                    raise RestoreError('config.yaml in the backup is not valid YAML: %s' % e)
+                if data is not None and not isinstance(data, dict):
+                    raise RestoreError('config.yaml in the backup is not a settings file.')
+                cfg = os.path.join(workdir, 'config.yaml')
+                with open(cfg, 'wb') as f:
+                    f.write(raw)
+                out['files']['config'] = cfg
+
+            if out['contents']['secrets']:
+                try:
+                    secrets = json.loads(zf.read(members['data_private/secrets.json'])
+                                         .decode('utf-8'))
+                except ValueError as e:
+                    raise RestoreError('secrets.json in the backup is not valid JSON: %s' % e)
+                if not isinstance(secrets, dict):
+                    raise RestoreError('secrets.json in the backup is not a key list.')
+                out['secrets'] = secrets
+                out['secret_names'] = sorted(secrets.keys())
+
+            if out['contents']['public_db']:
+                info = members['data_public/public.db']
+                out['public'] = {'size': info.file_size}
+                if want_market:
+                    pub = _extract(zf, info, os.path.join(workdir, 'public.db'),
+                                   RESTORE_MEMBERS['data_public/public.db'])
+                    out['public'].update(_check_backup_db(
+                        pub, 'public.db', PUBLIC_TABLES, database.SCHEMA_VERSION_PUBLIC))
+                    out['files']['public_db'] = pub
+        except (zipfile.BadZipFile, zlib.error, EOFError) as e:
+            raise RestoreError('The zip is damaged: %s' % e)
+    finally:
+        zf.close()
+    return out
+
+
+def _public_schema_only(zip_path, workdir):
+    """Schema version of the backup's public.db (for inspect), or an error."""
+    import database
+    with zipfile.ZipFile(zip_path) as zf:
+        members = _scan_zip(zf)
+        pub = _extract(zf, members['data_public/public.db'], os.path.join(workdir, 'public.db'),
+                       RESTORE_MEMBERS['data_public/public.db'])
+    try:
+        con = sqlite3.connect(pub)
+        try:
+            version = con.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.DatabaseError:
+        return None, False
+    return version, version <= database.SCHEMA_VERSION_PUBLIC
+
+
+def _safety_root():
+    """Where pre-restore snapshots go: <INSTALL_HOME>/backups when installed,
+    the gitignored <repo>/backup/ in a dev checkout."""
+    if paths.IS_INSTALLED:
+        return os.path.join(paths.INSTALL_HOME, 'backups')
+    return os.path.join(paths.CODE_DIR, 'backup')
+
+
+def _safety_snapshot(include_public):
+    c = _core()
+    root = _safety_root()
+    os.makedirs(root, exist_ok=True)
+    dest = c.unique_dir(os.path.join(root, 'pre-restore-%s'
+                                     % datetime.now().strftime('%Y%m%d-%H%M%S')))
+    os.makedirs(os.path.join(dest, 'data_private'), mode=0o700)
+    saved = []
+    if os.path.isfile(paths.PRIVATE_DB_PATH):
+        c.copy_sqlite(paths.PRIVATE_DB_PATH, os.path.join(dest, 'data_private', 'private.db'))
+        saved.append('data_private/private.db')
+    if os.path.isfile(SECRETS_FILE):
+        shutil.copy2(SECRETS_FILE, os.path.join(dest, 'data_private', 'secrets.json'))
+        saved.append('data_private/secrets.json')
+    if os.path.isfile(paths.USER_CONFIG_FILE):
+        shutil.copy2(paths.USER_CONFIG_FILE, os.path.join(dest, 'config.yaml'))
+        saved.append('config.yaml')
+    if include_public and os.path.isfile(paths.PUBLIC_DB_PATH):
+        c.copy_sqlite(paths.PUBLIC_DB_PATH, os.path.join(dest, 'data_public', 'public.db'))
+        saved.append('data_public/public.db')
+    with open(os.path.join(dest, 'README.txt'), 'w', encoding='utf-8') as f:
+        f.write('FinanceApp data saved before restoring a backup (%s)\n'
+                'From: %s\n\nContents: %s\n\n'
+                'Same layout as a backup zip: to undo the restore, zip this folder and\n'
+                'restore it from Settings > Backup & Export.\n'
+                % (datetime.now().isoformat(timespec='seconds'), paths.DATA_ROOT,
+                   ', '.join(saved) or 'nothing'))
+    return dest
+
+
+def _live_counts():
+    con = sqlite3.connect(paths.PRIVATE_DB_PATH, timeout=30.0)
+    try:
+        return {t: con.execute('SELECT COUNT(*) FROM %s' % t).fetchone()[0]
+                for t in PRIVATE_TABLES}
+    finally:
+        con.close()
+
+
+def _apply_restore(backup, restore_config, restore_secrets, restore_market):
+    """Save current data, then write the validated backup into the live data.
+    Returns the response data."""
+    files = backup['files']
+    do_config = restore_config and 'config' in files
+    do_secrets = restore_secrets and 'secrets' in backup
+    do_market = restore_market and 'public_db' in files
+
+    safety = _safety_snapshot(include_public=do_market)
+    restored = []
+    try:
+        return _write_restore(backup, files, safety, restored,
+                              do_config, do_secrets, do_market)
+    except Exception as e:
+        raise RuntimeError('%s (restored so far: %s). Your previous data was saved to %s'
+                           % (e, ', '.join(restored) or 'nothing', safety))
+
+
+def _write_restore(backup, files, safety, restored, do_config, do_secrets, do_market):
+    import database
+    c = _core()
+    warnings = []
+    restart = False
+
+    os.makedirs(paths.DATA_PRIVATE_DIR, exist_ok=True)
+    c.restore_sqlite_into(files['private_db'], paths.PRIVATE_DB_PATH)
+    # Brings an older backup up to this version's schema (idempotent).
+    database._init_private_database()
+    restored.append('private.db')
+
+    if do_market:
+        os.makedirs(paths.DATA_PUBLIC_DIR, exist_ok=True)
+        c.restore_sqlite_into(files['public_db'], paths.PUBLIC_DB_PATH)
+        database._init_public_database()
+        restored.append('public.db')
+        restart = True  # in-memory market caches throughout the app
+        try:
+            from routes.valuation import invalidate_valuation_memo
+            invalidate_valuation_memo()
+            import data_manager
+            data_manager._ticker_index_cache = None
+            from services.providers import get_orchestrator
+            get_orchestrator().clear_cache()
+        except Exception as e:
+            warnings.append('Could not clear cached market data: %s' % e)
+
+    if do_config:
+        tmp = paths.USER_CONFIG_FILE + '.restore-tmp'
+        shutil.copyfile(files['config'], tmp)
+        os.replace(tmp, paths.USER_CONFIG_FILE)
+        try:
+            from user_config import fill_missing_defaults
+            fill_missing_defaults(paths.USER_CONFIG_FILE)
+        except Exception as e:
+            warnings.append('Could not add new default settings to config.yaml: %s' % e)
+        try:
+            from services.providers.config import reload_config
+            reload_config()
+        except Exception as e:
+            warnings.append('Could not reload provider settings: %s' % e)
+        restored.append('config.yaml')
+        restart = True  # app settings (config.py) are read at startup
+
+    if do_secrets:
+        from services.providers.secrets import replace_secrets
+        replace_secrets(backup['secrets'])
+        restored.append('secrets.json')
+
+    return {
+        'restored': restored,
+        'safety_backup': safety,
+        'counts': _live_counts(),
+        'restart_recommended': restart,
+        'secrets_kept': not do_secrets,
+        'warnings': warnings,
+    }
+
+
+@backup_bp.route('/inspect', methods=['POST'])
+def backup_inspect():
+    """Describe an uploaded backup zip without changing anything."""
+    import database
+    tmpdir = tempfile.mkdtemp(prefix='financeapp-inspect-')
+    try:
+        zip_path = _save_upload(tmpdir)
+        info = _load_backup(zip_path, tmpdir, want_market=False)
+        data = {
+            'app_version': info.get('app_version'),
+            'created': info.get('created'),
+            'contents': info['contents'],
+            'private': info['private'],
+            'secret_names': info.get('secret_names', []),
+            'public': None,
+            'supported_schema': {'private': database.SCHEMA_VERSION_PRIVATE,
+                                 'public': database.SCHEMA_VERSION_PUBLIC},
+            'current_counts': _live_counts() if os.path.isfile(paths.PRIVATE_DB_PATH) else None,
+            'safety_dir': _safety_root(),
+        }
+        if info['contents']['public_db']:
+            version, ok = _public_schema_only(zip_path, tmpdir)
+            data['public'] = {'size': info['public']['size'], 'schema_version': version,
+                              'restorable': ok}
+            if version is None:
+                data['public']['problem'] = 'Market data in this backup is not a readable database.'
+            elif not ok:
+                data['public']['problem'] = ('Market data in this backup is from a newer '
+                                             'version of FinanceApp; update the app first.')
+        return _ok(data)
+    except RestoreError as e:
+        return _err(str(e), 400)
+    except Exception as e:
+        return _err('Could not read the backup: %s' % e, 500)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@backup_bp.route('/restore', methods=['POST'])
+def backup_restore():
+    """Replace the current data with an uploaded backup zip.
+
+    Everything is validated first; current data is then saved to a
+    pre-restore-<timestamp>/ folder before anything is overwritten.
+    """
+    restore_config = _form_flag('restore_config', True)
+    restore_secrets = _form_flag('restore_secrets', True)
+    restore_market = _form_flag('restore_market', False)
+
+    if not _restore_lock.acquire(blocking=False):
+        return _err('A restore is already in progress.', 409)
+    tmpdir = tempfile.mkdtemp(prefix='financeapp-restore-')
+    try:
+        if restore_market:
+            from services.screener import is_running
+            if is_running():
+                return _err('The screener is running; stop it (or restore without market '
+                            'data) before restoring.', 409)
+        zip_path = _save_upload(tmpdir)
+        backup = _load_backup(zip_path, tmpdir, want_market=restore_market)
+        try:
+            os.remove(zip_path)  # free disk space before copying databases
+        except OSError:
+            pass
+        data = _apply_restore(backup, restore_config, restore_secrets, restore_market)
+        print('[Backup] Restored %s (safety copy: %s)'
+              % (', '.join(data['restored']), data['safety_backup']))
+        return _ok(data)
+    except RestoreError as e:
+        return _err(str(e), 400)
+    except Exception as e:
+        return _err('Restore failed: %s' % e, 500)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        _restore_lock.release()

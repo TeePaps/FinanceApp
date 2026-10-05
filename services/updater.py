@@ -25,12 +25,10 @@ import os
 import platform
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
-import urllib.request
 from datetime import datetime, timezone
 
 import paths
@@ -607,17 +605,7 @@ def _restore_private(backup_dir):
     restored = []
     src_db = os.path.join(backup_dir, "data_private", "private.db")
     if os.path.isfile(src_db):
-        dst_db = paths.PRIVATE_DB_PATH
-        src = sqlite3.connect("file:%s?mode=ro" % urllib.request.pathname2url(
-            os.path.abspath(src_db)), uri=True)
-        try:
-            dst = sqlite3.connect(dst_db, timeout=30)
-            try:
-                src.backup(dst)
-            finally:
-                dst.close()
-        finally:
-            src.close()
+        c.restore_sqlite_into(src_db, paths.PRIVATE_DB_PATH)
         restored.append("private.db")
     src_cfg = os.path.join(backup_dir, "config.yaml")
     if os.path.isfile(src_cfg):
