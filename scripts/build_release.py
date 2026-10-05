@@ -16,8 +16,7 @@ Produces in the output directory:
 The zip is built from the committed tree at --ref (default HEAD) via `git archive`,
 not from the working tree. That means:
   * only tracked files are shipped, so untracked config.yaml / data_private/ never leak;
-  * data_public/public.db is the committed seed blob. setup() marks it skip-worktree, so the
-    working-tree copy is the developer's live database and must NOT be shipped;
+  * data_public/ ships only its README (public.db is gitignored and built on first run);
   * uncommitted edits are not included (a warning is printed if the tree is dirty).
 
 Installer assets are copied from the working-tree installer/ directory (they may not be
@@ -73,7 +72,7 @@ MAC_ZIP = "Install-FinanceApp-mac.zip"
 MAC_COMMAND = "Install-FinanceApp.command"
 
 REQUIRED_IN_ZIP = ["app.py", "version.py", "paths.py", "config.defaults.yaml",
-                   "requirements.txt", "restart_server.py", "data_public/public.db"]
+                   "requirements.txt", "restart_server.py"]
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$")
 

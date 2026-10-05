@@ -1,8 +1,16 @@
 # =============================================================================
 # Private Data (NEVER commit)
 # =============================================================================
-# Personal holdings database and all contents
-data_private/
+# Personal holdings database and all contents. The folder itself stays in
+# the repo (with its README) so the data layout is visible.
+data_private/*
+!data_private/README.md
+
+# =============================================================================
+# Public Data (rebuildable market data; not committed)
+# =============================================================================
+data_public/*
+!data_public/README.md
 
 # User config (created from the tracked config.defaults.yaml on first run)
 config.yaml

@@ -138,16 +138,7 @@ On Windows, use `py restart_server.py ...` (or `python`). Thin shims are also av
 
 ## Market database (data_public/public.db)
 
-`data_public/public.db` is committed to the repo as a **seed** — enough data to run the app out of the box. `restart_server.py setup` marks it `skip-worktree` so local screener runs never show up as changes in `git status`.
-
-To intentionally publish a refreshed seed:
-
-```bash
-git update-index --no-skip-worktree data_public/public.db
-git add data_public/public.db
-git commit -m "Refresh public.db seed"
-git update-index --skip-worktree data_public/public.db
-```
+`data_public/public.db` is **not** committed. It is created empty on first run (schema plus index definitions) and filled by the screener and scheduled syncs from the market data providers. It can be deleted at any time and rebuilt. The `data_public/` and `data_private/` folders are kept in the repo (each with a README) so the data layout is visible, but their contents are gitignored.
 
 ## Tech Stack
 
@@ -194,8 +185,8 @@ FinanceApp/
 │   └── css/               # Stylesheets
 │
 ├── data_public/           # Market data (can be rebuilt)
-│   └── public.db
-└── data_private/          # User data (backup this!)
+│   └── public.db          # (gitignored, created on first run)
+└── data_private/          # User data (backup this!, gitignored)
     ├── private.db
     ├── api_keys.json
     └── provider_config.json

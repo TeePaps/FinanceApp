@@ -481,17 +481,6 @@ def setup():
         print("Error: failed to install requirements.")
         return 1
 
-    print("Marking data_public/public.db as skip-worktree...")
-    try:
-        result = subprocess.run(
-            ["git", "update-index", "--skip-worktree", "data_public/public.db"],
-            cwd=BASE_DIR
-        )
-        if result.returncode != 0:
-            print("  Warning: git update-index failed (non-fatal).")
-    except (OSError, subprocess.SubprocessError) as e:
-        print("  Warning: git update-index failed: %s" % e)
-
     print()
     print("Setup complete. Next step:")
     print("  python restart_server.py restart")

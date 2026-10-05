@@ -62,7 +62,8 @@ DATA_PRIVATE_DIR    HOME/data/data_private  | CODE_DIR/data_private
 USER_CONFIG_FILE    HOME/data/config.yaml   | CODE_DIR/config.yaml
 DEFAULT_CONFIG_FILE CODE_DIR/config.defaults.yaml
 RUN_DIR             HOME/run                | CODE_DIR/logs
-SEED_PUBLIC_DB      CODE_DIR/data_public/public.db (copied only if DATA_PUBLIC_DIR has none)
+SEED_PUBLIC_DB      CODE_DIR/data_public/public.db (copied only if present and DATA_PUBLIC_DIR has none;
+                    public.db is no longer tracked, so releases ship none and it is built on first run)
 ```
 Also provided (added in Phase 1): `DATA_ROOT` (HOME/data | CODE_DIR), `ARCHIVE_DIR`
 (HOME/data/archive | CODE_DIR/archive, legacy migration archive), `PUBLIC_DB_PATH`,
@@ -151,10 +152,9 @@ idempotent migrations and stamp on first start. `database.get_schema_version(pat
 
 - `FinanceApp-X.Y.Z.zip` — top-level folder `FinanceApp-X.Y.Z/`; excludes `data_private/`,
   `_ARCHIVE/`, `_IDEAS/`, `backup/`, `playwright-mcp/`, `venv/`, `logs/`, `requirements/`
-  (the spec dir), `.github/`, `.claude/`, `__pycache__/`. Includes `data_public/public.db` as seed.
+  (the spec dir), `.github/`, `.claude/`, `__pycache__/`. `data_public/` ships only its README (no seed db).
   Built by `scripts/build_release.py VERSION [--out dist/] [--ref HEAD] [--installer-dir DIR]`
-  from the committed tree via `git archive` (tracked files only; the seed is the committed
-  public.db blob, not the skip-worktree working copy; uncommitted edits are not shipped).
+  from the committed tree via `git archive` (tracked files only; uncommitted edits are not shipped).
   Fails unless `version.py` at the ref equals VERSION. Installer assets are copied from
   `installer/` (missing ones skipped with a warning). `scripts/release.py X.Y.Z [--dry-run]
   [--push]` bumps version.py, commits "Release vX.Y.Z", tags; `.github/workflows/release.yml`
